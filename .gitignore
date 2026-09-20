@@ -1,0 +1,23 @@
+# 模型文件：体积大（244MB~326MB），用 tools/fetch_models.py 下载
+models/
+
+# 运行期数据：含 API Key、聊天记录、记忆库 —— 永不入库
+userdata/
+
+# 内置音乐（授权未确认）：不随仓库分发；没有它只是曲库为空
+music_starter/
+
+# 第三方依赖目录（本仓库不含，用 pip install -r requirements.txt）
+_pylibs/
+
+# 打包产物
+build/
+dist/
+*.spec
+桌宠合集_压缩包/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 注意：live2d_viewer/ **不要**忽略 —— 它是本仓库开源的核心素材

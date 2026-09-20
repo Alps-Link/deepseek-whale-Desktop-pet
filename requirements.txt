@@ -1,0 +1,24 @@
+# 大肥鱼桌宠 —— 源码运行依赖
+#
+# 环境：Windows x64 + **Python 3.10**（live2d-py 的 Cubism native 与 sherpa-onnx 都是 cp310 扩展）
+# 安装：python -m pip install -r requirements.txt
+
+# ---- 必需：缺了程序起不来 ----
+pillow==12.2.0
+numpy==2.2.6
+requests==2.34.2
+sherpa-onnx==1.12.31        # 语音识别 + 语音合成后端（Apache-2.0）
+pypinyin==0.55.0            # 唤醒词拼音模糊匹配（MIT）
+
+# ---- 角色渲染：缺了没有桌宠画面 ----
+pygame==2.6.1
+PyOpenGL==3.1.10
+live2d-py==0.7.0.4          # MIT，https://github.com/Arkueid/live2d-py
+
+# ---- 功能可选：缺了只有对应功能被禁用，程序照常运行 ----
+PyAudio==0.2.14               # 语音输入
+onnxruntime==1.23.2           # silero VAD + sherpa 后端
+mss==10.2.0                   # 陪玩（截屏）
+easyocr==1.7.2                # 读书 OCR（体积最大，连带 torch）
+edge-tts==7.2.8               # Edge TTS 音色
+sentence-transformers==6.0.0  # 记忆向量召回，缺了回退旧排序
