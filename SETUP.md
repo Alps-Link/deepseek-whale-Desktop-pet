@@ -1,5 +1,7 @@
 # 从源码运行（详细版）
 
+> **只是想用、不想改代码？** 直接下成品 exe（自包含，不用装 Python）：<https://pan.baidu.com/s/1SMvJiDkVZhNoARs75eDoZA>　提取码：`sgqg`
+
 本仓库**不含** `models/`（语音识别模型 244MB）与 `userdata/`（运行期数据），
 按下面几步补齐即可。已经跑起来的话看 [README](README.md) 就够了。
 
