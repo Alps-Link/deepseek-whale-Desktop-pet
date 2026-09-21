@@ -61,6 +61,12 @@ FIT_OFFSET_Y = -0.053  # 下移 6.4px（单位=显示高的一半），让下边
 #   偏移 = 缩放后把内容底边重新贴回下边界（复测 bbox 顶边 y=1、底边 y=239，不越界）。
 # 没列出的装扮不改变内容高度（猫猫/蝴蝶结/发箍/三副眼镜/墨爪/桌上鲸/深色桌布逐一量过 = 188），
 # 沿用基准构图，画面一点不动。
+# "手里拿着的东西"所在的槽位：动画（点她 / 主动做动作）播放期间，这些参数要让位，
+# 否则它们会一直压着动画自带的手和道具 —— 实测：装猫爪时点她，自拍的手机完全不出现、
+# 挤番茄酱的双手一直维持猫爪（`maoshou=1` 写满全程，而 8 段动画里没有一段会去改它）。
+# 桌面显示槽（画笔/橡皮/撤回/收起巴菲）不让位：巴菲是"写 1 才收起"的反向开关，
+# 停写会让它每次点她都弹回来；那几件也不跟动画抢参数。
+HAND_SLOTS = {'claw', 'item'}
 COSTUME_FIT = {
     'bunny_sticker': (1.213, -0.100),   # 兔耳
     'whale':         (1.258, -0.075),   # 头顶鲸
@@ -291,6 +297,7 @@ def _render_offscreen(bridge, width, height):
     costume_rest = {}          # 装扮：{槽位: {参数: 原本的值}}，摘掉时还原成它
     costume_params = {}        # 上面各槽位合并后的写入表
     costume_names = {}         # 装扮：{槽位: [表情名…]}，用于按装扮重算构图
+    hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间写回它＝先放下
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
     _idx_now = -1              # 当前动作索引（对应 action_curves）
@@ -448,9 +455,18 @@ def _render_offscreen(bridge, width, height):
                     # 记下"她原本的值"：有些装扮参数常态就不是 0（发箍 ParamCheek38 常态 3.0），
                     # 摘掉时写 0 反而会把常态的东西弄没——所以摘掉要还原成原本的值
                     _rest = costume_rest.setdefault(_slot, {})
+                    # 正在播动画时不能拿"当前值"当原本的值：动作可能正把这个参数顶在别的值上
+                    # （挤番茄酱会把 danbaofan 顶起来），记下来就会让蛋包饭之类一直粘着不走。
+                    # 这种时候用模型默认值兜底 —— 装扮参数只被装扮和动画改过，默认值就是它原本的值。
+                    _busy_now = bool((action_until and time.time() < action_until)
+                                     or (face_restore_at and time.time() < face_restore_at))
                     for _p in set(_new_params) | set(costume_slots.get(_slot) or {}):
                         if _p not in _rest and _p in _param_ids:
-                            _rest[_p] = model.GetParameterValue(_param_ids.index(_p))
+                            if _busy_now:
+                                _rest[_p] = defaults.get(_p, model.GetParameterValue(
+                                    _param_ids.index(_p)))
+                            else:
+                                _rest[_p] = model.GetParameterValue(_param_ids.index(_p))
                     # 先把这个槽位"用过的参数"全部还原成原本的值，再叠上新装扮 ——
                     # 少了这一步，同槽位换装扮（圆眼镜→方眼镜）会两个都亮着（只剩"无"能全清）
                     _slot_params = {_p: _v for _p, _v in _rest.items()}
@@ -461,6 +477,10 @@ def _render_offscreen(bridge, width, height):
                     for _sp in costume_slots.values():
                         costume_params.update(_sp)
                     costume_names[_slot] = list(_names)
+                    # 手里的东西 → 它们"原本的值"（放下时写回它）
+                    hand_rest = {_p: costume_rest.get(_sl, {}).get(_p, 0.0)
+                                 for _sl, _ps in costume_slots.items() if _sl in HAND_SLOTS
+                                 for _p in _ps}
                     # 装扮会改内容高度（兔耳最明显）→ 重算构图，否则头顶多出来的会被上边界裁掉。
                     # 多件同时挂时取"缩得最狠的那件"的一套（它自带对应的偏移）。
                     _fits = [COSTUME_FIT[_n] for _sl in costume_names.values()
@@ -605,7 +625,14 @@ def _render_offscreen(bridge, width, height):
             if _eyes_owned != blink_off:
                 model.SetAutoBlinkEnable(not _eyes_owned)
                 blink_off = _eyes_owned
+            # 动画期间（点她 / 做动作）把"手里的东西"放下：写回它原本的值，而不是"不写"——
+            # 不写的话参数会保持上一次的值（猫爪还是 1），等于没放下。动画结束写入恢复，东西自动回来。
+            _busy = bool((action_until and time.time() < action_until)
+                         or (face_restore_at and time.time() < face_restore_at))
             for _cp, _cv in costume_params.items():
+                if _busy and _cp in hand_rest:
+                    model.SetParameterValue(_cp, hand_rest[_cp])
+                    continue
                 model.SetParameterValue(_cp, _cv)
             if action_until:
                 _el = time.time() - action_start
