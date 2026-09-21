@@ -53,6 +53,19 @@ DRAG_SCALE_Y = 0.5
 # 所以只能用模型 API（SetScale/SetOffset，绝对值语义、设一次即持久）。
 FIT_SCALE = 1.277      # = 240/188，放大到占满显示高度
 FIT_OFFSET_Y = -0.053  # 下移 6.4px（单位=显示高的一半），让下边缘贴住窗口底
+# 装扮会把"内容有多高"改掉：兔耳 +9px、头顶鲸 +2、单边马尾 +1（把画面缩到 S=1.0 保证不裁边后
+# 量出的 bbox 高：常态 188 → 197 / 190 / 189）。而上面这套构图是按"常态内容占满显示高度"定的，
+# 于是头顶多出来的部分会被上边界截掉（兔耳实测被裁约 11px）。
+# 下表 = "挂着这件装扮时改用哪套缩放/偏移"，实测得来：
+#   缩放 = 让该装扮也刚好占满显示高度；
+#   偏移 = 缩放后把内容底边重新贴回下边界（复测 bbox 顶边 y=1、底边 y=239，不越界）。
+# 没列出的装扮不改变内容高度（猫猫/蝴蝶结/发箍/三副眼镜/墨爪/桌上鲸/深色桌布逐一量过 = 188），
+# 沿用基准构图，画面一点不动。
+COSTUME_FIT = {
+    'bunny_sticker': (1.213, -0.100),   # 兔耳
+    'whale':         (1.258, -0.075),   # 头顶鲸
+    'side_ponytail': (1.265, -0.067),   # 单边马尾
+}
 
 
 # 脸部残留修复：触摸动作播完后这些参数会定格在末帧——实测阿尔卑斯 EyeLift 1.00→0.00、
@@ -248,6 +261,9 @@ def _render_offscreen(bridge, width, height):
     disp_w, disp_h = width, height   # 显示尺寸（主线程推送）
     act_w, act_h = width, height     # 活动渲染区域（FBO 分配尺寸为上限）
 
+    cur_fit_scale = FIT_SCALE      # 当前生效的构图（装扮会临时改小，见 COSTUME_FIT）
+    cur_fit_offset = FIT_OFFSET_Y
+
     def apply_area():
         """按 显示尺寸 × 聚焦缩放 设定渲染区域；上限是 FBO 分配尺寸。
         这样任何缩放档位读回的都是显示尺寸的真实像素（不是把小块放大）。"""
@@ -264,7 +280,7 @@ def _render_offscreen(bridge, width, height):
         _sc = min(act_w / 800.0, act_h / 640.0) * 0.78
         # 注视基准行要在"未被纠正"的坐标里算，再套同一套 SetScale/SetOffset 变换
         _row = act_h * 0.5 - _sc * 320 + EYE_ROW_IN_CANVAS * _sc
-        _row = (_row - act_h * 0.5) * FIT_SCALE + act_h * 0.5 + FIT_OFFSET_Y * act_h * 0.5
+        _row = (_row - act_h * 0.5) * cur_fit_scale + act_h * 0.5 + cur_fit_offset * act_h * 0.5
         bridge.face_row = int(_row)
     active_scene = None
     expression_active = None   # 表情（场景）是否还挂着
@@ -274,6 +290,7 @@ def _render_offscreen(bridge, width, height):
     costume_slots = {}         # 装扮：{槽位: {参数: 值}}，每帧强制写入（动作会把参数顶掉）
     costume_rest = {}          # 装扮：{槽位: {参数: 原本的值}}，摘掉时还原成它
     costume_params = {}        # 上面各槽位合并后的写入表
+    costume_names = {}         # 装扮：{槽位: [表情名…]}，用于按装扮重算构图
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
     _idx_now = -1              # 当前动作索引（对应 action_curves）
@@ -335,8 +352,8 @@ def _render_offscreen(bridge, width, height):
     mouth_disp = 0.0    # 实际写入值（速率限制 0.25/帧，避免闭嘴时一跳）
     try:
         # 形象定位纠正（见 FIT_SCALE/FIT_OFFSET_Y 注释）
-        model.SetScale(FIT_SCALE)
-        model.SetOffset(0.0, FIT_OFFSET_Y)
+        model.SetScale(cur_fit_scale)
+        model.SetOffset(0.0, cur_fit_offset)
     except Exception:
         pass
     model.StartMotion('FirstImpression', 0, 3)
@@ -443,6 +460,18 @@ def _render_offscreen(bridge, width, height):
                     costume_params = {}
                     for _sp in costume_slots.values():
                         costume_params.update(_sp)
+                    costume_names[_slot] = list(_names)
+                    # 装扮会改内容高度（兔耳最明显）→ 重算构图，否则头顶多出来的会被上边界裁掉。
+                    # 多件同时挂时取"缩得最狠的那件"的一套（它自带对应的偏移）。
+                    _fits = [COSTUME_FIT[_n] for _sl in costume_names.values()
+                             for _n in _sl if _n in COSTUME_FIT]
+                    if _fits:
+                        cur_fit_scale, cur_fit_offset = min(_fits, key=lambda _f: _f[0])
+                    else:
+                        cur_fit_scale, cur_fit_offset = FIT_SCALE, FIT_OFFSET_Y
+                    model.SetScale(cur_fit_scale)
+                    model.SetOffset(0.0, cur_fit_offset)
+                    apply_area()      # 注视基准行要跟着新构图一起重算
                 elif cmd[0] == 'test_motion':
                     model.StartMotion(cmd[1], cmd[2], 5)
                 elif cmd[0] == 'wake':
