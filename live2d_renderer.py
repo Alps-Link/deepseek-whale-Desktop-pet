@@ -66,6 +66,11 @@ FIT_OFFSET_Y = -0.053  # 下移 6.4px（单位=显示高的一半），让下边
 # 挤番茄酱的双手一直维持猫爪（`maoshou=1` 写满全程，而 8 段动画里没有一段会去改它）。
 # 桌面显示槽（画笔/橡皮/撤回/收起巴菲）不让位：巴菲是"写 1 才收起"的反向开关，
 # 停写会让它每次点她都弹回来；那几件也不跟动画抢参数。
+# 默认收起的手部道具参数：模型出厂时她手里拿着一块点菜板（point=1），用户要求取消这个常态。
+# 这里每帧写 0 把它收起来；只有挤番茄酱 Action_0/Touch_1 会主动把 point 压成 0，其余动作不碰它，
+# 所以不冲突。想恢复出厂样子，把这一行删掉即可。
+DEFAULT_OFF_PARAMS = {'point': 0.0}
+
 HAND_SLOTS = {'item'}
 # 说明：只有**手持道具**槽（猫爪/蛋包饭/剪刀手/点单）参与让位 ——
 # 「魔爪」是**桌面摆件**、「桌面显示」槽（画笔/橡皮/撤回/收起巴菲）是**桌布上的图标**，
@@ -705,6 +710,9 @@ def _render_offscreen(bridge, width, height):
                     model.SetParameterValue(_cp, _cv + (_rv - _cv) * hand_yield)
                     continue
                 model.SetParameterValue(_cp, _cv)
+            # 默认收起的东西（见 DEFAULT_OFF_PARAMS）：每帧写一次，装扮/动作有需要时会自己覆盖它
+            for _dp, _dv in DEFAULT_OFF_PARAMS.items():
+                model.SetParameterValue(_dp, _dv)
             if action_until:
                 _el = time.time() - action_start
                 if _el <= action_until - action_start:
