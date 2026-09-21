@@ -308,10 +308,8 @@ def _render_offscreen(bridge, width, height):
     hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间淡出到它＝先放下
     hand_yield = 0.0           # 让位程度 0~1：渐变而不是瞬间切换（瞬间跳会"闪一下"）
     need_hand_yield = False    # 当前这段动画到底用不用手（用不到就不碰配件）
-    pose_from = {}; pose_to = {}      # 姿态还原：起点/终点（一帧硬写会让角色抽搐一下）
-    pose_start = 0.0; POSE_DUR = 0.35
+
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
-    action_pose = {}           # 整套参数的动作前快照（演完连姿态一起还原，见下面注释）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
     _idx_now = -1              # 当前动作索引（对应 action_curves）
     action_until = 0.0         # 动作预计结束时间
@@ -458,11 +456,6 @@ def _render_offscreen(bridge, width, height):
                         for _p in (action_curves[_idx] if _idx < len(action_curves) else {}):
                             if _p in _param_ids:
                                 action_props[_p] = model.GetParameterValue(_param_ids.index(_p))
-                        # 整套参数快照：引擎会把动作末帧的姿势定格下来，只还原"道具参数"不够 ——
-                        # 实测装猫爪做完自拍后 maoshou 明明是 1，但那套手部姿态让猫爪根本显示不出来，
-                        # 看上去就像退回了常态（用户报的"回到的是常态而不是装备的猫爪配件"）。
-                        action_pose = {pid: model.GetParameterValue(i)
-                                       for i, pid in enumerate(model.GetParamIds())}
                 elif cmd[0] == 'costume':
                     # 装扮配件（按槽位互斥）：换的时候先把该槽位旧参数写回 0，再写新装扮；
                     # 然后每帧强制写入——动作会把这些参数顶掉（卡梅莉亚那套同理）
@@ -656,17 +649,6 @@ def _render_offscreen(bridge, width, height):
             if _eyes_owned != blink_off:
                 model.SetAutoBlinkEnable(not _eyes_owned)
                 blink_off = _eyes_owned
-            # 姿态还原：动作演完后按 0.35 秒把整套参数拉回做动作前的值（一帧写死会抽搐）
-            if pose_start:
-                _pt = (time.time() - pose_start) / POSE_DUR
-                if _pt >= 1.0:
-                    for _pp, _pv in pose_to.items():
-                        model.SetParameterValue(_pp, _pv)
-                    pose_from = {}; pose_to = {}; pose_start = 0.0
-                else:
-                    for _pp, _pv in pose_to.items():
-                        _f0 = pose_from.get(_pp, _pv)
-                        model.SetParameterValue(_pp, _f0 + (_pv - _f0) * _pt)
             # 动画期间（点她 / 做动作）把"手里的东西"放下：朝它原本的值过渡，而不是直接写死——
             # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.25 秒的淡出/淡回。
             _now = time.time()
@@ -693,23 +675,13 @@ def _render_offscreen(bridge, width, height):
                     for _ap in action_props:
                         model.SetParameterValue(_ap, _curve_value(_curves_now.get(_ap), _el))
                 else:
-                    # 演完：还原成做动作前的样子（引擎没有所有者会定格），并回待机。
-                    # 先整份还原姿态，再按道具参数表覆盖一次（后者是动作期间逐帧插值写过的，
-                    # 快照本身也含它们，这里只是保证顺序明确）
-                    for _pp, _pv in action_pose.items():
-                        model.SetParameterValue(_pp, _pv)
+                    # 演完：只把"动作自己插值写过的道具参数"还原成动作前的值；
+                    # 姿势交给引擎自己的淡出 / 待机淡入接管 —— 硬停 + 把整套参数拉回去会让姿势瞬跳，
+                    # 看起来就是"先跳回常态拿着笔和写字板、再变回猫爪"。
                     for _ap, _av in action_props.items():
                         model.SetParameterValue(_ap, _av)
                     action_props = {}
-                    if action_pose:
-                        pose_from = {pid: model.GetParameterValue(i)
-                                     for i, pid in enumerate(model.GetParamIds())}
-                        pose_to = dict(action_pose)
-                        pose_start = time.time()
-                    action_pose = {}
                     action_until = 0.0
-                    model.StopAllMotions()
-                    model.StartRandomMotion('Idling', 4)
             if sleep_eyes:
                 model.SetParameterValue('ParamEyeLOpen', 0.0)
                 model.SetParameterValue('ParamEyeROpen', 0.0)
