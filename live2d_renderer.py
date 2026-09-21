@@ -67,6 +67,13 @@ FIT_OFFSET_Y = -0.053  # 下移 6.4px（单位=显示高的一半），让下边
 # 桌面显示槽（画笔/橡皮/撤回/收起巴菲）不让位：巴菲是"写 1 才收起"的反向开关，
 # 停写会让它每次点她都弹回来；那几件也不跟动画抢参数。
 HAND_SLOTS = {'claw', 'item'}
+# 判断"这段动画用不用手"的参数名：动画曲线里出现任意一个，就说明它要靠手演东西
+# （实测：挤番茄酱/开盖/自拍/快速自拍 有；吹泡泡/喷水/入场/待机 一个都没有）。
+# 用不到手的动画就**不该**碰她的配件——用户原话："吹泡泡糖用不到手，为什么动作期间手会变成原始常态"。
+HAND_PARAMS = {'phone', 'phone2', 'phone3', 'phone4', 'phone5', 'phone6', 'phone7', 'shouji',
+               'ji', 'danbaoX', 'danbaoY', 'danbaofan', 'danbaoz', 'point', 'pointZ',
+               'keyboard', 'xbox', 'aixing', 'maoshou', 'mozhua', 'mozhua2', 'bi', 'pi',
+               'chehui'}
 COSTUME_FIT = {
     'bunny_sticker': (1.213, -0.100),   # 兔耳
     'whale':         (1.258, -0.075),   # 头顶鲸
@@ -299,6 +306,9 @@ def _render_offscreen(bridge, width, height):
     costume_names = {}         # 装扮：{槽位: [表情名…]}，用于按装扮重算构图
     hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间淡出到它＝先放下
     hand_yield = 0.0           # 让位程度 0~1：渐变而不是瞬间切换（瞬间跳会"闪一下"）
+    need_hand_yield = False    # 当前这段动画到底用不用手（用不到就不碰配件）
+    pose_from = {}; pose_to = {}      # 姿态还原：起点/终点（一帧硬写会让角色抽搐一下）
+    pose_start = 0.0; POSE_DUR = 0.35
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
     action_pose = {}           # 整套参数的动作前快照（演完连姿态一起还原，见下面注释）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
@@ -324,18 +334,21 @@ def _render_offscreen(bridge, width, height):
                 md = json.load(f)
             scene_params[i] = {c['Id']: c['Segments'][1] for c in md['Curves']}
         except: pass
-    # Touch 组各动作时长（点击/唤醒随机播放后，循环点前收尾）
-    touch_durations = []
+    # Touch 组各动作时长（点击/唤醒随机播放后，循环点前收尾）+ 是否用到手
+    touch_durations, touch_needs_hands = [], []
     try:
         for _it in (_md.get('FileReferences', {}).get('Motions', {}).get('Touch', []) or []):
             with open(os.path.join(MODEL_DIR, _it['File']), 'r', encoding='utf-8') as _f:
-                touch_durations.append(json.load(_f).get('Meta', {}).get('Duration', 0) or 0)
+                _mo = json.load(_f)
+            touch_durations.append(_mo.get('Meta', {}).get('Duration', 0) or 0)
+            touch_needs_hands.append(
+                any(_c.get('Id') in HAND_PARAMS for _c in _mo.get('Curves', [])))
     except Exception:
         pass
     # Action 组（形象转换用的"做事情"动作）：时长 + 道具参数曲线
     # 实测：引擎播这些动作时只驱动姿态/脸，道具参数一律不动（曲线/参数都在也不动）——
     # 所以道具由渲染端自己按关键帧插值写入（同装扮那套写法），播完写回 0。
-    action_durations, action_curves = [], []
+    action_durations, action_curves, action_needs_hands = [], [], []
     try:
         for _it in (_md.get('FileReferences', {}).get('Motions', {}).get('Action', []) or []):
             with open(os.path.join(MODEL_DIR, _it['File']), 'r', encoding='utf-8') as _f:
@@ -352,6 +365,8 @@ def _render_offscreen(bridge, width, height):
                 if _keys:
                     _curves[_pid] = _keys
             action_curves.append(_curves)
+            # action_curves 里已经滤掉了脸/角度，剩下的基本就是道具参数 → 用不用手一眼可判
+            action_needs_hands.append(any(_p in HAND_PARAMS for _p in _curves))
     except Exception:
         pass
 
@@ -434,6 +449,8 @@ def _render_offscreen(bridge, width, height):
                         action_start = time.time()
                         _idx_now = _idx
                         action_until = action_start + action_durations[_idx] + 0.1
+                        need_hand_yield = (_idx < len(action_needs_hands)
+                                           and action_needs_hands[_idx])
                         # 动作前快照：演完还原成"她原本的样子"（这些道具参数没有别的所有者，
                         # 一律写 0 会把常态值改掉——例如 point 常态就是 1.0）
                         action_props = {}
@@ -514,9 +531,12 @@ def _render_offscreen(bridge, width, height):
                         _ti = random.randint(0, len(touch_durations) - 1)
                         model.StartMotion('Touch', _ti, 3)
                         _touch_dur = touch_durations[_ti]
+                        need_hand_yield = (_ti < len(touch_needs_hands)
+                                           and touch_needs_hands[_ti])
                     else:
                         model.StartRandomMotion('Touch', 3)
                         _touch_dur = 0.0
+                        need_hand_yield = False
                     # 脸会在动作末帧定格：记下动作时长，播完把脸还原回她的日常状态（NORMAL_FACE）
                     face_restore_at = time.time() + (_touch_dur or 1.0)
                 elif cmd[0] == 'click':
@@ -534,9 +554,12 @@ def _render_offscreen(bridge, width, height):
                         _ti = random.randint(0, len(touch_durations) - 1)
                         model.StartMotion('Touch', _ti, 3)
                         _touch_dur = touch_durations[_ti]
+                        need_hand_yield = (_ti < len(touch_needs_hands)
+                                           and touch_needs_hands[_ti])
                     else:
                         model.StartRandomMotion('Touch', 3)
                         _touch_dur = 0.0
+                        need_hand_yield = False
                     # 脸会在动作末帧定格：记下动作时长，播完把脸还原回她的日常状态（NORMAL_FACE）
                     face_restore_at = time.time() + (_touch_dur or 1.0)
                 elif cmd[0] == 'mouth':
@@ -632,10 +655,25 @@ def _render_offscreen(bridge, width, height):
             if _eyes_owned != blink_off:
                 model.SetAutoBlinkEnable(not _eyes_owned)
                 blink_off = _eyes_owned
+            # 姿态还原：动作演完后按 0.35 秒把整套参数拉回做动作前的值（一帧写死会抽搐）
+            if pose_start:
+                _pt = (time.time() - pose_start) / POSE_DUR
+                if _pt >= 1.0:
+                    for _pp, _pv in pose_to.items():
+                        model.SetParameterValue(_pp, _pv)
+                    pose_from = {}; pose_to = {}; pose_start = 0.0
+                else:
+                    for _pp, _pv in pose_to.items():
+                        _f0 = pose_from.get(_pp, _pv)
+                        model.SetParameterValue(_pp, _f0 + (_pv - _f0) * _pt)
             # 动画期间（点她 / 做动作）把"手里的东西"放下：朝它原本的值过渡，而不是直接写死——
             # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.25 秒的淡出/淡回。
-            _busy = bool((action_until and time.time() < action_until)
-                         or (face_restore_at and time.time() < face_restore_at))
+            _now = time.time()
+            # ① 只有这段动画真的用手时才让位（吹泡泡/喷水/入场等一个手部参数都不动，配件该留着）
+            # ② 提前 0.35 秒放行：动画收尾本身有淡出，等它完全结束再淡回，中间会看到一段"手里空着"的常态
+            _busy = need_hand_yield and bool(
+                (action_until and _now < action_until - 0.35)
+                or (face_restore_at and _now < face_restore_at - 0.35))
             _target = 1.0 if _busy else 0.0
             if hand_yield != _target:
                 _step = 1.0 / (0.25 * 60)          # 0.25 秒走完
@@ -662,6 +700,11 @@ def _render_offscreen(bridge, width, height):
                     for _ap, _av in action_props.items():
                         model.SetParameterValue(_ap, _av)
                     action_props = {}
+                    if action_pose:
+                        pose_from = {pid: model.GetParameterValue(i)
+                                     for i, pid in enumerate(model.GetParamIds())}
+                        pose_to = dict(action_pose)
+                        pose_start = time.time()
                     action_pose = {}
                     action_until = 0.0
                     model.StopAllMotions()
