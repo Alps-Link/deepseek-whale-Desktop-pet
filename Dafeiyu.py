@@ -985,7 +985,7 @@ COSTUME_SLOTS = [
     ("display", "桌面显示", "常态", [("brush", "画笔"), ("eraser", "橡皮"), ("undo", "撤回"),
                                     ("parfait", "收起巴菲")]),
     ("item", "手持道具", "无", [("omurice", "蛋包饭"), ("paw", "猫爪"),
-                              (["double_peace", "no_board"], "剪刀手"), ("order_press", "点单")]),
+                              (["double_peace", "no_board"], "剪刀手"), (["order_press", "board"], "点单")]),
 ]
 
 # 可以多选并存的槽位（其余槽位互斥单选）。

@@ -710,9 +710,11 @@ def _render_offscreen(bridge, width, height):
                     model.SetParameterValue(_cp, _cv + (_rv - _cv) * hand_yield)
                     continue
                 model.SetParameterValue(_cp, _cv)
-            # 默认收起的东西（见 DEFAULT_OFF_PARAMS）：每帧写一次，装扮/动作有需要时会自己覆盖它
+            # 默认收起的东西（见 DEFAULT_OFF_PARAMS）：每帧写一次，但**装扮正在管这个参数时不写** ——
+            # 否则会把装扮要的值盖掉（蛋包饭选项写的是 point=-1，被这里写成 0 就走样了）
             for _dp, _dv in DEFAULT_OFF_PARAMS.items():
-                model.SetParameterValue(_dp, _dv)
+                if _dp not in costume_params:
+                    model.SetParameterValue(_dp, _dv)
             if action_until:
                 _el = time.time() - action_start
                 if _el <= action_until - action_start:
