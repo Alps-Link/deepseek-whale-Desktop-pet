@@ -299,6 +299,7 @@ def _render_offscreen(bridge, width, height):
     costume_names = {}         # 装扮：{槽位: [表情名…]}，用于按装扮重算构图
     hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间写回它＝先放下
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
+    action_pose = {}           # 整套参数的动作前快照（演完连姿态一起还原，见下面注释）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
     _idx_now = -1              # 当前动作索引（对应 action_curves）
     action_until = 0.0         # 动作预计结束时间
@@ -438,6 +439,11 @@ def _render_offscreen(bridge, width, height):
                         for _p in (action_curves[_idx] if _idx < len(action_curves) else {}):
                             if _p in _param_ids:
                                 action_props[_p] = model.GetParameterValue(_param_ids.index(_p))
+                        # 整套参数快照：引擎会把动作末帧的姿势定格下来，只还原"道具参数"不够 ——
+                        # 实测装猫爪做完自拍后 maoshou 明明是 1，但那套手部姿态让猫爪根本显示不出来，
+                        # 看上去就像退回了常态（用户报的"回到的是常态而不是装备的猫爪配件"）。
+                        action_pose = {pid: model.GetParameterValue(i)
+                                       for i, pid in enumerate(model.GetParamIds())}
                 elif cmd[0] == 'costume':
                     # 装扮配件（按槽位互斥）：换的时候先把该槽位旧参数写回 0，再写新装扮；
                     # 然后每帧强制写入——动作会把这些参数顶掉（卡梅莉亚那套同理）
@@ -641,10 +647,15 @@ def _render_offscreen(bridge, width, height):
                     for _ap in action_props:
                         model.SetParameterValue(_ap, _curve_value(_curves_now.get(_ap), _el))
                 else:
-                    # 演完：道具还原成动作前的值（引擎没有所有者会定格），并回待机
+                    # 演完：还原成做动作前的样子（引擎没有所有者会定格），并回待机。
+                    # 先整份还原姿态，再按道具参数表覆盖一次（后者是动作期间逐帧插值写过的，
+                    # 快照本身也含它们，这里只是保证顺序明确）
+                    for _pp, _pv in action_pose.items():
+                        model.SetParameterValue(_pp, _pv)
                     for _ap, _av in action_props.items():
                         model.SetParameterValue(_ap, _av)
                     action_props = {}
+                    action_pose = {}
                     action_until = 0.0
                     model.StopAllMotions()
                     model.StartRandomMotion('Idling', 4)
