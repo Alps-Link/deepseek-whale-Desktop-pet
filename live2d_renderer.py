@@ -297,7 +297,8 @@ def _render_offscreen(bridge, width, height):
     costume_rest = {}          # 装扮：{槽位: {参数: 原本的值}}，摘掉时还原成它
     costume_params = {}        # 上面各槽位合并后的写入表
     costume_names = {}         # 装扮：{槽位: [表情名…]}，用于按装扮重算构图
-    hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间写回它＝先放下
+    hand_rest = {}             # 手里拿的东西：{参数: 原本的值}，动画期间淡出到它＝先放下
+    hand_yield = 0.0           # 让位程度 0~1：渐变而不是瞬间切换（瞬间跳会"闪一下"）
     action_props = {}          # 本动作涉及的道具参数 → 动作结束时要还原成的值（动作前快照）
     action_pose = {}           # 整套参数的动作前快照（演完连姿态一起还原，见下面注释）
     action_start = 0.0         # 动作开始时间（用于按 elapsed 插值道具曲线）
@@ -631,13 +632,19 @@ def _render_offscreen(bridge, width, height):
             if _eyes_owned != blink_off:
                 model.SetAutoBlinkEnable(not _eyes_owned)
                 blink_off = _eyes_owned
-            # 动画期间（点她 / 做动作）把"手里的东西"放下：写回它原本的值，而不是"不写"——
-            # 不写的话参数会保持上一次的值（猫爪还是 1），等于没放下。动画结束写入恢复，东西自动回来。
+            # 动画期间（点她 / 做动作）把"手里的东西"放下：朝它原本的值过渡，而不是直接写死——
+            # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.25 秒的淡出/淡回。
             _busy = bool((action_until and time.time() < action_until)
                          or (face_restore_at and time.time() < face_restore_at))
+            _target = 1.0 if _busy else 0.0
+            if hand_yield != _target:
+                _step = 1.0 / (0.25 * 60)          # 0.25 秒走完
+                hand_yield = max(0.0, min(1.0, hand_yield +
+                                          (_step if _target > hand_yield else -_step)))
             for _cp, _cv in costume_params.items():
-                if _busy and _cp in hand_rest:
-                    model.SetParameterValue(_cp, hand_rest[_cp])
+                if hand_yield > 0.0 and _cp in hand_rest:
+                    _rv = hand_rest[_cp]
+                    model.SetParameterValue(_cp, _cv + (_rv - _cv) * hand_yield)
                     continue
                 model.SetParameterValue(_cp, _cv)
             if action_until:
