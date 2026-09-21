@@ -898,6 +898,10 @@ def load_costume_config():
         if not picked:
             continue
         out[slot] = picked if slot in COSTUME_MULTI_SLOTS else picked[0]
+    # 必须有的槽位（手持道具）：没存过、或存档里是空的 ⇒ 用默认的「点单」
+    for _slot, _val in DEFAULT_COSTUME.items():
+        if not out.get(_slot):
+            out[_slot] = list(_val)
     return out
 
 def save_costume_config(choice):
@@ -993,6 +997,10 @@ COSTUME_SLOTS = [
 # 巴菲是反的：她常态就摆着一份，所以这一项写作"收起巴菲"（同发饰槽"摘掉发箍"的先例）。
 COSTUME_MULTI_SLOTS = {"display"}
 
+
+# 不提供"无"选项、必须有东西的槽位；以及没存过装扮时的默认选择
+COSTUME_REQUIRED_SLOTS = {"item"}
+DEFAULT_COSTUME = {"item": ["order_press", "board"]}
 
 def _costume_toggle(choice, slot, name):
     """算出点击某个装扮按钮之后该槽位的新选择值。
@@ -6518,7 +6526,9 @@ class DesktopPet:
                      bg=DIALOG_BG).pack(anchor='w', pady=(8, 2))
             row = None
             # 一排最多 6 个按钮，超了自动换行（"手持道具"有 12 个按钮，一行放不下会被窗口右边界裁掉）
-            for _i, (name, item_label) in enumerate([(None, clear_label)] + items):
+            # 必须有的槽位不给"无"按钮（手持道具：她总得有件拿的东西）
+            _opts = ([] if slot in COSTUME_REQUIRED_SLOTS else [(None, clear_label)]) + items
+            for _i, (name, item_label) in enumerate(_opts):
                 if _i % 6 == 0:
                     row = tk.Frame(frame, bg=DIALOG_BG)
                     row.pack(anchor='w')
