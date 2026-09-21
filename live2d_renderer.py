@@ -653,13 +653,14 @@ def _render_offscreen(bridge, width, height):
             # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.25 秒的淡出/淡回。
             _now = time.time()
             # ① 只有这段动画真的用手时才让位（吹泡泡/喷水/入场等一个手部参数都不动，配件该留着）
-            # ② 提前 0.35 秒放行：动画收尾本身有淡出，等它完全结束再淡回，中间会看到一段"手里空着"的常态
+            # ② 提前 0.5 秒放行、0.12 秒过渡 ⇒ 动作还没演完配件就完全回来了。
+            # 收尾时看到的就是"装备好的样子"，不会先露出底层手形（用户说的"右手先变回握笔"）
             _busy = need_hand_yield and bool(
-                (action_until and _now < action_until - 0.35)
-                or (face_restore_at and _now < face_restore_at - 0.35))
+                (action_until and _now < action_until - 0.5)
+                or (face_restore_at and _now < face_restore_at - 0.5))
             _target = 1.0 if _busy else 0.0
             if hand_yield != _target:
-                _step = 1.0 / (0.25 * 60)          # 0.25 秒走完
+                _step = 1.0 / (0.12 * 60)          # 0.12 秒走完（要快：慢了会在动作收尾时露出底层手形）
                 hand_yield = max(0.0, min(1.0, hand_yield +
                                           (_step if _target > hand_yield else -_step)))
             for _cp, _cv in costume_params.items():
