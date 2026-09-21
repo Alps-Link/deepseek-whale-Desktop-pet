@@ -878,6 +878,33 @@ def load_character_config():
         persona = _migrate_persona_from_system_prompt() or DEFAULT_PERSONA
     return {"name": name, "persona": persona}
 
+def load_costume_config():
+    """装扮选择（持久化）：{槽位: 装扮名 或 [装扮名…]}。
+
+    只保留"现在仍然存在的选项"——装扮表改过（比如删掉手机/爱心、新增桌面显示）之后，
+    存档里的旧名字直接丢掉，不让它在界面上变成一个点不亮的空状态。
+    多选槽位（COSTUME_MULTI_SLOTS）存列表，其余槽位存单个名字；空槽位不存。
+    """
+    data = _get_section("costume")
+    valid = {slot: {str(n) for n, _ in items} for slot, _l, _c, items in COSTUME_SLOTS}
+    out = {}
+    for slot, val in (data or {}).items():
+        if slot not in valid:
+            continue
+        # 存档可能是手改的：单选槽位也可能被写成列表，多选槽位也可能被写成单个名字。
+        # 这里统一成列表再挑一遍，挑完按槽位类型决定落成列表还是单个名字。
+        # （早先直接 `val in valid[slot]` 碰到列表会 TypeError，把程序崩在启动那一步）
+        picked = [n for n in (val if isinstance(val, list) else [val]) if n in valid[slot]]
+        if not picked:
+            continue
+        out[slot] = picked if slot in COSTUME_MULTI_SLOTS else picked[0]
+    return out
+
+def save_costume_config(choice):
+    """把当前装扮写回 config.json 的 costume 节（摘干净的槽位不落盘）"""
+    sec = {k: v for k, v in (choice or {}).items() if v}
+    _update_section("costume", sec)
+
 def _migrate_persona_from_system_prompt():
     """从旧 system_prompt.txt 切分出人设：去掉开头"你是X，"前缀与【回复格式要求】段"""
     if not os.path.exists(SYSTEM_PROMPT_FILE):
@@ -2488,7 +2515,8 @@ class DesktopPet:
 
         # 形象转换与装扮
         self.action_timer_job = None   # 下一次自发做动作的定时器
-        self.costume_choice = {}       # {槽位: 装扮名 or None}
+        self.costume_choice = load_costume_config()   # 装扮（持久化，见 load_costume_config）
+        self._costume_applied = False  # 渲染器就绪后把存档的装扮穿回去（只做一次）
         self._costume_buttons = {}     # {(槽位, 装扮名): 按钮}，用于刷新选中高亮
         topic_cfg = load_topic_config()
         self.topic_interval_minutes = topic_cfg["interval_minutes"]
@@ -3704,6 +3732,11 @@ class DesktopPet:
             self.spine_enabled = False
 
     def _on_renderer_frame(self, src_w_full, src_h_full, rgba_bytes):
+        if not self._costume_applied and self.spine is not None and self.spine.is_ready():
+            try:
+                self._apply_saved_costumes()
+            except Exception as e:
+                log.warning("恢复装扮异常: %s", e)
         """renderer 线程：帧已是显示尺寸（渲染端不再做聚焦裁剪），这里只缩放到显示尺寸。"""
         if not self.spine_enabled:
             return
@@ -6502,6 +6535,19 @@ class DesktopPet:
                       font=(self.font_family, 11)).pack(pady=(10, 0))
         self._refresh_costume_buttons()
 
+    def _apply_saved_costumes(self):
+        """渲染器就绪后把上次的装扮穿回去（只调一次；渲染线程里执行，set_costume 只是入队）"""
+        self._costume_applied = True
+        for slot, _label, _clear, _items in COSTUME_SLOTS:
+            val = self.costume_choice.get(slot)
+            if not val:
+                continue
+            try:
+                self.spine.set_costume(slot, val)
+                log.info("装扮：%s → %s（启动恢复）", slot, val)
+            except Exception as e:
+                log.warning("恢复装扮失败 %s: %s", slot, e)
+
     def _refresh_costume_buttons(self):
         for (slot, key), btn in self._costume_buttons.items():
             chosen = self.costume_choice.get(slot)
@@ -6529,6 +6575,7 @@ class DesktopPet:
         except Exception:
             pass
         log.info("装扮：%s → %s", slot, chosen if chosen else "无")
+        save_costume_config(self.costume_choice)
         self._refresh_costume_buttons()
 
     def start_topic_timer(self):
