@@ -67,17 +67,14 @@ FIT_OFFSET_Y = -0.053  # 下移 6.4px（单位=显示高的一半），让下边
 # 桌面显示槽（画笔/橡皮/撤回/收起巴菲）不让位：巴菲是"写 1 才收起"的反向开关，
 # 停写会让它每次点她都弹回来；那几件也不跟动画抢参数。
 HAND_SLOTS = {'claw', 'item'}
-# "桌面显示"槽整体不让位（巴菲是"写 1 才收起"的反向开关，停写会让它每次点她都弹回来），
-# 但画笔/橡皮/撤回确实是手里拿的 —— 单独列进来，跟猫爪一起淡出淡回。
-# 少了这一步，动作结束时会看到"先回到握着笔的常态、过一下才变回猫爪"（用户反馈）。
-HAND_EXTRA_PARAMS = ('bi', 'pi', 'chehui')
+# 说明：画笔/橡皮/撤回/巴菲 都在"桌面显示"槽，它们是**桌布上的图标**（不是手里拿的东西），
+# 所以整个槽都不参与让位、动画期间照常亮着（巴菲还额外是"写 1 才收起"的反向开关）。
 # 判断"这段动画用不用手"的参数名：动画曲线里出现任意一个，就说明它要靠手演东西
 # （实测：挤番茄酱/开盖/自拍/快速自拍 有；吹泡泡/喷水/入场/待机 一个都没有）。
 # 用不到手的动画就**不该**碰她的配件——用户原话："吹泡泡糖用不到手，为什么动作期间手会变成原始常态"。
 HAND_PARAMS = {'phone', 'phone2', 'phone3', 'phone4', 'phone5', 'phone6', 'phone7', 'shouji',
                'ji', 'danbaoX', 'danbaoY', 'danbaofan', 'danbaoz', 'point', 'pointZ',
-               'keyboard', 'xbox', 'aixing', 'maoshou', 'mozhua', 'mozhua2', 'bi', 'pi',
-               'chehui'}
+               'keyboard', 'xbox', 'aixing', 'maoshou', 'mozhua', 'mozhua2'}
 COSTUME_FIT = {
     'bunny_sticker': (1.213, -0.100),   # 兔耳
     'whale':         (1.258, -0.075),   # 头顶鲸
@@ -505,12 +502,10 @@ def _render_offscreen(bridge, width, height):
                     for _sp in costume_slots.values():
                         costume_params.update(_sp)
                     costume_names[_slot] = list(_names)
-                    # 手里的东西 → 它们"原本的值"（放下时写回它）
-                    hand_rest = {}
-                    for _sl, _ps in costume_slots.items():
-                        for _p in _ps:
-                            if _sl in HAND_SLOTS or _p in HAND_EXTRA_PARAMS:
-                                hand_rest[_p] = costume_rest.get(_sl, {}).get(_p, 0.0)
+                    # 手里拿的东西 → 它们"原本的值"（放下时写回它）
+                    hand_rest = {_p: costume_rest.get(_sl, {}).get(_p, 0.0)
+                                 for _sl, _ps in costume_slots.items() if _sl in HAND_SLOTS
+                                 for _p in _ps}
                     # 装扮会改内容高度（兔耳最明显）→ 重算构图，否则头顶多出来的会被上边界裁掉。
                     # 多件同时挂时取"缩得最狠的那件"的一套（它自带对应的偏移）。
                     _fits = [COSTUME_FIT[_n] for _sl in costume_names.values()
