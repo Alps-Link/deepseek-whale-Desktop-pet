@@ -886,15 +886,27 @@ def load_costume_config():
     多选槽位（COSTUME_MULTI_SLOTS）存列表，其余槽位存单个名字；空槽位不存。
     """
     data = _get_section("costume")
-    valid = {slot: {str(n) for n, _ in items} for slot, _l, _c, items in COSTUME_SLOTS}
+    # 选项名可能是单个表情名，也可能是表情名列表（「点单」= order_press + board、
+    # 「剪刀手」= double_peace + no_board）。键统一取 str(name)（界面按钮的 key 也是这么取的），
+    # 值放回原样的选项名——千万别只留下 str(name) 这个键，否则列表选项会被拍成
+    # "['order_press', 'board']" 这种字符串，存档里的列表值再按元素比对就一个都命不中，
+    # 结果就是「点单/剪刀手」重启后被悄悄换成默认项。
+    tables = {}
+    for slot, _l, _c, items in COSTUME_SLOTS:
+        tables[slot] = {str(n): n for n, _label in items}
     out = {}
     for slot, val in (data or {}).items():
-        if slot not in valid:
+        table = tables.get(slot)
+        if not table:
             continue
-        # 存档可能是手改的：单选槽位也可能被写成列表，多选槽位也可能被写成单个名字。
-        # 这里统一成列表再挑一遍，挑完按槽位类型决定落成列表还是单个名字。
-        # （早先直接 `val in valid[slot]` 碰到列表会 TypeError，把程序崩在启动那一步）
-        picked = [n for n in (val if isinstance(val, list) else [val]) if n in valid[slot]]
+        # 先拿存档值整体比对一次（单选槽位存的就是选项名本身，可能是个列表）；
+        # 对不上再退回按元素挑，兼容手改过的旧存档与多选槽位。
+        cands = [val] + (list(val) if isinstance(val, list) else [])
+        picked = []
+        for cand in cands:
+            name = table.get(str(cand))
+            if name is not None and name not in picked:
+                picked.append(name)
         if not picked:
             continue
         out[slot] = picked if slot in COSTUME_MULTI_SLOTS else picked[0]
