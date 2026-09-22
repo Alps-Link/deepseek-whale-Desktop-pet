@@ -550,28 +550,24 @@ def _render_offscreen(bridge, width, height):
                 elif cmd[0] == 'test_motion':
                     model.StartMotion(cmd[1], cmd[2], 5)
                 elif cmd[0] == 'wake':
-                    # 苏醒：播随机触摸动画；同时把 Idling 以更低优先级排队，
-                    # 动画播完由 Cubism 自己交叉淡入接管（不硬停、不动参数）
+                    # 苏醒：**只睁眼 + 回常态，不播动作、不碰手部配件**。
+                    # 这里原来是"随机播一段触摸动画"，而触摸动画会按自身曲线触发"手部配件让位"——
+                    # 可触摸动画本身一个道具参数都不驱动（探针实测 phone4/phone6/ji/danbaoX 全程 0.00），
+                    # 让位的结果只是把她手里的东西拿走、2.6~5.0 秒里没有任何东西顶上来
+                    # （用户看到的就是"睡眠唤醒后双手消失一会儿又回来"；实测抽到番茄酱要 5.01s）。
+                    # 所以醒来只做三件事：睁眼（睡眠期间每帧强制闭眼）、摘掉睡眠表情、解开让位。
                     active_scene = None
-                    expression_active = None   # 触摸/唤醒接管面部，表情不再拥有嘴
+                    expression_active = None
                     trans_to = {}
                     trans_return = False
-                    # 先清掉当前动作（否则新一轮触摸会因优先级不高于它而被拒），再播触摸动作
-                    model.StopAllMotions()
-                    if touch_durations:
-                        _ti = random.randint(0, len(touch_durations) - 1)
-                        model.StartMotion('Touch', _ti, 3)
-                        _touch_dur = touch_durations[_ti]
-                        need_hand_yield = (_ti < len(touch_needs_hands)
-                                           and touch_needs_hands[_ti])
-                        hand_busy_until = (time.time() + touch_hand_until[_ti]
-                                           if _ti < len(touch_hand_until) else 0.0)
-                    else:
-                        model.StartRandomMotion('Touch', 3)
-                        _touch_dur = 0.0
-                        need_hand_yield = False
-                    # 脸会在动作末帧定格：记下动作时长，播完把脸还原回她的日常状态（NORMAL_FACE）
-                    face_restore_at = time.time() + (_touch_dur or 1.0)
+                    sleep_eyes = False           # 睁眼
+                    last_emo_expr = None
+                    model.ResetExpressions()     # 摘掉睡眠表情（drool）
+                    need_hand_yield = False      # 唤醒不算"她在用手"：手部配件不掉
+                    hand_busy_until = 0.0
+                    face_restore_at = 0.0        # 没播动作，不需要"等动作播完再收脸"
+                    # 保证有待机在跑（若正有更高优先级的动作在播，引擎会忽略这次调用）
+                    model.StartRandomMotion('Idling', 1)
                 elif cmd[0] == 'click':
                     # 触摸：播随机触摸动画（优先级 5 立刻插入），并把 Idling 以更低优先级
                     # 排队 —— Touch 播完后由 Cubism 用动作自身的淡入淡出接管呼吸，
@@ -691,13 +687,13 @@ def _render_offscreen(bridge, width, height):
                 model.SetAutoBlinkEnable(not _eyes_owned)
                 blink_off = _eyes_owned
             # 动画期间（点她 / 做动作）把"手里的东西"放下：朝它原本的值过渡，而不是直接写死——
-            # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.25 秒的淡出/淡回。
+            # 直接写会"闪一下"，不写又等于没放下（参数会保持上一个值）。所以做成 0.12 秒的淡出/淡回。
             _now = time.time()
             # ① 只有这段动画真的用手时才让位（吹泡泡/喷水/入场等一个手部参数都不动，配件该留着）
-            # ② 提前 0.5 秒放行、0.12 秒过渡 ⇒ 动作还没演完配件就完全回来了。
-            # 收尾时看到的就是"装备好的样子"，不会先露出底层手形（用户说的"右手先变回握笔"）
-            # 让位只覆盖"手部参数真的在动"的那一段（hand_busy_until 由动作曲线算出），
-            # 动作自带的"回到默认手形"收尾不再被盖住 ⇒ 不会再先露出握笔手形
+            # ② 让位截止点 = 手部参数"偏离起始值"的最后时刻（hand_busy_until，由动作曲线算出）：
+            #    恒定参数（如 phone 恒为常态 1.0）不计入，动作自带的"回到默认手形"收尾也不再被盖住
+            #    ⇒ 配件在动作演完之前就淡回来，不会先露出底层手形。
+            # ③ 唤醒**不**走这条路（见上面 wake 分支）：醒来不播动作，配件一律不动。
             _busy = need_hand_yield and _now < hand_busy_until
             _target = 1.0 if _busy else 0.0
             if hand_yield != _target:
