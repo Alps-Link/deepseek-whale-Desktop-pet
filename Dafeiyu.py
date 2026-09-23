@@ -1043,6 +1043,23 @@ def save_zoom_config(char, bubble, input_zoom, width):
     _update_section("zoom", {"zoom_char": char, "zoom_bubble": bubble, "zoom_input": input_zoom,
                              "window_width": width})
 
+DEFAULT_WAKE_WINDOW = 8.0     # 免唤醒窗口默认秒数（0 = 关闭，每次都要喊名字）
+
+def load_voice_config():
+    """语音识别设置：{"wake_window": 秒}。
+    免唤醒窗口 = 她说完话之后这段时间里直接说话不用先喊名字；0 = 关闭（每次都要喊名字）。"""
+    sec = _get_section("voice", {"wake_window": DEFAULT_WAKE_WINDOW})
+    try:
+        v = float(sec.get("wake_window", DEFAULT_WAKE_WINDOW))
+    except (TypeError, ValueError):
+        v = DEFAULT_WAKE_WINDOW
+    if v != v or v < 0:          # NaN / 负数都当默认
+        v = DEFAULT_WAKE_WINDOW
+    return {"wake_window": min(v, 60.0)}
+
+def save_voice_config(wake_window):
+    _update_section("voice", {"wake_window": float(wake_window)})
+
 def save_chats(chats):
     save_json_file(CHATS_LOG_FILE, chats)
 
@@ -2108,6 +2125,22 @@ class SileroVAD:
         return self._segments.pop(0)
 
 
+def _speech_start(vad, n_samples, sample_rate, t_pop):
+    """由"语音段被取走的时刻"反推这段话**开口**的时刻。
+
+    VAD 要等连续 min_silence_duration 的静音才封段，所以段尾固定含一段静音：
+        tail       = 封段所需静音时长
+        说完       ≈ t_pop − tail
+        开口       ≈ 说完 −（段长 − tail）
+    用途：免唤醒窗口的判据要用"开口时刻"，否则比开口晚 ~0.6 秒（BUG1）。
+    """
+    tail = 0.0
+    if vad is not None:
+        tail = (vad.min_silence_frames * vad.window_size) / float(sample_rate)
+    dur = n_samples / float(sample_rate)
+    return t_pop - tail - max(0.0, dur - tail)
+
+
 class LocalParaformerSTT:
     """本地语音识别（sherpa-onnx Paraformer 离线中文 + silero VAD）：
     双线程架构——录音循环用 VAD 检测语音段（过滤风扇/咀嚼等非语音噪音），
@@ -2124,6 +2157,7 @@ class LocalParaformerSTT:
         self.recording = False
         self.muted = False  # 宠物自己 TTS 说话时静音，避免“听见自己”
         self.audio_queue = queue.Queue()
+        self.wake_window = DEFAULT_WAKE_WINDOW   # 免唤醒窗口秒数（0 = 关闭，由 App 从设置推过来）
         self.ready = False
         self.load_failed = False
         # 会话窗：唤醒后这段时间内说话无需再喊名字，超时自动回到待唤醒
@@ -2135,11 +2169,29 @@ class LocalParaformerSTT:
             log.info("STT 静音切换: muted=%s", bool(on))
         self.muted = bool(on)
 
-    def refresh_window(self):
-        """刷新免唤醒词窗口（宠物输出完毕 / 说话 / 唤醒时调用）"""
-        self._active_until = time.time() + self.CONVERSATION_WINDOW
+    def set_wake_window(self, seconds):
+        """设置免唤醒窗口秒数（0 = 关闭：每次说话都要先喊名字）"""
+        try:
+            v = float(seconds)
+        except (TypeError, ValueError):
+            v = DEFAULT_WAKE_WINDOW
+        self.wake_window = max(0.0, min(v, 60.0))
+        if self.wake_window <= 0:
+            self._active_until = 0.0        # 关掉时立刻失效，别让旧窗口继续生效
+        log.info("免唤醒窗口: %s", "关闭" if self.wake_window <= 0 else "%.1f 秒" % self.wake_window)
 
-    CONVERSATION_WINDOW = 8.0  # 免唤醒词窗口：宠物输出完毕（气泡打完/TTS播完）后 8 秒内可直接说话
+    def refresh_window(self):
+        """刷新免唤醒词窗口（宠物输出完毕 / 说话 / 唤醒时调用）；窗口为 0（关闭）时什么都不做"""
+        if self.wake_window <= 0:
+            self._active_until = 0.0
+            return
+        self._active_until = time.time() + self.wake_window
+
+    def window_left(self):
+        """窗口剩余秒数（<=0 表示已关闭/已过期）"""
+        return self._active_until - time.time()
+
+    CONVERSATION_WINDOW = DEFAULT_WAKE_WINDOW   # 兼容旧引用：默认窗口长度
 
     @property
     def wake_prefix(self):
@@ -2222,13 +2274,17 @@ class LocalParaformerSTT:
                             return True
         return False
 
-    def _classify(self, text):
+    def _classify(self, text, speech_start=None):
         """把转写文本分类为 (mode, content)：
         - ("content", 文本)：需要发送的内容（唤醒词已去除）
         - ("wake", None)：只说唤醒词，进入聆听状态等待指令
         - ("ignore", None)：直接说话（未唤醒）或噪音，不响应
-        发送内容或只说唤醒词都会开启会话窗（期间免唤醒词）。"""
-        now = time.time()
+        发送内容或只说唤醒词都会开启会话窗（期间免唤醒词）。
+
+        speech_start：这段话**开口**的时刻。判据必须用它，不能用"此刻"——
+        转写要等 VAD 攒够静音（0.5s）再跑识别，比开口晚 0.6 秒左右，
+        用"此刻"会把跨过窗口边界的话整句判成"没喊名字"（BUG1）。"""
+        now = speech_start if speech_start is not None else time.time()
         if now < self._active_until:
             # 会话窗内：无需唤醒词；带上唤醒词也自动去掉
             content = self._wake_check(text)
@@ -2326,8 +2382,9 @@ class LocalParaformerSTT:
             chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             self.vad.accept_waveform(chunk)
             # VAD 判定出的语音段 → 送转写（风扇/咀嚼/键盘等非语音噪音不会形成语音段）
+            # 连同"段被取走的时刻"一起入队：转写循环要用它反推这段话的开口时刻（见 _speech_start）
             while not self.vad.empty():
-                self.audio_queue.put(self.vad.pop())
+                self.audio_queue.put((self.vad.pop(), time.time()))
         stream.stop_stream()
         stream.close()
         p.terminate()
@@ -2335,9 +2392,14 @@ class LocalParaformerSTT:
     def _transcribe_loop(self):
         while self.recording:
             try:
-                audio = self.audio_queue.get(timeout=0.05)
+                item = self.audio_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+            # 录音循环放进来的是 (语音段, 取走时刻)；兼容旧格式（裸数组）
+            if isinstance(item, tuple):
+                audio, t_pop = item
+            else:
+                audio, t_pop = item, time.time()
             try:
                 stream = self.recognizer.create_stream()
                 stream.accept_waveform(self.SAMPLE_RATE, audio)
@@ -2345,8 +2407,13 @@ class LocalParaformerSTT:
                 text = stream.result.text.strip()
                 if not text:
                     continue
-                mode, content = self._classify(text)
+                # BUG1：判窗口用"这段话开口的时刻"，不是"转写完成的时刻"
+                speech_start = _speech_start(self.vad, len(audio), self.SAMPLE_RATE, t_pop)
+                mode, content = self._classify(text, speech_start)
                 if mode == "ignore":
+                    # 记一行：用户问"为什么她没理我"时，这是唯一线索（窗口已过 + 句子里没喊名字）
+                    log.info("语音丢弃（窗口剩余 %.1fs，句中没有唤醒词）: %s",
+                             self.window_left(), text)
                     continue
                 # 说话/唤醒被接受：开启免唤醒词窗口
                 self.refresh_window()
@@ -2515,6 +2582,9 @@ class DesktopPet:
         self.manual_sleep = False
         self.sleep_start_time = None
         self.input_visible = load_ui_config()["input_visible"]   # 上次把输入框收起来就保持收起
+        self.voice_cfg = load_voice_config()                     # 语音识别设置（免唤醒窗口）
+        self._badge = None                                       # 「在听」小标记（头顶小胶囊）
+        self._badge_visible = False
 
         # 精力值系统
         self.energy = MAX_ENERGY
@@ -2591,6 +2661,11 @@ class DesktopPet:
                 dispatcher=self._ui,
                 pet=self
             )
+            try:
+                self.stt.set_wake_window(self.voice_cfg.get("wake_window", DEFAULT_WAKE_WINDOW))
+            except Exception as e:
+                log.warning("应用免唤醒窗口设置失败: %s", e)
+            self._init_listen_badge()
         else:
             self.mode_menu.entryconfigure(self.voice_menu_index, label="🎤 语音识别 (不可用)", state="disabled")
 
@@ -2602,7 +2677,7 @@ class DesktopPet:
             self.start_topic_timer()
 
         self.start_action_timer()   # 形象转换：她自己找件事做
-        self.start_energy_tick()
+        self.start_energy_tick()    # 「在听」标记的 tick 由 _init_listen_badge 启动（单一路径，别重复调）
 
         # Live2D 渲染器（立即启动）
         if SPINE_AVAILABLE:
@@ -3573,6 +3648,7 @@ class DesktopPet:
         settings_menu.add_command(label="阅读设置", command=self.open_reading_settings)
         settings_menu.add_command(label="话题定时器设置...", command=self.open_topic_timer_settings)
         settings_menu.add_command(label="🎵 音乐库设置...", command=self.open_music_library_settings)
+        settings_menu.add_command(label="🎤 语音识别设置...", command=self.open_voice_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🎩 装扮", command=self._open_costume_window)
         settings_menu.add_command(label="关于", command=self.show_about)
@@ -7262,6 +7338,63 @@ OCR文字：
                       radius=int(6 * s), font=(self.font_family, 11)).grid(row=10, column=0, columnspan=2, sticky="e", pady=15)
 
     # ---------- 语音识别控制 ----------
+    def _init_listen_badge(self):
+        """「在听」小标记：免唤醒窗口开着时，在宠物头顶上方显示一个小胶囊。
+
+        免唤醒窗口是不可见的，用户只能靠猜自己还在不在窗口里 —— 这个标记就是为了
+        让他"一眼看出现在出声会不会被听到"。窗口关掉（0 秒）时永远不显示。"""
+        try:
+            s = self._dpi_scale
+            w, h = int(78 * s), int(24 * s)
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.configure(bg=CARD_MASK)
+            if CARD_MASK:
+                win.attributes("-transparentcolor", CARD_MASK)
+            win.attributes("-topmost", True)
+            cv = tk.Canvas(win, width=w, height=h, highlightthickness=0, bd=0, bg=CARD_MASK)
+            cv.pack()
+            self._badge_photo = _card_photo(w, h, max(6, int(11 * s)))
+            cv.create_image(0, 0, anchor="nw", image=self._badge_photo)
+            cv.create_text(w // 2, h // 2, text="🎤 在听", font=(self.font_family, int(9 * s)),
+                           fill=TEXT_MAIN)
+            win.withdraw()
+            self._badge = win
+            self._badge_visible = False
+        except Exception as e:
+            log.warning("「在听」标记创建失败: %s", e)
+            self._badge = None
+        # tick 单独起：调度失败不该把已建好的标记丢掉
+        if self._badge is not None:
+            try:
+                self.root.after(250, self._badge_tick)
+            except Exception:
+                pass
+
+    def _badge_tick(self):
+        """每 0.25 秒同步一次标记的显隐与位置（只读 STT 的窗口状态，不碰渲染线程）"""
+        try:
+            if self._badge is not None:
+                listening = bool(self.voice_on and self.stt is not None
+                                 and self.stt.window_left() > 0)
+                if listening != self._badge_visible:
+                    self._badge_visible = listening
+                    if listening:
+                        self._badge.deiconify()
+                        self._badge.lift()
+                    else:
+                        self._badge.withdraw()
+                if listening:
+                    bw = max(1, self._badge.winfo_width())
+                    bh = max(1, self._badge.winfo_height())
+                    x = self.root.winfo_rootx() + (self.root.winfo_width() - bw) // 2
+                    y = self.root.winfo_rooty() - bh - int(4 * self._dpi_scale)
+                    self._badge.geometry(f"+{x}+{max(0, y)}")
+        except Exception:
+            pass
+        if not self._shutdown:
+            self.root.after(250, self._badge_tick)
+
     def toggle_voice(self):
         if not VOICE_AVAILABLE:
             messagebox.showwarning("缺少依赖", "语音识别需要安装 sherpa-onnx pyaudio numpy")
@@ -7308,10 +7441,72 @@ OCR文字：
             pass
         return False
 
+    def open_voice_settings(self):
+        """🎤 语音识别设置：免唤醒窗口（0 = 关闭，每次都要喊名字）"""
+        win, frame = self._make_card_window("语音识别设置", 430, 300)
+        s = self._dpi_scale
+        cur = float(self.voice_cfg.get("wake_window", DEFAULT_WAKE_WINDOW))
+        choice = {"v": cur}
+        btn_map = {}
+
+        # 底部按钮先 pack（布局铁律：内容变高时收尾按钮不被挤走）
+        btn_frame = tk.Frame(frame, bg=DIALOG_BG)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+
+        def save():
+            v = float(choice["v"])
+            self.voice_cfg["wake_window"] = v
+            try:
+                save_voice_config(v)
+            except Exception as e:
+                log.warning("保存语音设置失败: %s", e)
+            if self.stt is not None:
+                try:
+                    self.stt.set_wake_window(v)
+                except Exception as e:
+                    log.warning("应用免唤醒窗口失败: %s", e)
+            messagebox.showinfo("成功", "已保存：免唤醒窗口关闭（每次说话都要先喊名字）"
+                                if v <= 0 else "已保存：免唤醒窗口 %d 秒" % int(v))
+            win.destroy()
+
+        RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
+                      radius=int(6 * s), font=(self.font_family, 11)).pack(side=tk.LEFT, padx=3)
+
+        tk.Label(frame, text="免唤醒窗口", font=(self.font_family, 12, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor='w', pady=(6, 2))
+        tk.Label(frame, text="她说完话之后的这段时间里，你直接说话不用先喊名字；\n"
+                             "关掉之后每一次说话都要先喊她名字（点歌报编号也一样）。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w')
+
+        def select(v):
+            choice["v"] = v
+            for _v, _b in btn_map.items():
+                try:
+                    _b.set_variant("primary" if _v == v else "subtle")
+                except Exception:
+                    pass
+
+        row = tk.Frame(frame, bg=DIALOG_BG)
+        row.pack(anchor='w', pady=10)
+        for v, label in ((0.0, "关闭"), (3.0, "3 秒"), (5.0, "5 秒"),
+                         (8.0, "8 秒"), (15.0, "15 秒")):
+            b = RoundedButton(row, text=label, width=int(62 * s), height=int(30 * s),
+                              radius=int(8 * s), font=(self.font_family, 10),
+                              variant="primary" if abs(v - cur) < 0.01 else "subtle",
+                              command=lambda vv=v: select(vv))
+            b.pack(side=tk.LEFT, padx=(0, 6))
+            btn_map[v] = b
+
+        tk.Label(frame, text="窗口开着的时候，她头顶会显示一个「🎤 在听」小标记；\n"
+                             "她说话期间麦克风是静音的，所以那会儿你出声不会打断她。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w', pady=(6, 0))
+
     def on_speech_recognized(self, text, mode="content"):
         self.last_interaction_time = time.time()
         try:
-            remain = (self.stt._active_until - time.time()) if self.stt is not None else -1
+            remain = self.stt.window_left() if self.stt is not None else -1
         except Exception:
             remain = -1
         log.info("语音入口: mode=%s 窗口剩余=%.1fs text=%s", mode, remain, text)
