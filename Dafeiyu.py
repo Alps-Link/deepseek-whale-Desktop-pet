@@ -1044,21 +1044,95 @@ def save_zoom_config(char, bubble, input_zoom, width):
                              "window_width": width})
 
 DEFAULT_WAKE_WINDOW = 8.0     # 免唤醒窗口默认秒数（0 = 关闭，每次都要喊名字）
+DEFAULT_PTT_VK = 0xA3         # 按键说话默认键：右 Ctrl（VK_RCONTROL = 163）
+DEFAULT_PTT_NAME = "右 Ctrl"
+
+# 按键显示名：按 Windows 虚拟键码反查（轮询捕获时只有 vk，没有 Tk 的 keysym）
+VK_LABELS = {
+    0x08: "退格", 0x09: "Tab", 0x0D: "回车", 0x10: "Shift", 0x11: "Ctrl", 0x12: "Alt",
+    0x14: "Caps Lock", 0x1B: "Esc", 0x20: "空格", 0x21: "PageUp", 0x22: "PageDown",
+    0x23: "End", 0x24: "Home", 0x25: "左方向", 0x26: "上方向", 0x27: "右方向", 0x28: "下方向",
+    0x2C: "PrintScreen", 0x2D: "Insert", 0x2E: "Delete", 0x5B: "左 Win", 0x5C: "右 Win",
+    0x5D: "菜单键", 0x90: "Num Lock", 0x91: "Scroll Lock",
+    0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".", 0xBF: "/", 0xC0: "`",
+    0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
+    0xA0: "左 Shift", 0xA1: "右 Shift", 0xA2: "左 Ctrl", 0xA3: "右 Ctrl",
+    0xA4: "左 Alt", 0xA5: "右 Alt",
+}
+
+def vk_label(vk):
+    """虚拟键码 → 人看的名字"""
+    vk = int(vk)
+    if 0x70 <= vk <= 0x87:
+        return "F%d" % (vk - 0x6F)          # F1~F24
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk)                       # A~Z
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)                       # 0~9
+    if 0x60 <= vk <= 0x69:
+        return "小键盘%d" % (vk - 0x60)
+    if 0x6A <= vk <= 0x6F:
+        return "小键盘符号"
+    return VK_LABELS.get(vk, "按键 0x%02X" % vk)
+
+def any_key_down(skip=()):
+    """当前按着的键里最小的那个虚拟键码（0 = 没有）。
+
+    轮询法，所以修饰键（Ctrl/Alt/Shift）也能捕获 —— Tk 的 <KeyPress> 在 Windows 上
+    对"单独按一下右 Ctrl"并不可靠（合成测试时直接报 no keycode for keysym）。
+    """
+    try:
+        u = ctypes.windll.user32
+        for vk in range(1, 255):
+            if vk in skip or 1 <= vk <= 6:      # 1~6 是鼠标左右/中键，别被点击误采
+                continue
+            if u.GetAsyncKeyState(vk) & 0x8000:
+                return vk
+    except Exception:
+        pass
+    return 0
 
 def load_voice_config():
-    """语音识别设置：{"wake_window": 秒}。
-    免唤醒窗口 = 她说完话之后这段时间里直接说话不用先喊名字；0 = 关闭（每次都要喊名字）。"""
-    sec = _get_section("voice", {"wake_window": DEFAULT_WAKE_WINDOW})
+    """语音识别设置：
+    wake_window      免唤醒窗口秒数（她说完话后可直接说话的时间；0 = 关闭，每次都要喊名字）
+    hotkey_enabled   按键说话开关（按住指定键期间窗口一直开着）
+    hotkey_vk/name   那个键的 Windows 虚拟键码与显示名
+    """
+    default = {"wake_window": DEFAULT_WAKE_WINDOW, "hotkey_enabled": False,
+               "hotkey_vk": DEFAULT_PTT_VK, "hotkey_name": DEFAULT_PTT_NAME}
+    sec = _get_section("voice", default)
     try:
         v = float(sec.get("wake_window", DEFAULT_WAKE_WINDOW))
     except (TypeError, ValueError):
         v = DEFAULT_WAKE_WINDOW
     if v != v or v < 0:          # NaN / 负数都当默认
         v = DEFAULT_WAKE_WINDOW
-    return {"wake_window": min(v, 60.0)}
+    enabled = bool(sec.get("hotkey_enabled", False))
+    if enabled:
+        v = 0.0                  # 按键说话与免唤醒窗口不共存：开着按键就固定"关闭"
+    try:
+        vk = int(sec.get("hotkey_vk", DEFAULT_PTT_VK))
+    except (TypeError, ValueError):
+        vk = DEFAULT_PTT_VK
+    name = sec.get("hotkey_name")
+    if not (1 <= vk <= 255):
+        vk = DEFAULT_PTT_VK
+        name = DEFAULT_PTT_NAME          # 键回退了，名字也一起回退，别留个对不上的名字
+    if not isinstance(name, str) or not name.strip():
+        name = DEFAULT_PTT_NAME
+    return {"wake_window": min(v, 60.0),
+            "hotkey_enabled": enabled,
+            "hotkey_vk": vk,
+            "hotkey_name": name.strip()}
 
-def save_voice_config(wake_window):
-    _update_section("voice", {"wake_window": float(wake_window)})
+def save_voice_config(cfg):
+    """cfg 至少含 wake_window，其余按键项缺省不覆盖旧值"""
+    sec = _get_section("voice", {})
+    out = {"wake_window": float(cfg.get("wake_window", sec.get("wake_window", DEFAULT_WAKE_WINDOW)))}
+    for k, d in (("hotkey_enabled", True), ("hotkey_vk", DEFAULT_PTT_VK),
+                 ("hotkey_name", DEFAULT_PTT_NAME)):
+        out[k] = cfg[k] if k in cfg else sec.get(k, d)
+    _update_section("voice", out)
 
 def save_chats(chats):
     save_json_file(CHATS_LOG_FILE, chats)
@@ -2191,6 +2265,18 @@ class LocalParaformerSTT:
         """窗口剩余秒数（<=0 表示已关闭/已过期）"""
         return self._active_until - time.time()
 
+    def clear_window(self):
+        """立刻关掉免唤醒窗口（关语音时用：否则下次打开语音，那个旧窗口还会接着生效）"""
+        self._active_until = 0.0
+
+    def hold_open(self, seconds=0.35):
+        """按键说话：按住期间把窗口顶住（松开后 0.35 秒内自然失效）。
+
+        比配置的窗口短得多 —— 它就是"按住才开"，松开即关。
+        用 max 是为了不去缩短一个本来就更长的窗口（比如刚说完话的 8 秒免唤醒期）。
+        """
+        self._active_until = max(self._active_until, time.time() + float(seconds))
+
     CONVERSATION_WINDOW = DEFAULT_WAKE_WINDOW   # 兼容旧引用：默认窗口长度
 
     @property
@@ -2585,6 +2671,12 @@ class DesktopPet:
         self.voice_cfg = load_voice_config()                     # 语音识别设置（免唤醒窗口）
         self._badge = None                                       # 「在听」小标记（头顶小胶囊）
         self._badge_visible = False
+        # 按键说话（PTT）：按住这个键期间免唤醒窗口一直开着（轮询 GetAsyncKeyState，任何前台窗口都有效）
+        self._ptt_vk = self.voice_cfg.get("hotkey_vk", DEFAULT_PTT_VK)
+        self._ptt_name = self.voice_cfg.get("hotkey_name", DEFAULT_PTT_NAME)
+        self._ptt_enabled = bool(self.voice_cfg.get("hotkey_enabled", False))
+        self._ptt_down = False
+        self._thinking_since = 0.0                               # 正在等模型回复（占位提示期间）
 
         # 精力值系统
         self.energy = MAX_ENERGY
@@ -2666,6 +2758,7 @@ class DesktopPet:
             except Exception as e:
                 log.warning("应用免唤醒窗口设置失败: %s", e)
             self._init_listen_badge()
+            self._init_voice_hotkey()
         else:
             self.mode_menu.entryconfigure(self.voice_menu_index, label="🎤 语音识别 (不可用)", state="disabled")
 
@@ -4008,7 +4101,7 @@ class DesktopPet:
         if self.current_event_context:
             self.on_event_text(msg)
             return
-        self.show_bubble_text("(normal) 嗯...让我想想...", "normal")
+        self._show_thinking_bubble()
         def process():
             reply = self.get_ai_response(msg)
             self._ui(lambda: self.handle_ai_reply(reply, msg))
@@ -4183,6 +4276,20 @@ class DesktopPet:
         # 无开头标注：正常文本，仍剥离正文中残留的多余英文情绪标注
         return "normal", _strip_inline_markers(text)
 
+    def _show_thinking_bubble(self):
+        """「嗯…让我想想…」占位提示。
+
+        它不是"她的一轮输出"——只是等模型回复时的过渡，所以：
+        ①不刷新免唤醒窗口；②这期间头顶的「🎤 在听」标记保持熄灭（见 _thinking_now），
+        免得她还在想、标记先亮了，用户以为可以说话。
+        """
+        self._thinking_since = time.time()
+        self.show_bubble_text("(normal) 嗯...让我想想...", "normal")
+
+    def _thinking_now(self):
+        """是否正在等模型回复（45 秒兜底过期：万一回复路径出错，标记不能永久不亮）"""
+        return bool(self._thinking_since) and (time.time() - self._thinking_since) < 45
+
     def show_bubble_text(self, text, emotion="normal", refresh_voice=False):
         if text.startswith("(") or text.startswith("（"):
             em = re.match(r'[（(]\s*([A-Za-z]+)\s*[）)]\s*(.*)', text, re.DOTALL)
@@ -4190,6 +4297,8 @@ class DesktopPet:
                 emotion = em.group(1).lower()
                 text = em.group(2).strip()
         text = _strip_inline_markers(text)
+        if refresh_voice:
+            self._thinking_since = 0.0      # 真的开始输出了，不再算"在想"
         self.set_emotion(emotion)
         self.bubble_window.show_text(text, refresh_voice=refresh_voice)
         # 说话时张嘴，2秒后闭合
@@ -4492,9 +4601,9 @@ class DesktopPet:
             finally:
                 if self.stt is not None and self.voice_on:
                     self.stt.set_muted(False)
-                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口
+                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
                 if refresh_voice:
-                    self._on_output_finished(True)
+                    self._on_output_finished(True, from_tts=True)
                 if temp_file and os.path.exists(temp_file):
                     try:
                         os.remove(temp_file)
@@ -4546,9 +4655,9 @@ class DesktopPet:
             finally:
                 if self.stt is not None and self.voice_on:
                     self.stt.set_muted(False)
-                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口
+                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
                 if refresh_voice:
-                    self._on_output_finished(True)
+                    self._on_output_finished(True, from_tts=True)
                 if temp_file and os.path.exists(temp_file):
                     try: os.remove(temp_file)
                     except Exception: pass
@@ -4718,7 +4827,7 @@ class DesktopPet:
         selected = self.current_event_options[idx]
         context = self.current_event_context
         self.clear_event_buttons()
-        self.show_bubble_text("(normal) 嗯...让我想想...", "normal")
+        self._show_thinking_bubble()
         self._respond_to_topic(selected, context)
 
     def on_event_text(self, text):
@@ -4729,7 +4838,7 @@ class DesktopPet:
                 return
         context = self.current_event_context
         self.clear_event_buttons()
-        self.show_bubble_text("(normal) 嗯...让我想想...", "normal")
+        self._show_thinking_bubble()
         self._respond_to_topic(text.strip(), context)
 
     def show_menu(self, event):
@@ -7375,8 +7484,13 @@ OCR文字：
         """每 0.25 秒同步一次标记的显隐与位置（只读 STT 的窗口状态，不碰渲染线程）"""
         try:
             if self._badge is not None:
+                # 亮着 = 现在出声她真的能听到：语音开着 + 窗口没过期 + 她没在说话 + 也不是"等她想想"期间
+                # （她 TTS 播放时麦克风整帧丢弃、气泡打字期间结果会被抗打断丢掉，
+                #   这两种时候标记载亮着就是在骗人 —— 宁可灭掉；"嗯…让我想想"那段同理）
                 listening = bool(self.voice_on and self.stt is not None
-                                 and self.stt.window_left() > 0)
+                                 and self.stt.window_left() > 0
+                                 and not self._voice_output_busy()
+                                 and not self._thinking_now())
                 if listening != self._badge_visible:
                     self._badge_visible = listening
                     if listening:
@@ -7395,6 +7509,37 @@ OCR文字：
         if not self._shutdown:
             self.root.after(250, self._badge_tick)
 
+    def _ptt_pressed(self):
+        """按键说话：那个键现在是否按着。
+
+        用 GetAsyncKeyState 轮询而不是键盘钩子 —— 不需要管理员权限，也不管当前哪个
+        窗口在前台（钩子要装钩子过程、还容易被别的程序抢走）。0x8000 位 = 当前按下。
+        """
+        if not self._ptt_enabled or not self._ptt_vk:
+            return False
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(int(self._ptt_vk)) & 0x8000)
+        except Exception:
+            return False
+
+    def _init_voice_hotkey(self):
+        self.root.after(60, self._ptt_tick)
+
+    def _ptt_tick(self):
+        """每 60ms 看一次按键：按着就把免唤醒窗口顶住（松开后 0.35 秒内自然失效）"""
+        try:
+            down = self._ptt_pressed()
+            if down and self.voice_on and self.stt is not None:
+                self.stt.hold_open()
+            if down != self._ptt_down:
+                self._ptt_down = down
+                log.info("按键说话(%s): %s", self._ptt_name,
+                         "按住 → 窗口打开" if down else "松开 → 窗口关闭")
+        except Exception:
+            pass
+        if not self._shutdown:
+            self.root.after(60, self._ptt_tick)
+
     def toggle_voice(self):
         if not VOICE_AVAILABLE:
             messagebox.showwarning("缺少依赖", "语音识别需要安装 sherpa-onnx pyaudio numpy")
@@ -7404,6 +7549,7 @@ OCR文字：
             return
         if self.voice_on:
             self.stt.stop()
+            self.stt.clear_window()      # 关语音顺手清窗口，免得下次打开时旧窗口还生效
             self.voice_on = False
             self._update_voice_menu_label()
             self.show_bubble_text("(normal) 语音识别已停止", "normal")
@@ -7417,15 +7563,33 @@ OCR文字：
             self.show_bubble_text("(happy) 我在听你说话", "happy")
             log.info("语音识别已开启")
 
-    def _on_output_finished(self, refresh_voice=False):
+    def _on_output_finished(self, refresh_voice=False, from_tts=False):
         """一轮输出完毕（气泡打字完成 / TTS 播完）。
-        仅当该轮是对用户输入的回应时，才刷新免唤醒词窗口——
-        主动发言（陪玩评论/话题推送/闲话等）不刷新，避免高频评论让唤醒词失效。"""
-        if refresh_voice and self.stt is not None:
-            try:
-                self.stt.refresh_window()
-            except Exception:
-                pass
+
+        仅当该轮是对用户输入的回应时才刷新免唤醒词窗口——主动发言不刷新。
+        **TTS 开着的时候只认"念完"那次**：气泡打完先不开窗（否则她还在念、窗口就先亮了，
+        看着像"能说话"，其实麦克风正静音），等她念完由 TTS 那条路开窗；
+        TTS 关着（或这轮根本念不出来）就按气泡打完开窗。
+        """
+        if not refresh_voice or self.stt is None:
+            return
+        if not from_tts and self._tts_will_play():
+            return                      # 等她念完，TTS 结束那条路会开窗
+        try:
+            self.stt.refresh_window()
+        except Exception:
+            pass
+
+    def _tts_will_play(self):
+        """这轮回复是不是真会念出来（决定窗口在"气泡打完"还是"念完"时开）"""
+        try:
+            if not (self.tts_enabled and TTS_AVAILABLE):
+                return False
+            if self.tts_mode == "edge":
+                return bool(EDGE_TTS_IMPORTED)
+            return bool(self.tts_api_key and self.tts_speaker_id)
+        except Exception:
+            return False
 
     def _voice_output_busy(self):
         """宠物是否正在输出（气泡打字中 / TTS 发声）——期间忽略语音输入，防误打断"""
@@ -7442,12 +7606,17 @@ OCR文字：
         return False
 
     def open_voice_settings(self):
-        """🎤 语音识别设置：免唤醒窗口（0 = 关闭，每次都要喊名字）"""
-        win, frame = self._make_card_window("语音识别设置", 430, 300)
+        """🎤 语音识别设置：免唤醒窗口（0 = 关闭）+ 按键说话（PTT）"""
+        win, frame = self._make_card_window("语音识别设置", 440, 450)
         s = self._dpi_scale
         cur = float(self.voice_cfg.get("wake_window", DEFAULT_WAKE_WINDOW))
         choice = {"v": cur}
         btn_map = {}
+        ptt = {"enabled": bool(self._ptt_enabled), "vk": int(self._ptt_vk),
+               "name": str(self._ptt_name)}
+        ptt_var = tk.BooleanVar(value=ptt["enabled"])
+        cap = {"on": False}
+        key_label = {"w": None}
 
         # 底部按钮先 pack（布局铁律：内容变高时收尾按钮不被挤走）
         btn_frame = tk.Frame(frame, bg=DIALOG_BG)
@@ -7455,9 +7624,19 @@ OCR文字：
 
         def save():
             v = float(choice["v"])
+            ptt["enabled"] = bool(ptt_var.get())
+            if ptt["enabled"]:
+                v = 0.0                  # 按键说话与免唤醒窗口不共存：开着按键就固定关闭
             self.voice_cfg["wake_window"] = v
+            self.voice_cfg["hotkey_enabled"] = ptt["enabled"]
+            self.voice_cfg["hotkey_vk"] = ptt["vk"]
+            self.voice_cfg["hotkey_name"] = ptt["name"]
+            self._ptt_enabled = ptt["enabled"]
+            self._ptt_vk = ptt["vk"]
+            self._ptt_name = ptt["name"]
             try:
-                save_voice_config(v)
+                save_voice_config({"wake_window": v, "hotkey_enabled": ptt["enabled"],
+                                   "hotkey_vk": ptt["vk"], "hotkey_name": ptt["name"]})
             except Exception as e:
                 log.warning("保存语音设置失败: %s", e)
             if self.stt is not None:
@@ -7465,8 +7644,9 @@ OCR文字：
                     self.stt.set_wake_window(v)
                 except Exception as e:
                     log.warning("应用免唤醒窗口失败: %s", e)
-            messagebox.showinfo("成功", "已保存：免唤醒窗口关闭（每次说话都要先喊名字）"
-                                if v <= 0 else "已保存：免唤醒窗口 %d 秒" % int(v))
+            msg = "已保存：免唤醒窗口关闭（每次说话都要先喊名字）" if v <= 0 else "已保存：免唤醒窗口 %d 秒" % int(v)
+            msg += "；按键说话：%s（%s）" % ("启用" if ptt["enabled"] else "停用", ptt["name"])
+            messagebox.showinfo("成功", msg)
             win.destroy()
 
         RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
@@ -7481,6 +7661,8 @@ OCR文字：
 
         def select(v):
             choice["v"] = v
+            if v > 0 and ptt_var.get():
+                ptt_var.set(False)      # 二者不共存：选了窗口就把"按键说话"关掉（后动的那一方生效）
             for _v, _b in btn_map.items():
                 try:
                     _b.set_variant("primary" if _v == v else "subtle")
@@ -7499,9 +7681,66 @@ OCR文字：
             btn_map[v] = b
 
         tk.Label(frame, text="窗口开着的时候，她头顶会显示一个「🎤 在听」小标记；\n"
-                             "她说话期间麦克风是静音的，所以那会儿你出声不会打断她。",
+                             "她说话期间麦克风是静音的，所以那会儿你出声不会打断她。\n"
+                             "TTS 开着时，窗口要等她念完才开（气泡打完不算）。",
                  font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
                  justify='left').pack(anchor='w', pady=(6, 0))
+
+        # ---------- 按键说话（PTT）----------
+        tk.Frame(frame, bg=CARD_BORDER, height=1).pack(fill=tk.X, pady=8)
+        tk.Label(frame, text="按住按键说话", font=(self.font_family, 12, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor='w', pady=(0, 2))
+        tk.Label(frame, text="按住下面这个键（任何窗口在前台都有效），窗口就一直开着，松开就关。\n"
+                             "跟上面的窗口**互斥**：启用它，窗口固定为「关闭」（每次说话按住键即可）。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w')
+
+        def on_ptt_toggle():
+            if ptt_var.get():
+                select(0.0)             # 启用按键说话 → 窗口自动切到"关闭"
+
+        ttk.Checkbutton(frame, text="启用按键说话", variable=ptt_var,
+                        command=on_ptt_toggle).pack(anchor='w', pady=(6, 2))
+        ptt_row = tk.Frame(frame, bg=DIALOG_BG)
+        ptt_row.pack(anchor='w', pady=2)
+        key_label["w"] = tk.Label(ptt_row, text="当前按键：%s" % ptt["name"],
+                                  font=(self.font_family, 10, "bold"), fg=BTN_PRIMARY, bg=DIALOG_BG)
+        key_label["w"].pack(side=tk.LEFT, padx=(0, 10))
+
+        def start_capture():
+            cap["on"] = True
+            cap["baseline"] = set()      # 开始捕获时已经按着的键，不算
+            try:
+                u = ctypes.windll.user32
+                for vk in range(1, 255):
+                    if u.GetAsyncKeyState(vk) & 0x8000:
+                        cap["baseline"].add(vk)
+            except Exception:
+                pass
+            key_label["w"].config(text="请按一个键…")
+            win.after(50, _capture_tick)
+
+        def _capture_tick():
+            """轮询捕获：等到出现一个"刚刚按下"的键就记下来。
+
+            不用 Tk 的 <KeyPress>：Windows 上单独按修饰键（右 Ctrl）不一定送来 KeyPress，
+            而轮询 GetAsyncKeyState 跟运行时的检测是同一套机制，还能捕获修饰键。
+            """
+            if not cap["on"]:
+                return
+            vk = any_key_down(skip=cap["baseline"])
+            if vk:
+                cap["on"] = False
+                ptt["vk"] = int(vk)
+                ptt["name"] = vk_label(vk)
+                key_label["w"].config(text="当前按键：%s" % ptt["name"])
+                log.info("按键说话改为: %s (vk=%d)", ptt["name"], ptt["vk"])
+                return
+            win.after(50, _capture_tick)
+
+        RoundedButton(ptt_row, text="改键", command=start_capture, variant="subtle",
+                      width=int(70 * s), height=int(30 * s), radius=int(8 * s),
+                      font=(self.font_family, 10)).pack(side=tk.LEFT)
 
     def on_speech_recognized(self, text, mode="content"):
         self.last_interaction_time = time.time()
@@ -7516,9 +7755,10 @@ OCR文字：
             log.info("宠物正在说话，忽略语音输入（抗打断）")
             return
         if mode == "wake":
-            # 只说唤醒词：进入聆听状态，提示用户直接说
+            # 只说唤醒词：进入聆听状态。
+            # 不再弹"在呢，请说"气泡（用户要求去掉）——反馈交给头顶的「🎤 在听」标记，
+            # 免得每次喊她都多一句废话，也避免气泡/TTS 反过来干扰她自己听你说话。
             log.info("语音唤醒: 已进入聆听状态（会话窗内免唤醒词）")
-            self.show_bubble_text("(happy) 在呢，请说", "happy")
             return
         if not text:
             return
