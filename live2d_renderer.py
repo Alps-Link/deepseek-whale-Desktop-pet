@@ -123,6 +123,15 @@ EMOTION_POOLS = {
 # （"墨镜遮眼被眨眼盖过"就是这个毛病，装扮里写眼睛的也归这条规则管）
 EYE_OWNING_EXPRESSIONS = {'excited', 'playful', 'dizzy', 'sunglasses'}
 
+# 换表情要"旧的淡完再上新的"。
+# 表情的淡入/淡出各是 1.0 秒（model3.json 里这几个表情的 FadeInTime/FadeOutTime 都是空的 → 用
+# Cubism 默认值），所以换表情时两段淡化是交叉跑的：探针实测 new=tongue 替换 old=playful 时，
+# 新表情的嘴已经开到 0.468（约 1.0s），旧表情的 Cheek21 还留着 0.96 —— 一张"单眼闭着咧嘴笑"的脸
+# 上嘴突然被撑开，就是用户看到的"表情结束时嘴巴猛地张大一下"。
+# 所以脸上已经有表情时，先把旧的按"回归常态"那套过渡淡掉（trans_dur_return = 0.8 秒），
+# 淡完再由渲染循环把新表情挂上；只多出这一小段等待，换来的是任何两个表情都不再叠画。
+EXPR_SWAP_WAIT = 0.85
+
 
 def _parse_curve(segments):
     """把 motion3 的 Segments 解析成 [(t, v), ...] 关键帧。
@@ -324,6 +333,7 @@ def _render_offscreen(bridge, width, height):
     active_scene = None
     expression_active = None   # 表情（场景）是否还挂着
     last_emo_expr = None       # 最近一次随机挑中的情绪表情（用于"不连抽同一个"）
+    pending_expr = None        # 排队等着上场的表情 (名字, 可上场时刻)：见 EXPR_SWAP_WAIT
     blink_off = False          # 当前是否已关掉自动眨眼（眼睛归表情/装扮/睡眠所有时）
     sleep_eyes = False         # 睡眠时每帧强制闭眼（她没有 Sleep 动作）：挂着期间嘴归表情所有，App 说话值不得覆盖
     costume_slots = {}         # 装扮：{槽位: {参数: 值}}，每帧强制写入（动作会把参数顶掉）
@@ -435,14 +445,42 @@ def _render_offscreen(bridge, width, height):
                         trans_to = {}
                         trans_return = False
                         sleep_eyes = True
+                        pending_expr = None            # 睡眠优先：还在排队的表情作废
                         last_emo_expr = EMOTION_POOLS['sleep'][0]
                         model.SetExpression(last_emo_expr)
                     elif cmd[1] in EMOTION_POOLS:
                         _pool = EMOTION_POOLS[cmd[1]]
-                        _cands = [e for e in _pool if e != last_emo_expr] or _pool
-                        last_emo_expr = random.choice(_cands)
-                        sleep_eyes = False
-                        model.SetExpression(last_emo_expr)
+                        _prev = pending_expr[0] if pending_expr else last_emo_expr
+                        _cands = [e for e in _pool if e != _prev] or _pool
+                        _pick = random.choice(_cands)
+                        if last_emo_expr is None and pending_expr is None:
+                            # 脸上没东西：直接上（正常路径，不加等待）
+                            last_emo_expr = _pick
+                            sleep_eyes = False
+                            model.SetExpression(_pick)
+                        else:
+                            # 旧脸还挂着：先借"回归常态"那套过渡把它淡掉，淡完由渲染循环把新的挂上
+                            # （直接 SetExpression 会两段 1.0 秒交叉淡化叠画，见 EXPR_SWAP_WAIT 注释）
+                            # 注意 trans_from 必须在这之前取：此时参数里存的还是旧表情插值后的值，
+                            # 由本过渡逐帧写回、平滑衰减；ResetExpressions 一调用就没了
+                            if not normal_face:
+                                normal_face = {p: NORMAL_FACE.get(p, 0.0)
+                                               for p in _face_param_ids(_param_ids, MOUTH_PARAM)}
+                            trans_from = {pid: model.GetParameterValue(i)
+                                for i, pid in enumerate(model.GetParamIds())}
+                            trans_to = dict(defaults)
+                            if MOUTH_PARAM:
+                                # 嘴交给这套过渡收回 0（同"表情结束"那条：模型默认嘴可能是张开的）
+                                trans_to[MOUTH_PARAM] = 0.0
+                            trans_to.update(normal_face)
+                            trans_start = time.time()
+                            trans_return = True
+                            active_scene = None
+                            expression_active = None
+                            sleep_eyes = False
+                            last_emo_expr = None
+                            model.ResetExpressions()
+                            pending_expr = (_pick, time.time() + EXPR_SWAP_WAIT)
                     else:
                         # 表情结束：从当前值平滑回归中性（模型默认参数）
                         trans_from = {pid: model.GetParameterValue(i)
@@ -461,6 +499,7 @@ def _render_offscreen(bridge, width, height):
                         active_scene = None
                         expression_active = None
                         sleep_eyes = False
+                        pending_expr = None          # 表情结束：排队中的脸也作废
                         last_emo_expr = None
                         model.ResetExpressions()
                         model.StartRandomMotion('Idling', 1)
@@ -561,6 +600,7 @@ def _render_offscreen(bridge, width, height):
                     trans_to = {}
                     trans_return = False
                     sleep_eyes = False           # 睁眼
+                    pending_expr = None          # 醒来：睡眠前排队等着的脸作废
                     last_emo_expr = None
                     model.ResetExpressions()     # 摘掉睡眠表情（drool）
                     need_hand_yield = False      # 唤醒不算"她在用手"：手部配件不掉
@@ -662,6 +702,12 @@ def _render_offscreen(bridge, width, height):
                         trans_return = False
                     active_scene = None
                     trans_to = {}
+            # 换脸排队：旧脸淡完（上面的回归过渡跑完）之后，才把排队的新表情挂上
+            if pending_expr is not None and not trans_return and time.time() >= pending_expr[1]:
+                last_emo_expr = pending_expr[0]
+                pending_expr = None
+                sleep_eyes = False
+                model.SetExpression(last_emo_expr)
             # 动作结束（接缝）：**什么都不做**。
             # 动作按引擎自己的淡入淡出收尾（硬停/排队/交叉淡入都会让自动呼吸单帧顶 +0.33~0.64）；
             # 角度/裙摆残姿由 drag 按绝对位置继续叠加；呼吸交给引擎自动呼吸；嘴由下方"嘴部"一行管。
