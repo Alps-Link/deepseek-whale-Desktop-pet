@@ -46,6 +46,8 @@ class MemoryDB:
                 evidence_count INTEGER,
                 archived INTEGER,
                 archived_at TEXT,
+                starred INTEGER,
+                starred_at TEXT,
                 source TEXT,
                 created_at TEXT,
                 observation TEXT,
@@ -63,6 +65,10 @@ class MemoryDB:
             conn.execute("ALTER TABLE memories ADD COLUMN evidence TEXT")
         if "archived_at" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
+        if "starred" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN starred INTEGER")
+        if "starred_at" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN starred_at TEXT")
         conn.commit()
 
     def replace_all(self, data):
@@ -133,8 +139,9 @@ class MemoryDB:
             """
             INSERT OR REPLACE INTO memories
             (id, type, content, embedding, importance, access_count,
-             last_accessed_at, evidence_count, archived, archived_at, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_accessed_at, evidence_count, archived, archived_at, starred, starred_at,
+             source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.get("id") or str(uuid.uuid4())[:8],
@@ -147,6 +154,8 @@ class MemoryDB:
                 int(item.get("evidence_count", 1)),
                 1 if item.get("archived", False) else 0,
                 item.get("archived_at"),      # 归档时刻：满 ARCHIVE_TTL_DAYS 天彻底删除
+                1 if item.get("starred", False) else 0,   # 收藏：置顶、不参与归档
+                item.get("starred_at"),       # 收藏时刻：收藏块内按它倒序（最近收藏在最上面）
                 item.get("source", ""),
                 item.get("created_at", now),
             )
@@ -222,6 +231,8 @@ class MemoryDB:
             "evidence_count": row["evidence_count"],
             "archived": bool(row["archived"]),
             "archived_at": row["archived_at"],
+            "starred": bool(row["starred"]),
+            "starred_at": row["starred_at"],
         }
 
     def _row_to_event(self, row):
@@ -235,6 +246,8 @@ class MemoryDB:
             "evidence_count": row["evidence_count"],
             "archived": bool(row["archived"]),
             "archived_at": row["archived_at"],
+            "starred": bool(row["starred"]),
+            "starred_at": row["starred_at"],
             "source": row["source"],
         }
 

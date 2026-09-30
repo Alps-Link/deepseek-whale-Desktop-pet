@@ -1047,6 +1047,13 @@ DEFAULT_WAKE_WINDOW = 8.0     # 免唤醒窗口默认秒数（0 = 关闭，每�
 DEFAULT_PTT_VK = 0xA3         # 按键说话默认键：右 Ctrl（VK_RCONTROL = 163）
 DEFAULT_PTT_NAME = "右 Ctrl"
 
+# 唤醒词容错：识别模型是通用词表，"大肥鱼"不是词，实测常被听成真词
+# （化肥鱼/咖啡鱼/阿非鱼/那飞鱼），拼音必须逐音节全等就永远唤不醒。
+WAKE_TOLERANCE = 1            # 拼音通道允许错几个音节（0 = 必须完全同音）
+WAKE_TAIL_LOCK = 2            # 名字末 N 个音节必须完全一致（挡"大飞机/大部分/往那卡"这类真词）
+WAKE_ANYWHERE = True          # 名字出现在整句任何位置都算唤醒（False = 只认句首 5~6 字内）
+WAKE_ALIASES = ("罗非鱼", "大头鱼")   # 默认名的"听错写法"白名单：只在还叫"大肥鱼"时生效（改名后整套失效）
+
 # 按键显示名：按 Windows 虚拟键码反查（轮询捕获时只有 vk，没有 Tk 的 keysym）
 VK_LABELS = {
     0x08: "退格", 0x09: "Tab", 0x0D: "回车", 0x10: "Shift", 0x11: "Ctrl", 0x12: "Alt",
@@ -1094,11 +1101,12 @@ def any_key_down(skip=()):
 
 def load_voice_config():
     """语音识别设置：
+    enabled          上次退出时语音识别是开着还是关着（开机沿用；自动睡眠/退出时的关麦不写它）
     wake_window      免唤醒窗口秒数（她说完话后可直接说话的时间；0 = 关闭，每次都要喊名字）
     hotkey_enabled   按键说话开关（按住指定键期间窗口一直开着）
     hotkey_vk/name   那个键的 Windows 虚拟键码与显示名
     """
-    default = {"wake_window": DEFAULT_WAKE_WINDOW, "hotkey_enabled": False,
+    default = {"enabled": False, "wake_window": DEFAULT_WAKE_WINDOW, "hotkey_enabled": False,
                "hotkey_vk": DEFAULT_PTT_VK, "hotkey_name": DEFAULT_PTT_NAME}
     sec = _get_section("voice", default)
     try:
@@ -1120,7 +1128,8 @@ def load_voice_config():
         name = DEFAULT_PTT_NAME          # 键回退了，名字也一起回退，别留个对不上的名字
     if not isinstance(name, str) or not name.strip():
         name = DEFAULT_PTT_NAME
-    return {"wake_window": min(v, 60.0),
+    return {"enabled": bool(sec.get("enabled", False)),
+            "wake_window": min(v, 60.0),
             "hotkey_enabled": enabled,
             "hotkey_vk": vk,
             "hotkey_name": name.strip()}
@@ -1129,7 +1138,7 @@ def save_voice_config(cfg):
     """cfg 至少含 wake_window，其余按键项缺省不覆盖旧值"""
     sec = _get_section("voice", {})
     out = {"wake_window": float(cfg.get("wake_window", sec.get("wake_window", DEFAULT_WAKE_WINDOW)))}
-    for k, d in (("hotkey_enabled", True), ("hotkey_vk", DEFAULT_PTT_VK),
+    for k, d in (("enabled", False), ("hotkey_enabled", True), ("hotkey_vk", DEFAULT_PTT_VK),
                  ("hotkey_name", DEFAULT_PTT_NAME)):
         out[k] = cfg[k] if k in cfg else sec.get(k, d)
     _update_section("voice", out)
@@ -2279,86 +2288,164 @@ class LocalParaformerSTT:
 
     CONVERSATION_WINDOW = DEFAULT_WAKE_WINDOW   # 兼容旧引用：默认窗口长度
 
+    _WAKE_FILLER = "斯丝寺嘶酱呀啊呢嘛吧的~ 喂嗯呃哦哎"   # 名字后面粘的称呼尾字
+    _PINYIN_INITIALS = ("zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l",
+                        "g", "k", "h", "j", "q", "x", "r", "z", "c", "s", "y", "w")
+
+    @property
+    def wake_name(self):
+        """唤醒词全名 = 系统提示词中的角色姓名（动态读取——改名后立即生效）"""
+        name = ""
+        if self.pet is not None:
+            try:
+                name = self.pet.pet_name or ""
+            except Exception:
+                name = ""
+        return name or DEFAULT_PET_NAME
+
     @property
     def wake_prefix(self):
-        """唤醒词 = 系统提示词中的角色姓名（前 3 个字，动态读取——改名后立即生效）"""
-        name = ""
-        if self.pet is not None:
-            try:
-                name = self.pet.pet_name or ""
-            except Exception:
-                name = ""
-        if not name:
-            name = "大肥鱼"
-        return name[:3] if len(name) >= 2 else name
+        """唤醒词前 3 个字（汉字精确通道用；拼音通道用全名）"""
+        return self.wake_name[:3]
+
+    @property
+    def _wake_patterns(self):
+        """汉字通道要试的写法：全名优先，再退到前 3 个字。
+        4 字名字必须试全名——只吃前 3 个字的话，"卡梅莉亚"会剩一个"亚"被当成内容发出去。"""
+        name = self.wake_name
+        return (name,) if len(name) <= 3 else (name, name[:3])
 
     def _strip_wake(self, text, idx, consumed):
-        """去掉唤醒词（从 idx 起 consumed 个字），清理称呼尾字后返回剩余内容"""
+        """去掉唤醒词（从 idx 起 consumed 个字），清理称呼尾字后返回剩余内容。
+
+        名字后面还有话 ⇒ 名字只是个称呼，前面的"喂/那个/嗯"不算内容；
+        名字后面没话、名字又不在句首（"游戏打多了有点累啊大肥鱼"）⇒ 那半句才是内容，
+        得接回来，否则会被当成"只喊了名字"丢掉。"""
+        head = text[:idx]
         rest = text[idx + consumed:]
-        while rest and rest[0] in "斯丝寺嘶酱呀啊呢嘛吧的~ ":
+        while rest and rest[0] in self._WAKE_FILLER:
             rest = rest[1:]
         rest = rest.strip(" ，。！？,.!?~")
-        return rest or None
+        if rest or idx > 4:
+            while head and head[-1] in self._WAKE_FILLER:
+                head = head[:-1]
+            content = (head + rest).strip(" ，。！？,.!?~")
+        else:
+            content = ""
+        return content or None
 
-    def _pinyin_wake(self, text):
-        """拼音模糊唤醒：名字转写出现同音变体（如“莫娜卡”→“莫纳卡”）时也能命中。
-        名字拼音必须是文本拼音开头附近（前 6 个字内）的连续子序列。"""
-        if not PINYIN_AVAILABLE:
-            return None
-        name = ""
-        if self.pet is not None:
-            try:
-                name = self.pet.pet_name or ""
-            except Exception:
-                name = ""
-        if len(name) < 2:
-            return None
-        name_py = lazy_pinyin(name)
-        text_py = lazy_pinyin(text)
-        n = len(name_py)
+    @staticmethod
+    def _syllable_distance(a, b):
+        """音节级编辑距离（"化肥鱼" vs "大肥鱼" = 1）"""
+        m, n = len(a), len(b)
+        dp = list(range(n + 1))
+        for i in range(1, m + 1):
+            prev, dp[0] = dp[0], i
+            for j in range(1, n + 1):
+                cur = dp[j]
+                dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] != b[j - 1]))
+                prev = cur
+        return dp[n]
+
+    @classmethod
+    def _final_of(cls, syllable):
+        """取音节韵母（声母之后的部分）：da→a、hua→ua"""
+        for ini in cls._PINYIN_INITIALS:
+            if syllable.startswith(ini) and len(syllable) > len(ini):
+                return syllable[len(ini):]
+        return syllable
+
+    @classmethod
+    def _final_close(cls, a, b):
+        """韵母是否相近（相同，或一方是另一方的后缀）：da↔hua 算近，da↔luo 不算。
+        这一条是防误触发的关键——"老师们往那卡里打钱"里的"往那卡"就是靠它挡住的。"""
+        fa, fb = cls._final_of(a), cls._final_of(b)
+        return bool(fa) and bool(fb) and (fa == fb or fa.endswith(fb) or fb.endswith(fa))
+
+    def _find_pinyin(self, text_py, pat_py, allow_fuzzy):
+        """在整句音节里找 pat_py：完全同音，或（allow_fuzzy 且名字≥3音节时）只错一个近音音节。
+        返回 (起始音节号, 听到的写法) 或 None。"""
+        n = len(pat_py)
         if n == 0 or len(text_py) < n:
             return None
-        # 名字起始字位置约束在开头 6 个字内（与汉字通道一致）
-        for start in range(0, min(5, len(text_py) - n + 1)):
-            if text_py[start:start + n] == name_py:
-                return self._strip_wake(text, start, n)
+        end = len(text_py) - n
+        limit = end if WAKE_ANYWHERE else min(5, end)
+        for start in range(0, limit + 1):
+            seg = text_py[start:start + n]
+            if seg == pat_py:
+                return (start, "".join(seg))
+            if not (allow_fuzzy and n >= 3 and WAKE_TOLERANCE > 0):
+                continue
+            if self._syllable_distance(seg, pat_py) > WAKE_TOLERANCE:
+                continue
+            if WAKE_TAIL_LOCK and seg[-WAKE_TAIL_LOCK:] != pat_py[-WAKE_TAIL_LOCK:]:
+                continue
+            diff = [(x, y) for x, y in zip(seg, pat_py) if x != y]
+            if len(diff) != 1:
+                continue
+            # 韵母闸门只在 3 音节名字上用：3 音节时末两个音节就是全部约束，剩下那个得"听起来像"；
+            # 4 音节以上光靠"末两音节完全一致"已经够严（600 句真语料实测：去掉闸门误触发 0），
+            # 而实测真误听里有"阿雷拉特←格雷拉特"（ge→a，韵母全变）这种，闸门会把它误挡。
+            if len(pat_py) <= 3 and not self._final_close(diff[0][0], diff[0][1]):
+                continue
+            return (start, "".join(seg))
+        return None
+
+    def _pinyin_hit(self, text):
+        """拼音通道：同音变体 / 只错一个近音音节 / 别名白名单。
+        返回 (名字起始的**原文字符**下标, 名字占的原文字数) 或 None ——
+        转写文本可能夹着数字和字母，音节序号和字符序号不是一回事。"""
+        if not PINYIN_AVAILABLE:
+            return None
+        text_py = lazy_pinyin(text)
+        han_idx = [i for i, ch in enumerate(text) if "\u4e00" <= ch <= "\u9fff"]
+        if len(han_idx) != len(text_py):      # 生僻字/扩展区：逐字问 pypinyin 拿准确位置
+            han_idx = [i for i, ch in enumerate(text) if lazy_pinyin(ch)]
+        if len(han_idx) < len(text_py):
+            return None
+        name_py = lazy_pinyin(self.wake_name)
+        # 别名属于"默认名"：只在桌宠还叫 DEFAULT_PET_NAME 时生效（改名后整套失效）
+        aliases = WAKE_ALIASES if self.wake_name == DEFAULT_PET_NAME else ()
+        patterns = [(name_py, True, None)] + [(lazy_pinyin(a), False, a) for a in aliases]
+        for pat_py, fuzzy, alias in patterns:
+            if len(pat_py) < 2:
+                continue
+            hit = self._find_pinyin(text_py, pat_py, fuzzy)
+            if hit is None:
+                continue
+            start, heard = hit
+            if alias is None:
+                if heard != "".join(pat_py):    # 完全同音时不刷日志
+                    log.info("语音唤醒：把「%s」当「%s」认（近音容错）", heard, "".join(pat_py))
+            else:
+                log.info("语音唤醒：按别名「%s」认（听到「%s」）", alias, heard)
+            n = len(pat_py)
+            return (han_idx[start], han_idx[start + n - 1] - han_idx[start] + 1)
         return None
 
     def _wake_check(self, text):
-        """唤醒词检测（双通道）：
-        1) 汉字精确前缀（前 6 个字内，容忍“嗯/那个”前导语气词）
-        2) 拼音模糊（同音字变体也能命中，解决音译名/短名识别不稳）
+        """唤醒词检测（三通道）：
+        1) 名字汉字精确（容忍"嗯/那个"这类前导语气词）
+        2) 拼音模糊（同音字变体、只错一个近音音节）
+        3) 别名白名单（明显听错但确实在喊她）
         尾字谐音（斯/丝/寺/酱 等）一并清除。"""
-        idx = text.find(self.wake_prefix)
-        if 0 <= idx <= 4:
-            return self._strip_wake(text, idx, len(self.wake_prefix))
+        for pat in self._wake_patterns:
+            idx = text.find(pat)
+            if idx >= 0 and (WAKE_ANYWHERE or idx <= 4):
+                return self._strip_wake(text, idx, len(pat))
         # 拼音模糊通道（含位置约束）
-        pinyin_hit = self._pinyin_wake(text)
+        pinyin_hit = self._pinyin_hit(text)
         if pinyin_hit is not None:
-            return pinyin_hit
+            return self._strip_wake(text, pinyin_hit[0], pinyin_hit[1])
         return None
 
     def _wake_present(self, text):
-        """文本开头附近（前 6 个字内）是否含唤醒词——汉字精确或拼音模糊"""
-        idx = text.find(self.wake_prefix)
-        if 0 <= idx <= 4:
-            return True
-        if PINYIN_AVAILABLE:
-            name = ""
-            if self.pet is not None:
-                try:
-                    name = self.pet.pet_name or ""
-                except Exception:
-                    name = ""
-            if len(name) >= 2:
-                name_py = lazy_pinyin(name)
-                text_py = lazy_pinyin(text)
-                n = len(name_py)
-                if n and len(text_py) >= n:
-                    for start in range(0, min(5, len(text_py) - n + 1)):
-                        if text_py[start:start + n] == name_py:
-                            return True
-        return False
+        """这句话里有没有喊她（与 _wake_check 同一套判据：汉字精确 / 拼音模糊 / 别名）"""
+        for pat in self._wake_patterns:
+            idx = text.find(pat)
+            if idx >= 0 and (WAKE_ANYWHERE or idx <= 4):
+                return True
+        return self._pinyin_hit(text) is not None
 
     def _classify(self, text, speech_start=None):
         """把转写文本分类为 (mode, content)：
@@ -2381,7 +2468,7 @@ class LocalParaformerSTT:
                 return ("ignore", None)
             content = text.strip(" ，。！？,.!?~")
             return ("content", content) if len(content) >= 2 else ("ignore", None)
-        # 待唤醒：必须以宠物名字开头（汉字精确或拼音模糊）
+        # 待唤醒：这句话里得喊她（汉字精确 / 拼音近音 / 别名，见 _wake_check）
         content = self._wake_check(text)
         if content is not None:
             return ("content", content)
@@ -2669,6 +2756,9 @@ class DesktopPet:
         self.sleep_start_time = None
         self.input_visible = load_ui_config()["input_visible"]   # 上次把输入框收起来就保持收起
         self.voice_cfg = load_voice_config()                     # 语音识别设置（免唤醒窗口）
+        # 用户上次的选择（睡着自动关麦、退出清理都不改它）：开机恢复与睡醒恢复都以它为准
+        self._voice_wanted = bool(self.voice_cfg.get("enabled", False))
+        self._voice_restore_done = not self._voice_wanted    # 开机恢复只做一次
         self._badge = None                                       # 「在听」小标记（头顶小胶囊）
         self._badge_visible = False
         # 按键说话（PTT）：按住这个键期间免唤醒窗口一直开着（轮询 GetAsyncKeyState，任何前台窗口都有效）
@@ -2759,6 +2849,9 @@ class DesktopPet:
                 log.warning("应用免唤醒窗口设置失败: %s", e)
             self._init_listen_badge()
             self._init_voice_hotkey()
+            if not self._voice_restore_done:
+                # 模型要几十秒才加载完，这里先排一次轮询（菜单这时候点了也只会弹"还没准备好"）
+                self.root.after(600, self._voice_restore_tick)
         else:
             self.mode_menu.entryconfigure(self.voice_menu_index, label="🎤 语音识别 (不可用)", state="disabled")
 
@@ -3701,6 +3794,7 @@ class DesktopPet:
         self.menu.add_command(label="💬 换个话题", command=self.generate_topic_manual)
         self.menu.add_command(label="💤 睡觉", command=lambda: self.start_sleep_mode(manual=True))
         self.menu.add_command(label="⚡ 精力值", command=self.show_energy_status)
+        self.menu.add_command(label="⌨️ 显示/隐藏输入框", command=self.toggle_input_frame)
         self.menu.add_separator()
 
         # ── 设置子菜单 ──
@@ -3735,11 +3829,8 @@ class DesktopPet:
 
         settings_menu.add_separator()
         settings_menu.add_command(label="缩放设置...", command=self.open_zoom_settings)
-        settings_menu.add_command(label="显示/隐藏输入框", command=self.toggle_input_frame)
         settings_menu.add_separator()
-        settings_menu.add_command(label="陪玩设置...", command=self.open_watch_frequency_settings)
-        settings_menu.add_command(label="阅读设置", command=self.open_reading_settings)
-        settings_menu.add_command(label="话题定时器设置...", command=self.open_topic_timer_settings)
+        settings_menu.add_command(label="模式相关设置...", command=self.open_mode_settings)
         settings_menu.add_command(label="🎵 音乐库设置...", command=self.open_music_library_settings)
         settings_menu.add_command(label="🎤 语音识别设置...", command=self.open_voice_settings)
         settings_menu.add_separator()
@@ -5150,7 +5241,7 @@ class DesktopPet:
         if self.watch_mode:
             self.toggle_watch_mode()
         if self.voice_on:
-            self.toggle_voice()
+            self.toggle_voice(save=False)   # 睡着自动关麦不算用户选择，别把它写进配置
         if self.reading_companion.enabled:
             self.toggle_reading()
         self.sleep_mode = True
@@ -5192,7 +5283,7 @@ class DesktopPet:
             except Exception as e:
                 log.warning("睡眠监测异常（继续监测）: %s", e)
 
-    def stop_sleep_mode(self):
+    def stop_sleep_mode(self, restore_voice=True):
         if not self.sleep_mode:
             return
         self.sleep_mode = False
@@ -5232,6 +5323,9 @@ class DesktopPet:
                 self._schedule_topic()
         except Exception:
             pass
+        if restore_voice:
+            # 睡着时自动关掉的麦，醒来接着开（quiet：别用气泡盖掉她刚说的"我眯了一会儿"）
+            self._restore_voice_if_wanted(quiet=True)
 
     # ---------- 精力值系统 ----------
     def start_energy_tick(self):
@@ -5290,7 +5384,7 @@ class DesktopPet:
         self._shutdown = True
         self._stop_spine()
         if self.voice_on:
-            self.toggle_voice()
+            self.toggle_voice(save=False)   # 退出时关麦只是清理：不能因此把她上次"开着"的选择冲掉
         if self.watch_mode:
             self.toggle_watch_mode()
         if self.reading_companion.enabled:
@@ -5347,18 +5441,15 @@ class DesktopPet:
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         listbox.config(yscrollcommand=scrollbar.set)
-        items = self.memory_data.get(key, [])
         # 只有事件记忆用 importance 排序，话题不用——话题列表不再显示分数
         show_imp = (key == "events")
-        for i, item in enumerate(items):
-            date_str = item.get("created_at", "")[:10]
-            src = item.get("source", "")
-            label = f"{date_str} | {item['content']}"
-            if show_imp:
-                label += f" | 重要:{item.get('importance', 0.5):.1f}"
-            if src:
-                label += f" | {src}"
-            listbox.insert(tk.END, label)
+        items = self.memory_data.get(key, [])
+        # 显示顺序：收藏的排在最前并锁定在上层（新记忆只加在收藏块下面）；其余保持原有先后顺序。
+        # 只改"显示顺序"，不动 items 本身 —— 提取提示词用 topics[-10:] 代表"最近 10 条"，挪数组会破坏语义。
+        view = []                    # 列表下标 → 记忆条目
+        STAR_ROW_BG = "#e7ebff"      # 收藏行：比白底深的淡紫底
+        ARCHIVE_ROW_BG = "#f1f2f4"   # 已归档行：浅灰底
+        ARCHIVE_ROW_FG = "#8b8f98"   # 已归档行：灰字
 
         detail_frame = tk.Frame(parent, bg=DIALOG_BG)
         detail_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=(0, 5))
@@ -5375,8 +5466,8 @@ class DesktopPet:
             detail_text.delete("1.0", tk.END)
             if sel:
                 idx = sel[0]
-                if 0 <= idx < len(items):
-                    item = items[idx]
+                if 0 <= idx < len(view):
+                    item = view[idx]
                     date_str = item.get("created_at", "")[:10]
                     src = item.get("source", "")
                     detail = f"时间：{date_str}\n内容：{item['content']}"
@@ -5384,38 +5475,109 @@ class DesktopPet:
                         detail += f"\n重要度：{item.get('importance', 0.5):.2f}"
                     if src:
                         detail += f"\n来源：{src}"
+                    detail += "\n收藏：" + ("是（置顶、不参与归档）" if item.get("starred", False) else "否")
+                    detail += "\n状态：" + ("已归档（满 5 天会彻底删除）" if item.get("archived", False) else "正常")
                     detail_text.insert("1.0", detail)
             detail_text.config(state=tk.DISABLED)
 
-        listbox.bind("<<ListboxSelect>>", show_detail)
+        def rebuild_view():
+            starred = [it for it in items if it.get("starred", False)]
+            # 收藏块里"最近收藏的在最上面"（没有 starred_at 的老数据按原顺序垫在收藏块末尾）
+            starred.sort(key=lambda it: it.get("starred_at") or "", reverse=True)
+            view[:] = starred + [it for it in items if not it.get("starred", False)]
+
+        def render(select_id=None):
+            """按 view 顺序重画：收藏行深底 + ★，已归档行灰字并在末尾标「已归档」"""
+            listbox.delete(0, tk.END)
+            for it in view:
+                label = ("★ " if it.get("starred", False) else "") + \
+                        f"{it.get('created_at', '')[:10]} | {it['content']}"
+                if show_imp:
+                    label += f" | 重要:{it.get('importance', 0.5):.1f}"
+                if it.get("source", ""):
+                    label += f" | {it['source']}"
+                if it.get("archived", False):
+                    label += " | 已归档"
+                listbox.insert(tk.END, label)
+            for i, it in enumerate(view):
+                if it.get("starred", False):
+                    listbox.itemconfig(i, background=STAR_ROW_BG)
+                elif it.get("archived", False):
+                    listbox.itemconfig(i, background=ARCHIVE_ROW_BG, foreground=ARCHIVE_ROW_FG)
+            if select_id is not None:
+                for i, it in enumerate(view):
+                    if it.get("id") == select_id:
+                        listbox.selection_set(i)
+                        listbox.see(i)
+                        break
+            sync_star_btn()
+            show_detail()
+
+        def refresh(select_id=None):
+            rebuild_view()
+            render(select_id)
+
+        def sync_star_btn():
+            sel = listbox.curselection()
+            starred = bool(sel) and 0 <= sel[0] < len(view) and view[sel[0]].get("starred", False)
+            star_btn.set_text("取消收藏" if starred else "收藏选中")
+
+        def on_select(event=None):
+            sync_star_btn()
+            show_detail(event)
+
+        listbox.bind("<<ListboxSelect>>", on_select)
 
         def delete_selected():
             sel = listbox.curselection()
             if not sel:
                 return
-            # 从大到小删除，保证剩余索引不漂移
+            # 从大到小删，保证剩余索引不漂移；列表下标要经 view 映射回真实条目
             for idx in sorted(sel, reverse=True):
-                del items[idx]
-                listbox.delete(idx)
+                if 0 <= idx < len(view) and view[idx] in items:
+                    items.remove(view[idx])
             save_memories(self.memory_data)
-            show_detail()
+            refresh()
 
         def clear_all():
             if messagebox.askyesno("确认", f"删除所有{key}记忆？"):
                 items.clear()
                 save_memories(self.memory_data)
-                listbox.delete(0, tk.END)
-                show_detail()
+                refresh()
+
+        def toggle_star():
+            sel = listbox.curselection()
+            if not sel or not (0 <= sel[0] < len(view)):
+                return
+            item = view[sel[0]]
+            item["starred"] = not item.get("starred", False)
+            if item["starred"]:
+                # 收藏即保住：顺手把归档状态摘掉，否则它照样会满 5 天被彻底删除
+                item["starred_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                item["archived"] = False
+                item["archived_at"] = None
+            else:
+                item["starred_at"] = None
+            save_memories(self.memory_data)
+            log.info("记忆%s：%s", "已收藏" if item["starred"] else "已取消收藏",
+                     (item.get("content") or "")[:24])
+            refresh(select_id=item.get("id"))
 
         btn_frame = tk.Frame(parent, bg=DIALOG_BG)
         btn_frame.pack(pady=5)
         s = self._dpi_scale
+        star_btn = RoundedButton(btn_frame, text="收藏选中", command=toggle_star, variant="primary",
+                                 width=int(100 * s), height=int(32 * s), radius=int(6 * s),
+                                 font=(self.font_family, 9))
+        star_btn.pack(side=tk.LEFT, padx=3)
         RoundedButton(btn_frame, text="删除选中", command=delete_selected, variant="danger",
                       width=int(100 * s), height=int(32 * s), radius=int(6 * s),
                       font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
         RoundedButton(btn_frame, text="清空所有", command=clear_all, variant="subtle",
                       width=int(100 * s), height=int(32 * s), radius=int(6 * s),
                       font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
+
+        refresh()
 
     def _build_profile_tab(self, parent):
         s = self._dpi_scale
@@ -5731,16 +5893,24 @@ class DesktopPet:
     def _prune_memories(self, category=None):
         """记忆裁剪（画像为固定清单，不参与）：
         ①归档满 ARCHIVE_TTL_DAYS 天的**彻底删除**（真遗忘，数据不再留）；
-        ②活跃条目超过上限时，把按分数排在后头的超限部分标 archived＝冷存，并记下归档时刻。"""
+        ②活跃条目超过上限时，把按分数排在后头的超限部分标 archived＝冷存，并记下归档时刻。
+        **收藏（starred）的永远不参与这两步**：既不被淘汰、也不会被过期删除；
+        而且顺手把它从归档状态摘回来（用户"收藏一条已归档的"＝我要留住它）。"""
         categories = [category] if category else ["topics", "events"]
         now = datetime.now()
-        purged = stamped = archived_now = 0
+        purged = stamped = archived_now = revived = 0
         for cat in categories:
             items = self.memory_data.get(cat, [])
-            # ① 归档满期 → 彻底遗忘
+            # ① 归档满期 → 彻底遗忘（收藏的例外：摘掉归档状态、永久保留）
             keep = []
             for item in items:
                 if item.get("archived", False):
+                    if item.get("starred", False):
+                        item["archived"] = False
+                        item["archived_at"] = None
+                        revived += 1
+                        keep.append(item)
+                        continue
                     if not item.get("archived_at"):
                         stamped += 1
                     if self._archive_expired(item, now):
@@ -5751,24 +5921,30 @@ class DesktopPet:
                 self.memory_data[cat] = keep
                 items = keep
             # ② 活跃超上限 → 归档（冷存），记下归档时刻
+            #    收藏的占名额但不被淘汰 ⇒ 只从"非收藏"里淘汰，淘汰到 非收藏 ≤ 上限 − 收藏数
             max_count = MAX_TOPICS if cat == "topics" else MAX_EVENTS
             active_items = [item for item in items if not item.get("archived", False)]
-            if len(active_items) <= max_count:
+            starred_n = sum(1 for item in active_items if item.get("starred", False))
+            keep_quota = max(0, max_count - starred_n)
+            candidates = [item for item in active_items if not item.get("starred", False)]
+            if len(candidates) <= keep_quota:
                 continue
             if cat == "topics":
-                active_items.sort(key=self._score_topic_memory, reverse=True)
+                candidates.sort(key=self._score_topic_memory, reverse=True)
             else:
-                active_items.sort(key=self._score_event_memory, reverse=True)
+                candidates.sort(key=self._score_event_memory, reverse=True)
             block_stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            for item in active_items[max_count:]:
+            for item in candidates[keep_quota:]:
                 item["archived"] = True
                 if not item.get("archived_at"):
                     item["archived_at"] = block_stamp
                 archived_now += 1
         if purged:
             log.info(f"彻底遗忘 {purged} 条归档超过 {ARCHIVE_TTL_DAYS} 天的记忆")
-        if purged or stamped or archived_now:
-            save_memories(self.memory_data)   # 删除、补记归档时刻、新归档都要落盘
+        if revived:
+            log.info(f"把 {revived} 条已收藏的记忆从归档状态摘回")
+        if purged or stamped or archived_now or revived:
+            save_memories(self.memory_data)   # 删除、补记归档时刻、新归档、收藏复活都要落盘
 
     def _build_extraction_prompt(self):
         """构建记忆提取提示词"""
@@ -6574,111 +6750,6 @@ class DesktopPet:
         
         threading.Thread(target=fetch, daemon=True).start()
 
-    def open_topic_timer_settings(self):
-        win, frame = self._make_card_window("话题定时器设置", 400, 340)
-        s = self._dpi_scale
-        # 底部按钮先 pack 固定（布局铁律：内容变高时收尾按钮不被挤走）
-        def save():
-            try:
-                fixed_val = int(interval_var.get())
-                rmin_val = int(rmin_var.get())
-                rmax_val = int(rmax_var.get())
-            except ValueError:
-                messagebox.showwarning("输入错误", "请输入有效的整数（分钟）")
-                return
-            self.topic_enabled = enabled_var.get()
-            mode = mode_var.get()
-            if mode == "fixed":
-                self.topic_mode = "fixed"
-                self.topic_interval_minutes = max(1, min(240, fixed_val))
-            else:
-                lo = max(1, min(240, rmin_val))
-                hi = max(1, min(240, rmax_val))
-                if lo > hi:
-                    messagebox.showwarning("提示", "最小间隔不能大于最大间隔")
-                    return
-                self.topic_mode = "random"
-                self.topic_random_min = lo
-                self.topic_random_max = hi
-            if self.topic_enabled:
-                self.start_topic_timer()
-            else:
-                if self.topic_timer_job:
-                    self.root.after_cancel(self.topic_timer_job)
-                    self.topic_timer_job = None
-            save_topic_config(self.topic_enabled, self.topic_interval_minutes,
-                              self.topic_mode, self.topic_random_min, self.topic_random_max)
-            if self.topic_mode == "random":
-                messagebox.showinfo("成功", f"已保存（随机间隔 {self.topic_random_min}~{self.topic_random_max} 分钟）")
-            else:
-                messagebox.showinfo("成功", f"已保存（固定间隔 {self.topic_interval_minutes} 分钟）")
-            win.destroy()
-
-        btn_frame = tk.Frame(frame, bg=DIALOG_BG)
-        btn_frame.pack(side=tk.BOTTOM, pady=8)
-        RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
-                      radius=int(6 * s), font=(self.font_family, 11)).pack(side=tk.LEFT, padx=3)
-
-        enabled_var = tk.BooleanVar(value=self.topic_enabled)
-        mode_var = tk.StringVar(value=self.topic_mode)
-        interval_var = tk.StringVar(value=str(self.topic_interval_minutes))
-        rmin_var = tk.StringVar(value=str(self.topic_random_min))
-        rmax_var = tk.StringVar(value=str(self.topic_random_max))
-
-        cb = ttk.Checkbutton(frame, text="启用定时话题", variable=enabled_var)
-        cb.pack(anchor='w', pady=(8, 4))
-
-        tk.Label(frame, text="间隔模式:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(anchor='w', pady=(4, 2))
-        mode_row = tk.Frame(frame, bg=DIALOG_BG)
-        mode_row.pack(anchor='w', pady=2)
-        btn_fixed = RoundedButton(mode_row, text="固定间隔", width=int(110 * s), height=int(30 * s),
-                                  radius=int(8 * s), font=(self.font_family, 11), variant="primary",
-                                  command=lambda: select_mode("fixed"))
-        btn_fixed.pack(side=tk.LEFT, padx=(0, 8))
-        btn_random = RoundedButton(mode_row, text="随机间隔", width=int(110 * s), height=int(30 * s),
-                                   radius=int(8 * s), font=(self.font_family, 11), variant="subtle",
-                                   command=lambda: select_mode("random"))
-        btn_random.pack(side=tk.LEFT)
-
-        # 固定模式输入行
-        fixed_frame = tk.Frame(frame, bg=DIALOG_BG)
-        tk.Label(fixed_frame, text="间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(fixed_frame, textvariable=interval_var, width=int(110 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11), justify="center").pack(side=tk.LEFT, padx=8)
-
-        # 随机模式输入行（最小/最大 分行，防右边界裁切）
-        random_min_row = tk.Frame(frame, bg=DIALOG_BG)
-        tk.Label(random_min_row, text="最小间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(random_min_row, textvariable=rmin_var, width=int(110 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11), justify="center").pack(side=tk.LEFT, padx=8)
-        random_max_row = tk.Frame(frame, bg=DIALOG_BG)
-        tk.Label(random_max_row, text="最大间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(random_max_row, textvariable=rmax_var, width=int(110 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11), justify="center").pack(side=tk.LEFT, padx=8)
-        tip = tk.Label(frame, text="随机间隔：每次触发后在此区间内随机抽一个间隔",
-                       font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG)
-
-        def select_mode(mode):
-            mode_var.set(mode)
-            btn_fixed.set_variant("primary" if mode == "fixed" else "subtle")
-            btn_random.set_variant("primary" if mode == "random" else "subtle")
-            fixed_frame.pack_forget()
-            random_min_row.pack_forget()
-            random_max_row.pack_forget()
-            tip.pack_forget()
-            if mode == "random":
-                random_min_row.pack(anchor='w', pady=(6, 2))
-                random_max_row.pack(anchor='w', pady=2)
-                tip.pack(anchor='w', pady=2)
-            else:
-                fixed_frame.pack(anchor='w', pady=(6, 2))
-
-        select_mode(mode_var.get())
-
     def start_action_timer(self):
         """形象转换：她每隔一段随机时间自己做件事（挤番茄酱、吹泡泡、自拍…）"""
         if self.action_timer_job:
@@ -7259,60 +7330,260 @@ OCR文字：
             log.error(f"视觉模型 API 失败: {e}")
             return None
 
-    # ---------- 陪玩设置界面 ----------
-    def open_watch_frequency_settings(self):
-        win, frame = self._make_card_window("陪玩设置", 440, 240)
+    # ---------- 模式相关设置界面（定时话题 + 陪玩陪看 + 陪读）----------
+    def open_mode_settings(self):
+        """🎮 模式相关设置：定时话题、陪玩陪看、陪读（阅读）合成一个卡片窗。
+
+        「最短沉默」管她最早多久能说一句，「最长沉默」到了必须说一句；
+        实际检查周期 = 最短沉默 ÷ 2，上限 60 秒（见 start_watch_loop / ReadingCompanion）。
+        陪玩陪看的两个秒数不设上限。陪读的截取区域只由「缩略图框选区域」决定（不再手填边距）。"""
+        win, frame = self._make_card_window("模式相关设置", 470, 690)
         s = self._dpi_scale
+        rc = self.reading_companion
+        region = dict(rc.region)        # 陪读截取区域：框选改它，保存时写回
 
-        # 最短间隔时间
-        tk.Label(frame, text="最短间隔时间（5~120 秒）:", font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=0, column=0, sticky="w", pady=8)
-        min_var = tk.StringVar(value=str(self.watch_min_interval))
-        min_entry = RoundedEntry(frame, textvariable=min_var, width=int(80 * s), height=int(30 * s),
-                                 radius=int(8 * s), font=(self.font_family, 11), justify="center")
-        min_entry.grid(row=0, column=1, padx=10, sticky="w")
-        tk.Label(frame, text="秒", font=(self.font_family, 10), fg=TEXT_SUB, bg=DIALOG_BG).grid(row=0, column=2, sticky="w")
+        # 底部按钮先 pack（布局铁律：内容变高时收尾按钮不被挤走）
+        btn_frame = tk.Frame(frame, bg=DIALOG_BG)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
 
-        # 最长沉默时间
-        tk.Label(frame, text="最长沉默时间（30~600 秒）:", font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=1, column=0, sticky="w", pady=8)
-        max_var = tk.StringVar(value=str(self.watch_max_silence))
-        max_entry = RoundedEntry(frame, textvariable=max_var, width=int(80 * s), height=int(30 * s),
-                                 radius=int(8 * s), font=(self.font_family, 11), justify="center")
-        max_entry.grid(row=1, column=1, padx=10, sticky="w")
-        tk.Label(frame, text="秒", font=(self.font_family, 10), fg=TEXT_SUB, bg=DIALOG_BG).grid(row=1, column=2, sticky="w")
+        wmin_var = tk.StringVar(value=str(self.watch_min_interval))
+        wmax_var = tk.StringVar(value=str(self.watch_max_silence))
+        enabled_var = tk.BooleanVar(value=self.topic_enabled)
+        mode_var = tk.StringVar(value=self.topic_mode)
+        interval_var = tk.StringVar(value=str(self.topic_interval_minutes))
+        rmin_var = tk.StringVar(value=str(self.topic_random_min))
+        rmax_var = tk.StringVar(value=str(self.topic_random_max))
+        cap_var = tk.DoubleVar(value=rc.capture_interval)
+        read_min_var = tk.IntVar(value=rc.min_interval)
+        read_max_var = tk.IntVar(value=rc.max_silence)
 
         def save():
             try:
-                new_min = int(min_var.get())
-                new_max = int(max_var.get())
+                w_min = int(wmin_var.get())
+                w_max = int(wmax_var.get())
+                t_fixed = int(interval_var.get())
+                t_rmin = int(rmin_var.get())
+                t_rmax = int(rmax_var.get())
             except ValueError:
                 messagebox.showwarning("输入错误", "请输入有效的整数")
                 return
-            if new_min < 5 or new_min > 120:
-                messagebox.showwarning("输入错误", "最短间隔需要在 5~120 之间")
+            if w_min < 5:
+                messagebox.showwarning("输入错误", "最短沉默不能小于 5 秒")
                 return
-            if new_max < 30 or new_max > 600:
-                messagebox.showwarning("输入错误", "最长沉默需要在 30~600 之间")
+            if w_max <= w_min:
+                messagebox.showwarning("输入错误", "最长沉默必须大于最短沉默")
                 return
-            if new_min >= new_max:
-                messagebox.showwarning("输入错误", "最短间隔必须小于最长沉默时间")
+            mode = mode_var.get()
+            if mode == "random" and t_rmin > t_rmax:
+                messagebox.showwarning("提示", "话题最小间隔不能大于最大间隔")
                 return
-            self.watch_min_interval = new_min
-            self.watch_max_silence = new_max
-            save_watch_config({
-                "min_interval": new_min,
-                "max_silence": new_max
-            })
-            messagebox.showinfo("成功", "陪玩设置已保存")
+            try:
+                read_cap = float(cap_var.get())
+                read_min = int(read_min_var.get())
+                read_max = int(read_max_var.get())
+            except (ValueError, tk.TclError):
+                messagebox.showwarning("输入错误", "陪读设置：请输入有效的数字")
+                return
+            # 定时话题
+            self.topic_enabled = bool(enabled_var.get())
+            if mode == "random":
+                self.topic_mode = "random"
+                self.topic_random_min = max(1, min(240, t_rmin))
+                self.topic_random_max = max(1, min(240, t_rmax))
+            else:
+                self.topic_mode = "fixed"
+                self.topic_interval_minutes = max(1, min(240, t_fixed))
+            if self.topic_enabled:
+                self.start_topic_timer()
+            elif self.topic_timer_job:
+                self.root.after_cancel(self.topic_timer_job)
+                self.topic_timer_job = None
+            save_topic_config(self.topic_enabled, self.topic_interval_minutes, self.topic_mode,
+                              self.topic_random_min, self.topic_random_max)
+            # 陪玩陪看
+            self.watch_min_interval = w_min
+            self.watch_max_silence = w_max
+            save_watch_config({"min_interval": w_min, "max_silence": w_max})
+            # 陪读（阅读）
+            rc.region.update(region)
+            rc.capture_interval = read_cap
+            rc.min_interval = read_min
+            rc.max_silence = read_max
+            rc.save_config()
+            if not self.topic_enabled:
+                topic_msg = "已关闭"
+            elif self.topic_mode == "random":
+                topic_msg = "随机 %d~%d 分钟" % (self.topic_random_min, self.topic_random_max)
+            else:
+                topic_msg = "固定 %d 分钟" % self.topic_interval_minutes
+            log.info("模式相关设置已保存：定时话题 %s；陪看 %d~%d 秒；陪读截图 %.1f 秒",
+                     topic_msg, w_min, w_max, read_cap)
+            messagebox.showinfo("成功", "已保存：定时话题 %s；陪玩陪看 %d~%d 秒" % (topic_msg, w_min, w_max))
             win.destroy()
 
-        RoundedButton(frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
-                      radius=int(6 * s), font=(self.font_family, 11, "bold")).grid(row=2, column=0, columnspan=3, sticky="e", pady=20)
+        RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
+                      radius=int(6 * s), font=(self.font_family, 11)).pack(side=tk.LEFT, padx=3)
 
-        # 回车键保存
-        def on_return(event):
-            save()
-        win.bind("<Return>", on_return)
-        min_entry.focus()
+        def _num_row(label, var, unit, width=90):
+            """一行「标签 + 圆角输入框 + 单位」（每行只放一对，防右边界裁切）"""
+            row = tk.Frame(frame, bg=DIALOG_BG)
+            row.pack(anchor='w', pady=3)
+            tk.Label(row, text=label, font=(self.font_family, 11), fg=TEXT_MAIN,
+                     bg=DIALOG_BG).pack(side=tk.LEFT)
+            ent = RoundedEntry(row, textvariable=var, width=int(width * s), height=int(30 * s),
+                               radius=int(8 * s), font=(self.font_family, 11), justify="center")
+            ent.pack(side=tk.LEFT, padx=8)
+            tk.Label(row, text=unit, font=(self.font_family, 10), fg=TEXT_SUB,
+                     bg=DIALOG_BG).pack(side=tk.LEFT)
+            return ent
+
+        def _sep():
+            tk.Frame(frame, height=max(1, int(s)), bg=CARD_BORDER).pack(fill=tk.X, pady=(10, 4))
+
+        # ── 定时话题 ──
+        tk.Label(frame, text="定时话题", font=(self.font_family, 12, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(anchor='w', pady=(2, 2))
+        tk.Label(frame, text="没话聊的时候，她隔一段时间自己找个话题开口。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w')
+        ttk.Checkbutton(frame, text="启用定时话题", variable=enabled_var).pack(anchor='w', pady=(4, 2))
+        tk.Label(frame, text="间隔模式:", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(anchor='w', pady=(4, 2))
+        mode_row = tk.Frame(frame, bg=DIALOG_BG)
+        mode_row.pack(anchor='w', pady=2)
+        btn_fixed = RoundedButton(mode_row, text="固定间隔", width=int(110 * s), height=int(30 * s),
+                                  radius=int(8 * s), font=(self.font_family, 11), variant="primary",
+                                  command=lambda: select_mode("fixed"))
+        btn_fixed.pack(side=tk.LEFT, padx=(0, 8))
+        btn_random = RoundedButton(mode_row, text="随机间隔", width=int(110 * s), height=int(30 * s),
+                                   radius=int(8 * s), font=(self.font_family, 11), variant="subtle",
+                                   command=lambda: select_mode("random"))
+        btn_random.pack(side=tk.LEFT)
+
+        # 话题的输入行放进专属容器：切换固定/随机时只在容器内部重排，
+        # 不会因为 pack_forget + 重新 pack 而跑到整个窗口的最底下（Tk 的坑）
+        topic_body = tk.Frame(frame, bg=DIALOG_BG)
+        topic_body.pack(anchor='w', fill=tk.X)
+
+        fixed_row = tk.Frame(topic_body, bg=DIALOG_BG)
+        tk.Label(fixed_row, text="间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(side=tk.LEFT)
+        RoundedEntry(fixed_row, textvariable=interval_var, width=int(90 * s), height=int(30 * s),
+                     radius=int(8 * s), font=(self.font_family, 11),
+                     justify="center").pack(side=tk.LEFT, padx=8)
+
+        rmin_row = tk.Frame(topic_body, bg=DIALOG_BG)
+        tk.Label(rmin_row, text="最小间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(side=tk.LEFT)
+        RoundedEntry(rmin_row, textvariable=rmin_var, width=int(90 * s), height=int(30 * s),
+                     radius=int(8 * s), font=(self.font_family, 11),
+                     justify="center").pack(side=tk.LEFT, padx=8)
+
+        rmax_row = tk.Frame(topic_body, bg=DIALOG_BG)
+        tk.Label(rmax_row, text="最大间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(side=tk.LEFT)
+        RoundedEntry(rmax_row, textvariable=rmax_var, width=int(90 * s), height=int(30 * s),
+                     radius=int(8 * s), font=(self.font_family, 11),
+                     justify="center").pack(side=tk.LEFT, padx=8)
+        tip = tk.Label(topic_body, text="随机间隔：每次触发后在此区间内随机抽一个间隔",
+                       font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG)
+
+        def select_mode(mode):
+            mode_var.set(mode)
+            btn_fixed.set_variant("primary" if mode == "fixed" else "subtle")
+            btn_random.set_variant("primary" if mode == "random" else "subtle")
+            for _w in (fixed_row, rmin_row, rmax_row, tip):
+                _w.pack_forget()
+            if mode == "random":
+                rmin_row.pack(anchor='w', pady=(4, 2))
+                rmax_row.pack(anchor='w', pady=2)
+                tip.pack(anchor='w', pady=2)
+            else:
+                fixed_row.pack(anchor='w', pady=(4, 2))
+
+        select_mode(mode_var.get())
+        _sep()
+
+        # ── 陪玩陪看 ──
+        tk.Label(frame, text="陪玩陪看", font=(self.font_family, 12, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(anchor='w', pady=(2, 2))
+        tk.Label(frame, text="距上次说话超过「最短沉默」之后，她才会考虑要不要说一句；\n"
+                             "到了「最长沉默」还没说，就强制说一句。单位秒，没有上限。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w')
+        wmin_entry = _num_row("最短沉默时间:", wmin_var, "秒")
+        _num_row("最长沉默时间:", wmax_var, "秒")
+        _sep()
+
+        # ── 陪读（阅读）──
+        tk.Label(frame, text="陪读（阅读）", font=(self.font_family, 12, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).pack(anchor='w', pady=(2, 2))
+        tk.Label(frame, text="截取区域：点「缩略图框选区域」在屏幕上框一块（会自动记下），\n"
+                             "再用「预览当前区域」看框得对不对。时间单位都是秒。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify='left').pack(anchor='w')
+
+        def start_box_select():
+            win.withdraw()
+
+            def on_region_selected(picked):
+                if picked is None:
+                    win.deiconify()
+                    return
+                for _k in ("left", "top", "width", "height"):
+                    region[_k] = round(picked[_k], 4)
+                win.deiconify()
+                preview_current()
+            rc.select_region_interactive(callback=on_region_selected)
+
+        def show_preview(reg):
+            try:
+                if not mss:
+                    return
+                with mss.MSS() as sct:
+                    mon = sct.monitors[1]
+                    l = int(mon["width"] * reg["left"])
+                    t = int(mon["height"] * reg["top"])
+                    w = int(mon["width"] * reg["width"])
+                    h = int(mon["height"] * reg["height"])
+                    cap = {"left": l, "top": t, "width": max(w, 1), "height": max(h, 1)}
+                    img = sct.grab(cap)
+                    pil_img = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+            except Exception as e:
+                messagebox.showerror("预览失败", str(e))
+                return
+            preview_win = tk.Toplevel(win)
+            preview_win.title("截取区域预览")
+            preview_win.configure(bg=DIALOG_BG)
+            img_width, img_height = pil_img.size
+            max_width = 400
+            if img_width > max_width:
+                ratio = max_width / img_width
+                pil_img = pil_img.resize((max_width, int(img_height * ratio)), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(pil_img)
+            lab = tk.Label(preview_win, image=photo, bg=DIALOG_BG)
+            lab.image = photo
+            lab.pack(padx=10, pady=10)
+            tk.Label(preview_win, text=f"区域大小：{w}x{h} 像素",
+                     font=(self.font_family, 9), bg=DIALOG_BG).pack()
+
+        def preview_current():
+            show_preview(region)
+
+        sel_row = tk.Frame(frame, bg=DIALOG_BG)
+        sel_row.pack(anchor='w', pady=(6, 2))
+        RoundedButton(sel_row, text="🖱️ 缩略图框选区域", command=start_box_select,
+                      width=int(190 * s), height=int(32 * s), radius=int(6 * s),
+                      font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+        RoundedButton(sel_row, text="🔍 预览当前区域", command=preview_current, variant="subtle",
+                      width=int(170 * s), height=int(32 * s), radius=int(6 * s),
+                      font=(self.font_family, 10)).pack(side=tk.LEFT)
+        _num_row("截图间隔:", cap_var, "秒", width=80)
+        _num_row("最短沉默时间:", read_min_var, "秒", width=80)
+        _num_row("最长沉默时间:", read_max_var, "秒", width=80)
+
+        win.bind("<Return>", lambda e: save())
+        wmin_entry.focus()
 
     # ---------- 读书伴侣 ----------
     def toggle_reading(self):
@@ -7330,121 +7601,6 @@ OCR文字：
             self.show_bubble_text("(shy) 有机会再一起读吧", "shy")
         label = "📖 陪我读书 (停止)" if self.reading_companion.enabled else "📖 陪我读书 (开始)"
         self._safe_menu_config(self.reading_menu_index, label, self.mode_menu)
-
-    def open_reading_settings(self):
-        win, frame = self._make_card_window("阅读区域与频率设置", 420, 520)
-        s = self._dpi_scale
-
-        tk.Label(frame, text="截取区域 (屏幕百分比)", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).grid(row=0, column=0, columnspan=2, pady=5)
-        fields = [
-            ("左边距 (left)", "left"),
-            ("上边距 (top)", "top"),
-            ("宽度 (width)", "width"),
-            ("高度 (height)", "height")
-        ]
-        vars = {}
-        for i, (text, key) in enumerate(fields):
-            tk.Label(frame, text=text, font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=i+1, column=0, sticky="e", pady=2)
-            var = tk.DoubleVar(value=self.reading_companion.region[key])
-            RoundedEntry(frame, textvariable=var, width=int(90 * s), height=int(30 * s),
-                         radius=int(8 * s), font=(self.font_family, 10)).grid(row=i+1, column=1, sticky="w", padx=5)
-            vars[key] = var
-
-        tk.Label(frame, text="截图间隔 (秒)", font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=5, column=0, sticky="e", pady=5)
-        cap_var = tk.DoubleVar(value=self.reading_companion.capture_interval)
-        RoundedEntry(frame, textvariable=cap_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 10)).grid(row=5, column=1, sticky="w", padx=5)
-
-        tk.Label(frame, text="最短间隔时间 (5~120 秒)", font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=6, column=0, sticky="e", pady=5)
-        min_var = tk.IntVar(value=self.reading_companion.min_interval)
-        RoundedEntry(frame, textvariable=min_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 10)).grid(row=6, column=1, sticky="w", padx=5)
-
-        tk.Label(frame, text="最长沉默时间 (30~600 秒)", font=(self.font_family, 10), fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=7, column=0, sticky="e", pady=5)
-        max_var = tk.IntVar(value=self.reading_companion.max_silence)
-        RoundedEntry(frame, textvariable=max_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 10)).grid(row=7, column=1, sticky="w", padx=5)
-
-        def start_box_select():
-            win.withdraw()
-            def on_region_selected(region):
-                if region is None:
-                    win.deiconify()
-                    return
-                for key in vars:
-                    vars[key].set(round(region[key], 4))
-                win.deiconify()
-                preview_current()
-            self.reading_companion.select_region_interactive(callback=on_region_selected)
-
-        def show_preview(region):
-            try:
-                if not mss:
-                    return
-                with mss.MSS() as sct:
-                    mon = sct.monitors[1]
-                    l = int(mon["width"] * region["left"])
-                    t = int(mon["height"] * region["top"])
-                    w = int(mon["width"] * region["width"])
-                    h = int(mon["height"] * region["height"])
-                    cap = {"left": l, "top": t, "width": max(w,1), "height": max(h,1)}
-                    img = sct.grab(cap)
-                    pil_img = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-            except Exception as e:
-                messagebox.showerror("预览失败", str(e))
-                return
-
-            preview_win = tk.Toplevel(win)
-            preview_win.title("截取区域预览")
-            preview_win.configure(bg=DIALOG_BG)
-            img_width, img_height = pil_img.size
-            max_width = 400
-            if img_width > max_width:
-                ratio = max_width / img_width
-                pil_img = pil_img.resize((max_width, int(img_height * ratio)), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(pil_img)
-            label = tk.Label(preview_win, image=photo, bg=DIALOG_BG)
-            label.image = photo
-            label.pack(padx=10, pady=10)
-            tk.Label(preview_win, text=f"区域大小：{w}x{h} 像素", font=(self.font_family, 9), bg=DIALOG_BG).pack()
-
-        def preview_current():
-            try:
-                region = {
-                    "left": float(vars["left"].get()),
-                    "top": float(vars["top"].get()),
-                    "width": float(vars["width"].get()),
-                    "height": float(vars["height"].get())
-                }
-            except ValueError:
-                messagebox.showerror("错误", "请输入有效的数字")
-                return
-            show_preview(region)
-
-        box_btn = RoundedButton(frame, text="🖱️ 缩略图框选区域", command=start_box_select,
-                                width=int(190 * s), height=int(34 * s), radius=int(6 * s),
-                                font=(self.font_family, 10, "bold"))
-        box_btn.grid(row=8, column=0, columnspan=2, pady=8)
-
-        preview_btn = RoundedButton(frame, text="🔍 预览当前区域", command=preview_current,
-                                    variant="subtle",
-                                    width=int(170 * s), height=int(32 * s), radius=int(6 * s),
-                                    font=(self.font_family, 10))
-        preview_btn.grid(row=9, column=0, columnspan=2, pady=5)
-
-        def save():
-            for key in vars:
-                self.reading_companion.region[key] = vars[key].get()
-            self.reading_companion.capture_interval = cap_var.get()
-            self.reading_companion.min_interval = min_var.get()
-            self.reading_companion.max_silence = max_var.get()
-            self.reading_companion.save_config()
-            messagebox.showinfo("成功", "阅读设置已保存")
-            win.destroy()
-
-        RoundedButton(frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
-                      radius=int(6 * s), font=(self.font_family, 11)).grid(row=10, column=0, columnspan=2, sticky="e", pady=15)
 
     # ---------- 语音识别控制 ----------
     def _init_listen_badge(self):
@@ -7540,7 +7696,12 @@ OCR文字：
         if not self._shutdown:
             self.root.after(60, self._ptt_tick)
 
-    def toggle_voice(self):
+    def toggle_voice(self, save=True, quiet=False):
+        """开关语音识别。
+
+        save=False 用于"不是用户选的动作"（自动睡眠、退出清理、开机/睡醒恢复）：
+        那些关麦只是临时状态，不能把她自己的选择冲掉——退出时会关麦，但下次开机还要接着开。
+        quiet=True 不弹气泡（睡醒时她已经在说"我眯了一会儿"了，别用气泡盖掉）。"""
         if not VOICE_AVAILABLE:
             messagebox.showwarning("缺少依赖", "语音识别需要安装 sherpa-onnx pyaudio numpy")
             return
@@ -7552,16 +7713,53 @@ OCR文字：
             self.stt.clear_window()      # 关语音顺手清窗口，免得下次打开时旧窗口还生效
             self.voice_on = False
             self._update_voice_menu_label()
-            self.show_bubble_text("(normal) 语音识别已停止", "normal")
+            if not quiet:
+                self.show_bubble_text("(normal) 语音识别已停止", "normal")
             log.info("语音识别已关闭")
         else:
             if self.sleep_mode:
-                self.stop_sleep_mode()
+                self.stop_sleep_mode(restore_voice=False)   # 开麦这条路上别再触发一次"睡醒恢复"
             self.stt.start()
             self.voice_on = True
             self._update_voice_menu_label()
-            self.show_bubble_text("(happy) 我在听你说话", "happy")
+            if not quiet:
+                self.show_bubble_text("(happy) 我在听你说话", "happy")
             log.info("语音识别已开启")
+        if save:
+            self._voice_wanted = self.voice_on
+            try:
+                save_voice_config({"enabled": self.voice_on})   # 记住选择，下次开机沿用
+            except Exception as e:
+                log.debug(f"语音开关状态保存失败: {e}")
+
+    def _restore_voice_if_wanted(self, quiet=False):
+        """该开却没开就开回来（开机恢复、睡醒恢复共用）。返回是否真的开了。"""
+        if self.voice_on or self.sleep_mode or not getattr(self, "_voice_wanted", False):
+            return False
+        stt = self.stt
+        if stt is None or getattr(stt, "load_failed", False) or not getattr(stt, "ready", False):
+            return False        # 模型还没就绪：交给开机那套轮询（_voice_restore_tick）去等
+        log.info("恢复语音识别（按你上次的选择）")
+        self.toggle_voice(save=False, quiet=quiet)
+        return True
+
+    def _voice_restore_tick(self):
+        """开机恢复上次退出时的语音开关状态。
+
+        语音模型要几十秒才 ready，菜单这时点了只会弹"还没准备好"，所以这里轮询等它；
+        上次就是关着的话压根不会排这个 tick。"""
+        if self._voice_restore_done:
+            return
+        stt = self.stt
+        if stt is None or getattr(stt, "load_failed", False):
+            self._voice_restore_done = True
+            log.warning("语音状态恢复跳过：语音识别不可用")
+            return
+        if not stt.ready:
+            self.root.after(500, self._voice_restore_tick)
+            return
+        self._voice_restore_done = True
+        self._restore_voice_if_wanted()
 
     def _on_output_finished(self, refresh_voice=False, from_tts=False):
         """一轮输出完毕（气泡打字完成 / TTS 播完）。
