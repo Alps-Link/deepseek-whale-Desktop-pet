@@ -1052,6 +1052,7 @@ DEFAULT_PTT_NAME = "右 Ctrl"
 WAKE_TOLERANCE = 1            # 拼音通道允许错几个音节（0 = 必须完全同音）
 WAKE_TAIL_LOCK = 2            # 名字末 N 个音节必须完全一致（挡"大飞机/大部分/往那卡"这类真词）
 WAKE_ANYWHERE = True          # 名字出现在整句任何位置都算唤醒（False = 只认句首 5~6 字内）
+WAKE_VOCATIVE_CHARS = 2       # 名字起点在前几个字内才算"称呼"（才会从文本里删掉）；更靠后就是"提到名字"，整句原样送
 WAKE_ALIASES = ("罗非鱼", "大头鱼")   # 默认名的"听错写法"白名单：只在还叫"大肥鱼"时生效（改名后整套失效）
 
 # 按键显示名：按 Windows 虚拟键码反查（轮询捕获时只有 vk，没有 Tk 的 keysym）
@@ -2289,6 +2290,7 @@ class LocalParaformerSTT:
     CONVERSATION_WINDOW = DEFAULT_WAKE_WINDOW   # 兼容旧引用：默认窗口长度
 
     _WAKE_FILLER = "斯丝寺嘶酱呀啊呢嘛吧的~ 喂嗯呃哦哎"   # 名字后面粘的称呼尾字
+    _WAKE_HEAD_FILLER = _WAKE_FILLER + "那个"              # 名字前面只可能是这些语气词（"那个大肥鱼…"）
     _PINYIN_INITIALS = ("zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l",
                         "g", "k", "h", "j", "q", "x", "r", "z", "c", "s", "y", "w")
 
@@ -2318,16 +2320,15 @@ class LocalParaformerSTT:
     def _strip_wake(self, text, idx, consumed):
         """去掉唤醒词（从 idx 起 consumed 个字），清理称呼尾字后返回剩余内容。
 
-        名字后面还有话 ⇒ 名字只是个称呼，前面的"喂/那个/嗯"不算内容；
-        名字后面没话、名字又不在句首（"游戏打多了有点累啊大肥鱼"）⇒ 那半句才是内容，
-        得接回来，否则会被当成"只喊了名字"丢掉。"""
+        只会在"名字处于句首附近（当称呼）"时被调用：名字后面还有话 ⇒ 名字前面的
+        "喂/那个/嗯"不算内容；名字后面没话（"今天大肥鱼"）⇒ 前面那半句才是内容，得接回来。"""
         head = text[:idx]
         rest = text[idx + consumed:]
         while rest and rest[0] in self._WAKE_FILLER:
             rest = rest[1:]
         rest = rest.strip(" ，。！？,.!?~")
-        if rest or idx > 4:
-            while head and head[-1] in self._WAKE_FILLER:
+        if rest:
+            while head and head[-1] in self._WAKE_HEAD_FILLER:
                 head = head[:-1]
             content = (head + rest).strip(" ，。！？,.!?~")
         else:
@@ -2428,14 +2429,22 @@ class LocalParaformerSTT:
         1) 名字汉字精确（容忍"嗯/那个"这类前导语气词）
         2) 拼音模糊（同音字变体、只错一个近音音节）
         3) 别名白名单（明显听错但确实在喊她）
+
+        只在名字处于**句首附近**时才把它从文本里删掉——那是在称呼她；
+        句中、句尾出现的名字算"提到名字"（"你喜欢大肥鱼这个名字吗"），
+        整句原样送进去，删了会裁出残句（"你喜欢这个名字吗"）让她答非所问。
         尾字谐音（斯/丝/寺/酱 等）一并清除。"""
         for pat in self._wake_patterns:
             idx = text.find(pat)
             if idx >= 0 and (WAKE_ANYWHERE or idx <= 4):
+                if idx > WAKE_VOCATIVE_CHARS:
+                    return text                      # 只是提到名字：保留原句
                 return self._strip_wake(text, idx, len(pat))
         # 拼音模糊通道（含位置约束）
         pinyin_hit = self._pinyin_hit(text)
         if pinyin_hit is not None:
+            if pinyin_hit[0] > WAKE_VOCATIVE_CHARS:
+                return text                          # 同上：句中/句尾提到的不删
             return self._strip_wake(text, pinyin_hit[0], pinyin_hit[1])
         return None
 
