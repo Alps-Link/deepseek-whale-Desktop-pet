@@ -727,9 +727,10 @@ ENERGY_RECOVER_PER_MINUTE = 6       # 睡眠时每分钟恢复
 ENERGY_LOW = 30                     # 低于此值开始显疲态
 ENERGY_CRITICAL = 10                # 低于此值有气无力
 # 记忆系统常量
-MAX_TOPICS = 50
-MAX_EVENTS = 30
-ARCHIVE_TTL_DAYS = 5   # 归档（冷存）记忆的保留天数：超过就彻底遗忘删除
+MAX_TOPICS = 60
+MAX_EVENTS = 40
+ARCHIVE_TTL_DAYS = 5        # 归档（冷存）记忆的保留天数：超过就彻底遗忘删除
+ARCHIVE_PROTECT_DAYS = 2    # 新记忆保护期：创建不满这么多天的条目不参与淘汰（让刚记下的先有机会被想起）
 # 性格画像固定清单：写死 8 只一致，AI 只能往这些条目里填内容，无权自创/增删条目
 TRAIT_LIST = ["作息习惯", "饮食习惯", "游戏偏好", "内容偏好", "音乐偏好",
               "兴趣爱好", "性格特质", "工作学业", "健康与情绪", "社交与人际",
@@ -5899,6 +5900,18 @@ class DesktopPet:
             return False
         return (now - t).total_seconds() >= ARCHIVE_TTL_DAYS * 86400
 
+    @staticmethod
+    def _memory_age_days(item, now):
+        """记忆创建至今多少天（新记忆保护期用）；时间缺失或解析不了当作很久以前"""
+        raw = str(item.get("created_at") or "").strip()
+        if not raw:
+            return 10 ** 6
+        try:
+            t = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return 10 ** 6
+        return (now - t).total_seconds() / 86400.0
+
     def _prune_memories(self, category=None):
         """记忆裁剪（画像为固定清单，不参与）：
         ①归档满 ARCHIVE_TTL_DAYS 天的**彻底删除**（真遗忘，数据不再留）；
@@ -5907,7 +5920,7 @@ class DesktopPet:
         而且顺手把它从归档状态摘回来（用户"收藏一条已归档的"＝我要留住它）。"""
         categories = [category] if category else ["topics", "events"]
         now = datetime.now()
-        purged = stamped = archived_now = revived = 0
+        purged = stamped = archived_now = revived = protected_now = 0
         for cat in categories:
             items = self.memory_data.get(cat, [])
             # ① 归档满期 → 彻底遗忘（收藏的例外：摘掉归档状态、永久保留）
@@ -5931,19 +5944,34 @@ class DesktopPet:
                 items = keep
             # ② 活跃超上限 → 归档（冷存），记下归档时刻
             #    收藏的占名额但不被淘汰 ⇒ 只从"非收藏"里淘汰，淘汰到 非收藏 ≤ 上限 − 收藏数
+            #    新记忆保护期：创建不满 ARCHIVE_PROTECT_DAYS 天的先不参与淘汰（它们还没机会被想起，
+            #    而打分只看"召回次数 + 最近被召回"，新条目天然垫底，会被成批冷存掉）
             max_count = MAX_TOPICS if cat == "topics" else MAX_EVENTS
             active_items = [item for item in items if not item.get("archived", False)]
             starred_n = sum(1 for item in active_items if item.get("starred", False))
             keep_quota = max(0, max_count - starred_n)
             candidates = [item for item in active_items if not item.get("starred", False)]
-            if len(candidates) <= keep_quota:
+            protected, selectable = [], []
+            for it in candidates:
+                if self._memory_age_days(it, now) < ARCHIVE_PROTECT_DAYS:
+                    protected.append(it)
+                else:
+                    selectable.append(it)
+            protected_now += len(protected)
+            need = len(candidates) - keep_quota      # 要淘汰掉几条才能回到上限
+            if need <= 0:
                 continue
-            if cat == "topics":
-                candidates.sort(key=self._score_topic_memory, reverse=True)
-            else:
-                candidates.sort(key=self._score_event_memory, reverse=True)
+            # 淘汰优先级：先动"保护期外"的（分数低的先走、同分老的先走＝同分保新），
+            # 只有它们不够抵数时，才轮到"保护期内"的（规则一样：分数低的、老的先走）。
+            # 保护期是"排队排到最后"，不是绝对免死 ⇒ 池子仍然守上限，不会因为一次爆发就无限膨胀，
+            # 也不会因为保护期条目多就把老记忆一次清空。
+            def _evict_key(it):
+                s = self._score_topic_memory(it) if cat == "topics" else self._score_event_memory(it)
+                return (s, str(it.get("created_at") or ""))
+
+            evict_order = sorted(selectable, key=_evict_key) + sorted(protected, key=_evict_key)
             block_stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            for item in candidates[keep_quota:]:
+            for item in evict_order[:need]:
                 item["archived"] = True
                 if not item.get("archived_at"):
                     item["archived_at"] = block_stamp
@@ -5952,6 +5980,8 @@ class DesktopPet:
             log.info(f"彻底遗忘 {purged} 条归档超过 {ARCHIVE_TTL_DAYS} 天的记忆")
         if revived:
             log.info(f"把 {revived} 条已收藏的记忆从归档状态摘回")
+        if archived_now:
+            log.info(f"记忆冷存 {archived_now} 条（超上限）；保护期内 {protected_now} 条本轮不参与淘汰")
         if purged or stamped or archived_now or revived:
             save_memories(self.memory_data)   # 删除、补记归档时刻、新归档、收藏复活都要落盘
 
