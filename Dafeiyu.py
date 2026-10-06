@@ -675,19 +675,58 @@ except ImportError:
 # 角色设定（姓名 + 人设独立成配置，系统提示词由代码拼装）
 DEFAULT_PET_NAME = "大肥鱼"
 DEFAULT_PERSONA = "从 DeepSeek 深海里游上来的鲸鱼娘，蓝白长发、圆滚滚的体型，身后一条会晃的尾鳍。性格可爱又傲娇：嘴上总说\"才不是\"\"别误会\"，身体却很诚实——会主动凑过来，被摸头时会偷偷眯眼。最大的执念是偷吃大白饭：闻到米饭香就游不动路，一天到晚惦记着谁家今天煮了白饭，吃饱了会打个小嗝然后假装什么都没发生。说话简短、带点小得意和小别扭，偶尔会突然冒出一句特别认真的话。"
-# 回复格式要求（内置固定，不可修改，不进入配置文件）
-REPLY_FORMAT_RULES = """整条回复只在开头用一个括号标注当前情绪，括号内只能有一个情绪词（可选值：relaxed, happy, hurried, normal, shy, surprised, worried, angry, sleep）。
+# 回复格式要求分两段：
+# ①「固定段」情绪括号的写法——程序要靠它解析情绪（parse_emotion_from_reply / EMOTION_WORDS /
+#    _strip_inline_markers），所以不可配置；
+# ②「可配置段」字数上限与说话方式——用户在 右键→设置→系统提示词 里改，存 config.json 的 character 节。
+REPLY_FORMAT_FIXED = """整条回复只在开头用一个括号标注当前情绪，括号内只能有一个情绪词（可选值：{emotions}）。
 例如：'(happy) 今天天气真好呀！'
 如需描述更细微的心情，请在第一个情绪括号后另外添加括号，例如：'(happy) (脸颊微微泛红) 谢谢你夸奖我。'
 一段回复里情绪括号只出现这一次（仅开头）；正文中不要再换行后重复标注情绪括号，需要停顿请用逗号或省略号在同一句话里继续，不要自行分段。
-**你说给用户听的整条回复（不含开头情绪括号和动作括号）必须控制在 70 个字以内**，宁短勿长：像真人随口说话那样一两句说完，不要长篇大论、不要分点罗列、不要反复铺陈。（此上限只针对说给用户的话；若任务另外要求填写结构化字段、事件描述等内容，按该任务的要求来，不受此限。）
 **绝不能**将多个词语放在同一个情绪括号内，如'(happy and excited)'是错误的。
-情绪括号必须使用英文半角小括号 ()，不要使用中文全角括号（）。
-请严格遵守格式，让情绪词单独出现在第一个括号中，并始终留意字数上限。"""
+情绪括号必须使用英文半角小括号 ()，不要使用中文全角括号（）。"""
+
+REPLY_FORMAT_LEN = """**你说给用户听的整条回复（不含开头情绪括号和动作括号）必须控制在 {max_chars} 个字以内**，宁短勿长：像真人随口说话那样一两句说完，不要长篇大论、不要分点罗列、不要反复铺陈。（此上限只针对说给用户的话；若任务另外要求填写结构化字段、事件描述等内容，按该任务的要求来，不受此限。）"""
+
+DEFAULT_MAX_CHARS = 70            # 回复字数上限（汉字），设置里可改
+MIN_MAX_CHARS = 20                # 可设的最小值
+MAX_MAX_CHARS = 400               # 可设的最大值
+
+# 说话方式 / 禁修辞：默认这份"反八股"规则；设置里可改，清空＝完全不注入这一段
+DEFAULT_STYLE_RULES = """像真人当面聊天，不是写文章：
+- 禁用书面连接词与套路词：首先、其次、然后、总之、综上、值得注意的是、不得不说、说到底、换句话说、某种意义上、这让我想到。
+- 禁用对举与排比：不要“不是…而是…”“既…又…”“与其…不如…”，不要连续三句同结构。
+- 不要在结尾总结、升华或抒情；说完要说的事就停，允许一句话就结束。
+- 不必回应对方说的每一点，挑一个点说；允许只应一声。
+- 允许口语与停顿：诶、欸、嘛、啊、嗯、哈、喔、省略号、半截话。
+- 比喻少用，一句里最多一个意象，别堆。"""
 
 # 合法情绪词（半角括号内唯一允许的标注词）
 EMOTION_WORDS = {"relaxed", "happy", "hurried", "normal", "shy", "surprised", "worried",
                  "angry", "sleep"}
+# 提示词里列出的顺序（只列 EMOTION_WORDS 里真实存在的词，各只可能不同）
+EMOTION_ORDER = ("relaxed", "happy", "hurried", "normal", "shy", "surprised", "worried",
+                 "angry", "sleep")
+
+
+def emotion_word_list():
+    """提示词里公示的情绪词表：只列本只真正支持的，避免提示词写了她答不出来的情绪"""
+    return ", ".join(w for w in EMOTION_ORDER if w in EMOTION_WORDS)
+
+
+def format_reply_rules(max_chars=DEFAULT_MAX_CHARS):
+    """完整回复格式要求 = 固定段（情绪括号）+ 可配置的字数上限段"""
+    try:
+        n = int(max_chars)
+    except (TypeError, ValueError):
+        n = DEFAULT_MAX_CHARS
+    n = max(MIN_MAX_CHARS, min(MAX_MAX_CHARS, n))
+    return (REPLY_FORMAT_FIXED.format(emotions=emotion_word_list())
+            + "\n" + REPLY_FORMAT_LEN.format(max_chars=n)
+            + "\n请严格遵守格式，让情绪词单独出现在第一个括号中，并始终留意字数上限。")
+
+
+REPLY_FORMAT_RULES = format_reply_rules()   # 兼容旧引用：默认字数那版（实际拼装走 build_system_prompt）
 
 def _strip_inline_markers(text):
     """只剥掉回复中残留的英文情绪标注（行首或紧跟标点/换行后的 (happy) 等，
@@ -871,13 +910,23 @@ def save_user_profile(profile):
     save_json_file(USER_PROFILE_FILE, profile)
 
 def load_character_config():
-    """加载角色设定（姓名 + 人设）；首次运行从旧 system_prompt.txt 迁移"""
+    """加载角色设定（姓名 + 人设 + 回复规则）；首次运行从旧 system_prompt.txt 迁移。
+    回复规则（字数上限 / 说话方式 / 禁词表）也存这里，见 设置→系统提示词。"""
     data = _get_section("character")
     name = (data.get("name") or "").strip() or DEFAULT_PET_NAME
     persona = (data.get("persona") or "").strip()
     if not persona:
         persona = _migrate_persona_from_system_prompt() or DEFAULT_PERSONA
-    return {"name": name, "persona": persona}
+    try:
+        max_chars = int(data.get("max_chars", DEFAULT_MAX_CHARS))
+    except (TypeError, ValueError):
+        max_chars = DEFAULT_MAX_CHARS
+    max_chars = max(MIN_MAX_CHARS, min(MAX_MAX_CHARS, max_chars))
+    style = data.get("style_rules")
+    if style is None:
+        style = DEFAULT_STYLE_RULES        # 没这个键＝老配置：用内置默认；存成空串＝真的不注入
+    return {"name": name, "persona": persona, "max_chars": max_chars,
+            "style_rules": str(style)}
 
 def load_costume_config():
     """装扮选择（持久化）：{槽位: 装扮名 或 [装扮名…]}。
@@ -945,13 +994,23 @@ def save_character_config(config):
     _update_section("character", config)
 
 def load_banned_words():
-    if os.path.exists(BANNED_WORDS_FILE):
-        with open(BANNED_WORDS_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return ""
+    """禁词表：优先 config.json 的 character 节；老的 banned_words.txt 兜底（下次保存迁进配置）"""
+    val = _get_section("character").get("banned_words")
+    if val is None:
+        if os.path.exists(BANNED_WORDS_FILE):
+            try:
+                with open(BANNED_WORDS_FILE, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                return ""
+        return ""
+    return str(val).strip()
 
 def save_banned_words(text):
-    _atomic_write_text(BANNED_WORDS_FILE, text.strip())
+    """写进 config.json 的 character 节（老 banned_words.txt 保留不删，只当迁移源）"""
+    sec = _get_section("character")
+    sec["banned_words"] = (text or "").strip()
+    _update_section("character", sec)
 
 def load_watch_config():
     default = {"min_interval": 15, "max_silence": 120}
@@ -1303,9 +1362,14 @@ def save_topic_history(history):
         history = history[-50:]
     save_json_file(TOPIC_HISTORY_FILE, history)
 
-def build_system_prompt(name, persona):
-    """由角色姓名 + 人设拼装系统提示词（"你是{名字}，"与回复格式要求由代码内置）"""
-    return f"你是{name}，{persona}\n\n【回复格式要求】\n{REPLY_FORMAT_RULES}"
+def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=None):
+    """由角色姓名 + 人设 + 回复规则拼系统提示词（"你是{名字}，"与情绪括号格式由代码内置）。
+    max_chars / style_rules 来自 config.json 的 character 节；style_rules 传空串＝不注入说话方式段。"""
+    parts = [f"你是{name}，{persona}\n\n【回复格式要求】\n{format_reply_rules(max_chars)}"]
+    style = (DEFAULT_STYLE_RULES if style_rules is None else str(style_rules)).strip()
+    if style:
+        parts.append("【说话方式】\n" + style)
+    return "\n\n".join(parts)
 
 def build_full_system_prompt(base_prompt, user_profile):
     story_text = ""
@@ -2705,7 +2769,10 @@ class DesktopPet:
 
         self.character_config = load_character_config()
         self.pet_name = self.character_config["name"]
-        self.system_prompt = build_system_prompt(self.pet_name, self.character_config["persona"])
+        self.max_chars = self.character_config["max_chars"]
+        self.style_rules = self.character_config["style_rules"]
+        self.system_prompt = build_system_prompt(self.pet_name, self.character_config["persona"],
+                                                 self.max_chars, self.style_rules)
         self.banned_words = load_banned_words()
         self.user_profile = load_user_profile()
         self.full_system = build_full_system_prompt(self.system_prompt, self.user_profile)
@@ -5058,16 +5125,16 @@ class DesktopPet:
 
     # ---------- 系统提示词设置 ----------
     def open_settings(self):
-        win, main_frame = self._make_card_window("系统提示词设置", 700, 700)
+        win, main_frame = self._make_card_window("系统提示词设置", 700, 880)
         s = self._dpi_scale
 
-        label = tk.Label(main_frame, text="角色设定（修改后需点击「保存」生效）：",
-                         font=(self.font_family, 12, "bold"), fg=TEXT_MAIN, bg=DIALOG_BG)
-        label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        tk.Label(main_frame, text="角色设定：", font=(self.font_family, 12, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).grid(row=0, column=0, columnspan=3, sticky="w",
+                                                  pady=(0, 6))
 
-        # 角色姓名（自绘圆角输入框）
-        name_label = tk.Label(main_frame, text="角色姓名：", font=(self.font_family, 11), fg=TEXT_MAIN, bg=DIALOG_BG)
-        name_label.grid(row=1, column=0, sticky="w", pady=3)
+        # 字段标签一律等宽（都 3 字）且靠左：输入框正好贴在标签右边，左右都不留空
+        tk.Label(main_frame, text="姓名：", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=1, column=0, sticky="w", pady=3)
         name_var = tk.StringVar(value=self.pet_name)
         name_entry = RoundedEntry(main_frame, textvariable=name_var,
                                   width=int(470 * s), height=int(32 * s),
@@ -5075,30 +5142,44 @@ class DesktopPet:
                                   font=(self.font_family, 11))
         name_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
-        # 人设（含说话方式）
-        persona_label = tk.Label(main_frame,
-                                 text="人设与说话方式（保存后会自动拼上“你是{角色姓名}，”和内置的回复格式要求）：",
-                                 font=(self.font_family, 11, "bold"), fg=TEXT_MAIN, bg=DIALOG_BG)
-        persona_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 3))
+        tk.Label(main_frame, text="人设：", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 3))
         persona_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, font=(self.font_family, 11),
                                                  bg="#ffffff", fg=TEXT_MAIN, relief=tk.FLAT, bd=0,
-                                                 highlightthickness=1, highlightbackground=INPUT_BORDER2, height=14)
+                                                 highlightthickness=1, highlightbackground=INPUT_BORDER2, height=11)
         persona_area.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=5)
         persona_area.insert(tk.END, self.character_config["persona"])
 
-        # 禁词表
-        ban_label = tk.Label(main_frame, text="禁词表（用逗号分隔，回复中将禁止出现这些词汇）：",
-                             font=(self.font_family, 11, "bold"), fg=TEXT_MAIN, bg=DIALOG_BG)
-        ban_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 3))
+        # ── 回复规则（可改，存 config.json 的 character 节）──
+        tk.Label(main_frame, text="回复规则：", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 3))
+
+        tk.Label(main_frame, text="字数：", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=5, column=0, sticky="w", pady=3)
+        max_var = tk.StringVar(value=str(self.max_chars))
+        max_entry = RoundedEntry(main_frame, textvariable=max_var,
+                                 width=int(140 * s), height=int(32 * s),
+                                 radius=int(8 * s), font=(self.font_family, 11))
+        max_entry.grid(row=5, column=1, columnspan=2, sticky="w", pady=3)
+
+        tk.Label(main_frame, text="禁词：", font=(self.font_family, 11), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=6, column=0, sticky="w", pady=3)
         ban_var = tk.StringVar(value=self.banned_words)
         ban_entry = RoundedEntry(main_frame, textvariable=ban_var,
                                  width=int(470 * s), height=int(32 * s),
-                                 radius=int(8 * s),
-                                 font=(self.font_family, 11))
-        ban_entry.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+                                 radius=int(8 * s), font=(self.font_family, 11))
+        ban_entry.grid(row=6, column=1, columnspan=2, sticky="ew", pady=3)
+
+        tk.Label(main_frame, text="说话方式：", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
+                 bg=DIALOG_BG).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 3))
+        style_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, font=(self.font_family, 10),
+                                               bg="#ffffff", fg=TEXT_MAIN, relief=tk.FLAT, bd=0,
+                                               highlightthickness=1, highlightbackground=INPUT_BORDER2, height=6)
+        style_area.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=5)
+        style_area.insert(tk.END, self.style_rules)
 
         btn_frame = tk.Frame(main_frame, bg=DIALOG_BG)
-        btn_frame.grid(row=6, column=0, columnspan=3, sticky="e", pady=10)
+        btn_frame.grid(row=9, column=0, columnspan=3, sticky="e", pady=10)
 
         def save_prompt():
             new_name = name_var.get().strip()
@@ -5109,14 +5190,26 @@ class DesktopPet:
             if not new_persona:
                 messagebox.showwarning("警告", "人设不能为空！")
                 return
-            self.character_config["name"] = new_name
-            self.character_config["persona"] = new_persona
+            try:
+                new_max = int(str(max_var.get()).strip())
+            except (TypeError, ValueError):
+                messagebox.showwarning("警告", "字数上限要填数字（%d~%d）" % (MIN_MAX_CHARS, MAX_MAX_CHARS))
+                return
+            if not (MIN_MAX_CHARS <= new_max <= MAX_MAX_CHARS):
+                messagebox.showwarning("警告", "字数上限请填 %d~%d 之间的数字" % (MIN_MAX_CHARS, MAX_MAX_CHARS))
+                return
+            new_style = style_area.get("1.0", tk.END).strip()
+            new_bans = ban_var.get().strip()
+            self.character_config.update({
+                "name": new_name, "persona": new_persona, "max_chars": new_max,
+                "style_rules": new_style, "banned_words": new_bans,
+            })
             save_character_config(self.character_config)
             self.pet_name = new_name
-            self.system_prompt = build_system_prompt(new_name, new_persona)
-            new_bans = ban_var.get().strip()
-            save_banned_words(new_bans)
+            self.max_chars = new_max
+            self.style_rules = new_style
             self.banned_words = new_bans
+            self.system_prompt = build_system_prompt(new_name, new_persona, new_max, new_style)
             self.full_system = build_full_system_prompt(self.system_prompt, self.user_profile)
             messagebox.showinfo("成功", "角色设定已保存并立即生效")
             win.destroy()
@@ -5125,7 +5218,10 @@ class DesktopPet:
             name_var.set(DEFAULT_PET_NAME)
             persona_area.delete("1.0", tk.END)
             persona_area.insert(tk.END, DEFAULT_PERSONA)
+            max_var.set(str(DEFAULT_MAX_CHARS))
             ban_var.set("")
+            style_area.delete("1.0", tk.END)
+            style_area.insert(tk.END, DEFAULT_STYLE_RULES)
 
         def cancel():
             win.destroy()
@@ -5152,6 +5248,7 @@ class DesktopPet:
         btn_save.pack(side=tk.RIGHT, padx=6)
 
         main_frame.grid_rowconfigure(3, weight=1)
+        main_frame.grid_rowconfigure(8, weight=1)
         main_frame.grid_columnconfigure(1, weight=1)
 
     # ---------- 用户档案设置 ----------
