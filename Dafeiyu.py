@@ -692,6 +692,12 @@ DEFAULT_MAX_CHARS = 70            # 回复字数上限（汉字），设置里�
 MIN_MAX_CHARS = 20                # 可设的最小值
 MAX_MAX_CHARS = 400               # 可设的最大值
 
+# 模型调用的输出预算（token）。max_tokens 只是天花板、按实际生成计费；
+# 给小了会 finish_reason=length，触发"加倍重试"白烧一次调用（重试天花板见 _chat_completion）
+DEFAULT_MAX_TOKENS = 8192         # 绝大多数调用的起始值
+EXTRACT_MAX_TOKENS = 16384        # 记忆提取（一次要吐几十条记忆，输出最长的一处）
+MAX_OUTPUT_TOKENS = 32768         # 截断后自动加倍的天花板
+
 # 说话方式 / 禁修辞：默认这份"反八股"规则；设置里可改，清空＝完全不注入这一段
 DEFAULT_STYLE_RULES = """像真人当面聊天，不是写文章：
 - 禁用书面连接词与套路词：首先、其次、然后、总之、综上、值得注意的是、不得不说、说到底、换句话说、某种意义上、这让我想到。
@@ -3008,7 +3014,7 @@ class DesktopPet:
         return base + "/chat/completions"
 
     def _chat_completion(self, base_url, api_key, model, messages,
-                         temperature=0.7, max_tokens=4096, timeout=20, _depth=0,
+                         temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=20, _depth=0,
                          tools=None, tool_choice=None):
         """通用 OpenAI 兼容 chat/completions 调用，兼容各提供方。
         - 兼容仅接受 max_completion_tokens 的接口（如 OpenAI o 系列）
@@ -3036,8 +3042,8 @@ class DesktopPet:
                 data = resp.json()
                 fr = data["choices"][0].get("finish_reason", "?")
                 log.debug(f"API finish_reason: {fr}")
-                if fr == "length" and _depth < 3 and max_tokens < 16384:
-                    new_tokens = min(max_tokens * 2, 16384)
+                if fr == "length" and _depth < 3 and max_tokens < MAX_OUTPUT_TOKENS:
+                    new_tokens = min(max_tokens * 2, MAX_OUTPUT_TOKENS)
                     log.warning("模型输出被截断(finish_reason=length, max_tokens=%s)，"
                                 "自动以 %s 重试", max_tokens, new_tokens)
                     return self._chat_completion(base_url, api_key, model, messages,
@@ -3048,7 +3054,7 @@ class DesktopPet:
                 pass
         return resp
 
-    def _call_text_model(self, messages, temperature=0.7, max_tokens=4096, timeout=20,
+    def _call_text_model(self, messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=20,
                          tools=None, tool_choice=None):
         """文本模型调用（对话、记忆、话题、翻译、纠错、读书等）"""
         return self._chat_completion(self.text_base_url, self.text_api_key, self.text_model,
@@ -3056,7 +3062,7 @@ class DesktopPet:
                                      max_tokens=max_tokens, timeout=timeout,
                                      tools=tools, tool_choice=tool_choice)
 
-    def _call_vision_model(self, messages, temperature=0.7, max_tokens=4096, timeout=30):
+    def _call_vision_model(self, messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=30):
         """视觉模型调用（陪看截图分析、内容识别）"""
         return self._chat_completion(self.vision_base_url, self.vision_api_key, self.vision_model,
                                      messages, temperature=temperature,
@@ -4344,7 +4350,7 @@ class DesktopPet:
                                "不要调用 play_random 或 play_song。）")
             messages = self.build_context_messages(system, user_msg,
                                                    extra_context=self._reading_context_digest())
-            resp = self._call_text_model(messages, temperature=0.7, max_tokens=4096, timeout=30,
+            resp = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=30,
                                          tools=tools)
             # 提供方不支持 function calling 时回退为普通对话
             if resp.status_code != 200 and tools is not None:
@@ -4352,7 +4358,7 @@ class DesktopPet:
                 tools = None
                 messages = self.build_context_messages(self._effective_system_prompt(), user_msg,
                                                        extra_context=self._reading_context_digest())
-                resp = self._call_text_model(messages, temperature=0.7, max_tokens=4096, timeout=30)
+                resp = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code == 200:
                 msg = resp.json()["choices"][0]["message"]
                 content = self._extract_message_content(msg)
@@ -4385,7 +4391,7 @@ class DesktopPet:
                     messages.append({"role": "assistant", "content": content, "tool_calls": calls})
                     for tid, res in tool_msgs:
                         messages.append({"role": "tool", "tool_call_id": tid, "content": res})
-                    resp2 = self._call_text_model(messages, temperature=0.7, max_tokens=4096,
+                    resp2 = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS,
                                                   timeout=30)
                     if resp2.status_code != 200:
                         break
@@ -4658,7 +4664,7 @@ class DesktopPet:
             return ""
         prompt = f"请将以下中文翻译成自然的口语日语，只输出日语译文，不要加任何额外说明：\n{chinese_text}"
         try:
-            resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048, timeout=15)
+            resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=15)
             if resp.status_code == 200:
                 result = resp.json()["choices"][0]["message"]["content"].strip()
                 log.info(f"日语翻译成功: {chinese_text[:20]}... → {result[:20]}...")
@@ -4962,7 +4968,7 @@ class DesktopPet:
                 self.api_busy = True
             try:
                 messages = self.build_context_messages(self._effective_system_prompt(), prompt)
-                resp = self._call_text_model(messages, temperature=0.7, max_tokens=2048, timeout=20)
+                resp = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
                 if resp.status_code == 200:
                     reply = resp.json()["choices"][0]["message"]["content"]
                     emotion, text = self.parse_emotion_from_reply(reply)
@@ -5314,7 +5320,7 @@ class DesktopPet:
                       f"- 如果不包含任何与“我”的关系描述：只输出 null。\n"
                       f"不要输出其他内容。")
             resp = self._call_text_model([{"role": "user", "content": prompt}],
-                                         temperature=0.3, max_tokens=300, timeout=60)
+                                         temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=60)
             if resp.status_code != 200:
                 log.warning("背景故事关系总结API失败: %s", resp.status_code)
                 return
@@ -6195,7 +6201,7 @@ class DesktopPet:
             # Thinking 模型会消耗大量 token 在思考上：给足输出预算（16384），
             # 超时放宽到 180s，避免 JSON 只生成一半/思考吃光预算导致 content 为空
             resp = self._call_text_model([{"role": "user", "content": prompt}],
-                                         temperature=0.3, max_tokens=16384, timeout=180)
+                                         temperature=0.3, max_tokens=EXTRACT_MAX_TOKENS, timeout=180)
             if resp.status_code != 200:
                 log.error(f"记忆提取API失败: {resp.status_code}")
                 self._extraction_fail_count += 1
@@ -6615,7 +6621,7 @@ class DesktopPet:
 """
         try:
             resp = self._call_text_model([{"role": "user", "content": prompt}],
-                                         temperature=0.1, max_tokens=2048, timeout=30)
+                                         temperature=0.1, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code != 200:
                 log.error(f"记忆合并判断API失败: {resp.status_code}")
                 return None
@@ -6843,7 +6849,7 @@ class DesktopPet:
                 with self.api_lock:
                     self.api_busy = True
                 try:
-                    resp = self._call_text_model([{"role":"user","content":prompt}], temperature=temp, max_tokens=2048, timeout=12)
+                    resp = self._call_text_model([{"role":"user","content":prompt}], temperature=temp, max_tokens=DEFAULT_MAX_TOKENS, timeout=12)
                     if resp.status_code == 200:
                         reply = resp.json()["choices"][0]["message"]["content"].strip()
                         parts = reply.split("|")
@@ -7114,7 +7120,7 @@ class DesktopPet:
             resp = self._call_text_model([{
                 "role": "user",
                 "content": f"请将下面的事件描述严格压缩到{max_len}字以内（含标点），保留关键信息（观看内容、观看状态、关键阶段、氛围），直接输出压缩结果，不要解释，不要超过{max_len}字。\n事件：\n{text}"
-            }], temperature=0.3, max_tokens=4096, timeout=20)
+            }], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
             if resp.status_code == 200:
                 compressed = resp.json()["choices"][0]["message"]["content"].strip()
                 if compressed and len(compressed) < len(text):
@@ -7138,7 +7144,7 @@ class DesktopPet:
 直接输出事件描述，不要解释。"""
             summary = None
             try:
-                resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=4096, timeout=20)
+                resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
                 if resp.status_code == 200:
                     summary = resp.json()["choices"][0]["message"]["content"].strip()
             except Exception as e:
@@ -7158,7 +7164,7 @@ class DesktopPet:
 新片段总结：{summary}
 直接输出合并后的事件描述，不要解释。"""
                         try:
-                            resp = self._call_text_model([{"role": "user", "content": merge_prompt}], temperature=0.3, max_tokens=4096, timeout=20)
+                            resp = self._call_text_model([{"role": "user", "content": merge_prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
                             if resp.status_code == 200:
                                 merged_text = resp.json()["choices"][0]["message"]["content"].strip()
                                 if merged_text:
@@ -7206,7 +7212,7 @@ class DesktopPet:
                 resp = self._call_text_model([{
                     "role": "user",
                     "content": f"请将下面这段陪看事件记录整理成最终版本：保留观看内容、观看状态、关键阶段和氛围，确保总字数不超过{WATCH_EVENT_MAX_LEN}字（含标点），直接输出整理结果，不要解释。\n事件：\n{content}"
-                }], temperature=0.3, max_tokens=4096, timeout=20)
+                }], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
                 if resp.status_code == 200:
                     final_text = resp.json()["choices"][0]["message"]["content"].strip()
                     if final_text:
@@ -7318,7 +7324,7 @@ class DesktopPet:
 
 OCR文字：
 {ocr_text[:500]}"""
-            resp = self._call_text_model([{"role": "user", "content": prompt1}], temperature=0.3, max_tokens=512, timeout=15)
+            resp = self._call_text_model([{"role": "user", "content": prompt1}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=15)
             if resp.status_code == 200:
                 result = resp.json()["choices"][0]["message"]["content"].strip()
                 if result and result != "未知" and len(result) >= 2:
@@ -7330,7 +7336,7 @@ OCR文字：
 
 OCR文字：
 {ocr_text[:500]}"""
-            resp2 = self._call_text_model([{"role": "user", "content": prompt2}], temperature=0.3, max_tokens=512, timeout=15)
+            resp2 = self._call_text_model([{"role": "user", "content": prompt2}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=15)
             if resp2.status_code == 200:
                 result2 = resp2.json()["choices"][0]["message"]["content"].strip()
                 if result2 and len(result2) >= 2:
@@ -7391,8 +7397,8 @@ OCR文字：
         force_line = "这一轮一定要说一句。" if force else ""
         watch_instructions = f"""你在陪"{user_name}"一起看屏幕——可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件。
 你是{self.pet_name}，用你自己的语气说话，不用把自己调成某个样子。
-看到什么就说你注意到的那个点，或者它让你想到的那句话——像坐在旁边的人顺口出声，不是写观后感。
-要说的就一句，别分两段；画面本身不用复述，那是 content 的事。
+就当自己坐在旁边一块儿看着：画面里正在发生什么、你什么感觉，顺口说出来就行，有情绪就带上，不用写观后感，也别去猜他在想什么。
+要说的就一句，别分两段。
 多数时候是句感觉或感慨；偶尔顺着话头问他一句就行，别每句都问。
 画面里是直播平台、弹幕或别人的操作 → 他在看；是他自己在操作 → 他在玩。记忆只能当闲聊的由头，不许盖过你现在看到的东西。
 如果画面正好勾起了之前聊过的事，就自然提一句；没有就不用硬找。
@@ -7409,7 +7415,7 @@ OCR文字：
                                                extra_context=said_block,
                                                skip_sources={"watch"} if monologue else None)
         try:
-            resp = self._call_vision_model(messages, temperature=1.1, max_tokens=4096, timeout=30)
+            resp = self._call_vision_model(messages, temperature=1.1, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code != 200:
                 log.error(f"视觉模型 API 返回非200: {resp.status_code} {resp.text[:200]}")
                 return None
@@ -8436,7 +8442,7 @@ class ReadingCompanion:
         try:
             messages = self.pet.build_context_messages(self.pet.full_system, reading_prompt, context_type="reading",
                                                        memory_query=incremental)
-            resp = self.pet._call_text_model(messages, temperature=0.95, max_tokens=2048, timeout=20)
+            resp = self.pet._call_text_model(messages, temperature=0.95, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
             if resp.status_code == 200:
                 raw_reply = resp.json()["choices"][0]["message"]["content"]
                 content_text = ""
