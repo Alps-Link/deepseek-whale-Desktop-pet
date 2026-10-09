@@ -487,21 +487,69 @@ def save_tts_speaker_id(v):
 TTS_CONFIG_FILE = os.path.join(CONFIG_DIR, "tts_config.json")
 TOPIC_CONFIG_FILE = os.path.join(CONFIG_DIR, "topic_config.json")
 
+# ------------------------------- TTS 音色与语言 ---------------------------------
+# 语言：zh=中文（不翻译）、en=英文、ja=日语。选了非中文语言时，播前把要说的话翻译成该语言再送 TTS；
+# 气泡、聊天记录、记忆始终是中文原文，只有"念出来"的是译文；翻译失败则退回中文音色念原文。
+TTS_LANG_NAMES = {"zh": "中文", "en": "英文", "ja": "日语"}
+EDGE_VOICE_TABLE = {                     # Edge 音色（按语言分组，设置窗里按语言过滤）
+    "zh": [("晓晓", "zh-CN-XiaoxiaoNeural"), ("晓伊", "zh-CN-XiaoyiNeural")],
+    "en": [("Emily", "en-IE-EmilyNeural"), ("Ana", "en-US-AnaNeural")],
+}
+DEFAULT_EDGE_VOICE = "zh-CN-XiaoyiNeural"          # 兜底音色（翻译失败时也用回它）
+EDGE_VOICE_DEFAULT = {"zh": "zh-CN-XiaoyiNeural",   # 每个语言的默认音色（中文默认仍是晓伊，保持老观感）
+                      "en": "en-IE-EmilyNeural"}
+TTS_PREVIEW_TEXT = {"zh": "今天天气不错，我们听首歌吧。",
+                    "en": "Hello, this is a quick test of my voice.",
+                    "ja": "こんにちは、これは声のテストです。"}
+
+
+def edge_voice_valid(lang, voice):
+    """音色是否属于该语言分组"""
+    return any(v == voice for _, v in EDGE_VOICE_TABLE.get(lang, []))
+
+
 def load_tts_config():
-    """加载 TTS 状态（开关/模式/日语翻译），避免每次启动重新设置"""
+    """加载 TTS 状态（开关/模式/语言/音色），避免每次启动重新设置"""
     data = _get_section("tts")
     mode = data.get("mode", "volc")
     if mode not in ("volc", "edge"):
         mode = "volc"
+    volc_lang = str(data.get("volc_lang", "") or "").lower()
+    if volc_lang not in ("zh", "en", "ja"):
+        # 老配置没有 volc_lang：用旧的日语开关迁移（true = 日语 / false = 中文）
+        volc_lang = "ja" if data.get("japanese") else "zh"
+    edge_lang = str(data.get("edge_lang", "") or "").lower()
+    if edge_lang not in EDGE_VOICE_TABLE:
+        edge_lang = "zh"
+    edge_voice = str(data.get("edge_voice", "") or "")
+    if not edge_voice_valid(edge_lang, edge_voice):
+        edge_voice = EDGE_VOICE_DEFAULT.get(edge_lang) or EDGE_VOICE_TABLE[edge_lang][0][1]
     return {
         "enabled": bool(data.get("enabled", False)),
         "mode": mode,
-        "japanese": bool(data.get("japanese", True)),
+        "japanese": volc_lang == "ja",     # 兼容旧键
+        "volc_lang": volc_lang,
+        "edge_lang": edge_lang,
+        "edge_voice": edge_voice,
     }
 
-def save_tts_config(enabled, mode, japanese):
-    sec = _get_section("tts")     # 保留同节的 api_key / speaker_id
-    sec.update({"enabled": enabled, "mode": mode, "japanese": japanese})
+def save_tts_config(enabled=None, mode=None, japanese=None,
+                    volc_lang=None, edge_lang=None, edge_voice=None):
+    """只写传入的字段，其余保持原值（同节的 api_key / speaker_id 一律保留）"""
+    sec = _get_section("tts")
+    if enabled is not None:
+        sec["enabled"] = bool(enabled)
+    if mode is not None:
+        sec["mode"] = mode
+    if volc_lang is not None:
+        sec["volc_lang"] = volc_lang
+    elif japanese is not None:                        # 兼容老调用
+        sec["volc_lang"] = "ja" if japanese else "zh"
+    if edge_lang is not None:
+        sec["edge_lang"] = edge_lang
+    if edge_voice is not None:
+        sec["edge_voice"] = edge_voice
+    sec["japanese"] = (sec.get("volc_lang") == "ja")  # 旧键跟着走，别的版本读它也不会错
     _update_section("tts", sec)
 
 def load_topic_config():
@@ -560,10 +608,15 @@ def load_ui_config():
     """界面开关状态（输入框显示/隐藏），跨重启沿用。
     注：语音识别开关不做保存——启动跟随开麦那条路用户不要。"""
     data = _get_section("ui")
-    return {"input_visible": bool(data.get("input_visible", True))}
+    return {"input_visible": bool(data.get("input_visible", True)),
+            "hide_reply_bubble": bool(data.get("hide_reply_bubble", False))}
 
-def save_ui_config(input_visible):
-    _update_section("ui", {"input_visible": bool(input_visible)})
+def save_ui_config(input_visible, hide_reply_bubble=None):
+    sec = _get_section("ui")     # 保留同节其它键
+    sec["input_visible"] = bool(input_visible)
+    if hide_reply_bubble is not None:
+        sec["hide_reply_bubble"] = bool(hide_reply_bubble)
+    _update_section("ui", sec)
 
 def load_llm_config():
     """加载统一 LLM 配置（config.json 的 llm 节；老的 ds/volc 文件在首次迁移时已并进来，
@@ -650,7 +703,7 @@ VISION_PRESETS = [
 ]
 
 VOLC_TTS_URL = "https://openspeech.bytedance.com/api/v1/tts"
-ENABLE_JAPANESE_TRANSLATION = True
+VOLC_TTS_UID = "dafeiyu_pet"      # 火山 TTS 的 user.uid（每只一个）
 
 try:
     import pygame
@@ -663,7 +716,7 @@ except Exception as e:
 
 
 # ------------------------------- Edge TTS 配置 ---------------------------------
-EDGE_TTS_VOICE = "zh-CN-XiaoyiNeural"
+# 音色不再写死：由 config.json 的 tts.edge_voice 决定（默认见 DEFAULT_EDGE_VOICE）
 try:
     import edge_tts
     import asyncio
@@ -2793,9 +2846,10 @@ class DesktopPet:
         self.vision_model = self.llm_config["vision"]["model"]
 
         tts_cfg = load_tts_config()
-        global ENABLE_JAPANESE_TRANSLATION
-        ENABLE_JAPANESE_TRANSLATION = tts_cfg["japanese"]
         self.tts_enabled = tts_cfg["enabled"]
+        self.tts_volc_lang = tts_cfg["volc_lang"]      # 火山区语言：zh/en/ja
+        self.tts_edge_lang = tts_cfg["edge_lang"]      # Edge 区语言：zh/en
+        self.tts_edge_voice = tts_cfg["edge_voice"]    # Edge 音色（ShortName）
         self.tts_api_key = load_tts_api_key() or os.environ.get("VOLC_TTS_API_KEY", "")
         self.tts_speaker_id = load_tts_speaker_id() or os.environ.get("VOLC_TTS_SPEAKER_ID", "")
         self.tts_mode = tts_cfg["mode"]  # "volc" 或 "edge"
@@ -2838,6 +2892,8 @@ class DesktopPet:
         self.manual_sleep = False
         self.sleep_start_time = None
         self.input_visible = load_ui_config()["input_visible"]   # 上次把输入框收起来就保持收起
+        # 隐藏回复气泡：她的回复不弹文字，但状态/提示气泡（如「我在听你说话」）照常显示
+        self.hide_reply_bubble = load_ui_config()["hide_reply_bubble"]
         self.voice_cfg = load_voice_config()                     # 语音识别设置（免唤醒窗口）
         # 用户上次的选择（睡着自动关麦、退出清理都不改它）：开机恢复与睡醒恢复都以它为准
         self._voice_wanted = bool(self.voice_cfg.get("enabled", False))
@@ -3015,16 +3071,21 @@ class DesktopPet:
 
     def _chat_completion(self, base_url, api_key, model, messages,
                          temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=20, _depth=0,
-                         tools=None, tool_choice=None):
+                         tools=None, tool_choice=None, thinking=None):
         """通用 OpenAI 兼容 chat/completions 调用，兼容各提供方。
         - 兼容仅接受 max_completion_tokens 的接口（如 OpenAI o 系列）
         - 输出因 max_tokens 截断（finish_reason=length）时自动加倍预算重试
         - tools/tool_choice 可选：function calling（如 control_music 本地音乐）
+        - thinking：None = 用模型默认（DeepSeek 默认思考开）；False = 关掉思考
+          （`{"thinking": {"type": "disabled"}}`）。翻译这类"短输出、不需要推理"的任务关掉它，
+          实测能把 1.3~7.7 秒压到 0.5~0.9 秒（思考 token 也是白花钱）。注意思考模式下 temperature 无效。
         """
         url = self._chat_url(base_url)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {"model": model, "messages": messages,
                    "temperature": temperature, "max_tokens": max_tokens}
+        if thinking is not None:
+            payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
         if tools is not None:
             payload["tools"] = tools
         if tool_choice is not None:
@@ -3049,18 +3110,19 @@ class DesktopPet:
                     return self._chat_completion(base_url, api_key, model, messages,
                                                  temperature=temperature, max_tokens=new_tokens,
                                                  timeout=timeout, _depth=_depth + 1,
-                                                 tools=tools, tool_choice=tool_choice)
+                                                 tools=tools, tool_choice=tool_choice,
+                                                 thinking=thinking)
             except Exception:
                 pass
         return resp
 
     def _call_text_model(self, messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=20,
-                         tools=None, tool_choice=None):
-        """文本模型调用（对话、记忆、话题、翻译、纠错、读书等）"""
+                         tools=None, tool_choice=None, thinking=None):
+        """文本模型调用（对话、记忆、话题、翻译、纠错、读书等）；thinking=False 关掉思考"""
         return self._chat_completion(self.text_base_url, self.text_api_key, self.text_model,
                                      messages, temperature=temperature,
                                      max_tokens=max_tokens, timeout=timeout,
-                                     tools=tools, tool_choice=tool_choice)
+                                     tools=tools, tool_choice=tool_choice, thinking=thinking)
 
     def _call_vision_model(self, messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS, timeout=30):
         """视觉模型调用（陪看截图分析、内容识别）"""
@@ -3379,7 +3441,7 @@ class DesktopPet:
         _i, title, path = hit
         self.last_interaction_time = time.time()
         self._queue_playlist([path], defer=False)
-        self.show_bubble_text(f"(happy) 在放《{title}》了", "happy")
+        self.show_bubble_text(f"(happy) 在放《{title}》了", "happy", status=True)
 
     def _play_index(self, index):
         """按最近一次候选的编号点歌（语音“放第X首”路径）"""
@@ -3654,6 +3716,15 @@ class DesktopPet:
             self.apply_window_width()
             self._save_zoom()
 
+    def set_hide_reply_bubble(self, flag):
+        """开关「隐藏回复气泡」，改完立即落盘"""
+        self.hide_reply_bubble = bool(flag)
+        try:
+            save_ui_config(self.input_visible, self.hide_reply_bubble)
+        except Exception as e:
+            log.warning("保存隐藏气泡设置失败: %s", e)
+        log.info("回复气泡已%s", "隐藏" if self.hide_reply_bubble else "显示")
+
     def open_zoom_settings(self):
         win, main_frame = self._make_card_window("缩放设置", 480, 456)
         s = self._dpi_scale
@@ -3664,6 +3735,7 @@ class DesktopPet:
         overall_var = tk.DoubleVar(value=self.zoom_char)
         width_var = tk.IntVar(value=self.window_width)
         sync_var = tk.BooleanVar(value=False)
+        hide_bubble_var = tk.BooleanVar(value=bool(self.hide_reply_bubble))
 
         # 滑块当前值标签（ttk.Scale 没有 showvalue，需要手动显示）
         value_labels = {}
@@ -3781,6 +3853,13 @@ class DesktopPet:
                                          bg=DIALOG_BG, width=5)
         value_labels["width"].grid(row=row, column=2, sticky="w", padx=(8, 0))
         row += 1
+        ttk.Separator(main_frame, orient='horizontal').grid(row=row, column=0, columnspan=3, sticky='ew', pady=10)
+        row += 1
+        ttk.Checkbutton(main_frame, text="隐藏回复气泡（只留提示气泡，如「我在听你说话」）",
+                        variable=hide_bubble_var,
+                        command=lambda: self.set_hide_reply_bubble(hide_bubble_var.get())
+                        ).grid(row=row, column=0, columnspan=3, sticky='w', pady=5)
+        row += 1
         RoundedButton(main_frame, text="恢复默认", command=reset_defaults, variant="subtle",
                       width=int(120 * s), height=int(34 * s), radius=int(6 * s),
                       font=(self.font_family, 10)).grid(row=row, column=0, columnspan=3, pady=5)
@@ -3870,6 +3949,9 @@ class DesktopPet:
         self.reading_menu_index = self.mode_menu.index("end")
         self.mode_menu.add_command(label="🎤 语音识别 (开始)", command=self.toggle_voice)
         self.voice_menu_index = self.mode_menu.index("end")
+        tts_speak_label = "🔊 语音朗读 (停止)" if self.tts_enabled else "🔊 语音朗读 (开始)"
+        self.mode_menu.add_command(label=tts_speak_label, command=self.toggle_tts_speak)
+        self.tts_speak_menu_index = self.mode_menu.index("end")
         self.menu.add_cascade(label="🎮 模式", menu=self.mode_menu)
         self.menu.add_separator()
 
@@ -3893,29 +3975,12 @@ class DesktopPet:
         settings_menu.add_cascade(label="API 密钥", menu=api_menu)
 
         settings_menu.add_separator()
-
-        # ── TTS 设置子菜单（移入设置）──
-        tts_menu = ModernMenu(self.root, pet=self)
-        tts_voice_label = "🔊 关闭语音" if self.tts_enabled else "🔊 开启语音"
-        tts_menu.add_command(label=tts_voice_label, command=self.toggle_tts)
-        self.tts_voice_menu_index = tts_menu.index("end")
-        tts_menu.add_command(label=f"🔄 切换TTS ({TTS_MODE_NAMES.get(self.tts_mode, 'Edge')})", command=self.toggle_tts_mode)
-        self.tts_mode_menu_index = tts_menu.index("end")
-        jp_status = "开" if ENABLE_JAPANESE_TRANSLATION else "关"
-        tts_menu.add_command(label=f"🌐 日语翻译 ({jp_status})", command=self.toggle_japanese_translation)
-        self.tts_japanese_menu_index = tts_menu.index("end")
-        if self.tts_mode == "edge":
-            # 日语翻译只对火山声音复刻有意义（Edge 不需要）
-            tts_menu.entryconfigure(self.tts_japanese_menu_index, state="disabled")
-        self.tts_submenu = tts_menu
-        settings_menu.add_cascade(label="🎵 TTS 设置", menu=tts_menu)
-
-        settings_menu.add_separator()
         settings_menu.add_command(label="缩放设置...", command=self.open_zoom_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="模式相关设置...", command=self.open_mode_settings)
         settings_menu.add_command(label="🎵 音乐库设置...", command=self.open_music_library_settings)
         settings_menu.add_command(label="🎤 语音识别设置...", command=self.open_voice_settings)
+        settings_menu.add_command(label="🎧 TTS 音色与语言...", command=self.open_tts_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🎩 装扮", command=self._open_costume_window)
         settings_menu.add_command(label="关于", command=self.show_about)
@@ -4300,7 +4365,7 @@ class DesktopPet:
     def get_ai_response(self, user_msg):
         # 检查 API Key
         if not self.text_api_key:
-            self._ui(lambda: self.show_bubble_text("(worried) 请先设置文本模型 API Key...", "worried"))
+            self._ui(lambda: self.show_bubble_text("(worried) 请先设置文本模型 API Key...", "worried"), status=True)
             return "(worried) 请先设置文本模型 API Key..."
         # 语音直连：歌曲选项卡片弹出后说“第2首/第二首/2号”直接命中编号（不经模型，秒响应）
         pick_idx = _parse_pick_num(user_msg)
@@ -4464,7 +4529,10 @@ class DesktopPet:
         """是否正在等模型回复（45 秒兜底过期：万一回复路径出错，标记不能永久不亮）"""
         return bool(self._thinking_since) and (time.time() - self._thinking_since) < 45
 
-    def show_bubble_text(self, text, emotion="normal", refresh_voice=False):
+    def show_bubble_text(self, text, emotion="normal", refresh_voice=False, status=False):
+        """弹气泡。status=True 表示状态/提示类（开关提示、错误、模式提示、事件卡片）——
+        它们不受「隐藏回复气泡」影响；不带 status 的就是她的回复，开了隐藏就不显示
+        （表情、嘴型、免唤醒窗口照常）。"""
         if text.startswith("(") or text.startswith("（"):
             em = re.match(r'[（(]\s*([A-Za-z]+)\s*[）)]\s*(.*)', text, re.DOTALL)
             if em and em.group(1).lower() in EMOTION_WORDS:
@@ -4474,13 +4542,18 @@ class DesktopPet:
         if refresh_voice:
             self._thinking_since = 0.0      # 真的开始输出了，不再算"在想"
         self.set_emotion(emotion)
-        self.bubble_window.show_text(text, refresh_voice=refresh_voice)
         # 说话时张嘴，2秒后闭合
         if self.spine_enabled and self.spine:
             if hasattr(self, '_mouth_job') and self._mouth_job:
                 self.root.after_cancel(self._mouth_job)
             self.spine.set_mouth(0.3)
             self._mouth_job = self.root.after(2000, lambda: self.spine.set_mouth(0) if self.spine else None)
+        if self.hide_reply_bubble and not status:
+            # 隐藏回复气泡：不碰气泡窗，但"说完了"这件事还得照常通知（免唤醒窗口靠它开）
+            if refresh_voice:
+                self._on_output_finished(True)
+            return
+        self.bubble_window.show_text(text, refresh_voice=refresh_voice)
 
     def set_text_model_settings(self):
         """文本模型设置：API 地址 + 密钥 + 模型名（OpenAI 兼容）"""
@@ -4659,20 +4732,34 @@ class DesktopPet:
 
 
     # ---------- 火山引擎声音复刻 TTS 核心方法 ----------
-    def _translate_to_japanese(self, chinese_text):
-        if not chinese_text.strip():
+    def _translate_for_tts(self, chinese_text, lang):
+        """把回复翻译成 TTS 要念的语言（en/ja）；失败返回空串（调用方退回中文原文）"""
+        if not chinese_text.strip() or lang not in ("en", "ja"):
             return ""
-        prompt = f"请将以下中文翻译成自然的口语日语，只输出日语译文，不要加任何额外说明：\n{chinese_text}"
+        # 语气词的固定译法：中文「哼」要的是轻声 Hmm，不是带火气的 Hmph
+        target = {"ja": ("自然的口语日语", "日语", ""),
+                  "en": ("自然的口语英语", "英语", "中文的语气词「哼」一律译成 Hmm，不要用 Hmph；")}[lang]
+        prompt = (f"请将以下中文翻译成{target[0]}，只输出{target[1]}译文，不要加任何额外说明。"
+                  f"{target[2]}\n{chinese_text}")
         try:
-            resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=15)
+            # 翻译是"短输出、不需要推理"的任务：关掉思考模式，省掉 1~7 秒的思考时间
+            resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3,
+                                         max_tokens=DEFAULT_MAX_TOKENS, timeout=15, thinking=False)
             if resp.status_code == 200:
                 result = resp.json()["choices"][0]["message"]["content"].strip()
-                log.info(f"日语翻译成功: {chinese_text[:20]}... → {result[:20]}...")
-                return result
+                if result:
+                    if lang == "en":
+                        # 兜底：模型偶尔还是写 Hmph，这里统一成 Hmm（保大小写）
+                        result = re.sub(r'\bHmph\b', 'Hmm', result)
+                        result = re.sub(r'\bhmph\b', 'hmm', result)
+                        result = re.sub(r'\bHMPH\b', 'HMM', result)
+                    log.info("TTS 翻译(%s)成功: %s... → %s...", target[1], chinese_text[:20], result[:20])
+                    return result
+                log.warning("TTS 翻译(%s)返回空", target[1])
             else:
-                log.warning(f"日语翻译 API 返回非200: {resp.status_code} {resp.text[:100]}")
+                log.warning("TTS 翻译(%s) API 返回非200: %s %s", target[1], resp.status_code, resp.text[:100])
         except Exception as e:
-            log.warning(f"日语翻译异常: {e}")
+            log.warning("TTS 翻译(%s)异常: %s", target[1], e)
         return ""
 
     def _tts_play(self, chinese_text, refresh_voice=False):
@@ -4691,14 +4778,17 @@ class DesktopPet:
         clean = re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip()
         if not clean:
             return
-        if ENABLE_JAPANESE_TRANSLATION:
-            tts_text = self._translate_to_japanese(clean)
-            if not tts_text:
-                tts_text = clean
-            log.info(f"TTS 日语: {tts_text}")
-        else:
-            tts_text = clean
-            log.info(f"TTS 声音复刻: {tts_text}")
+        # 语言：中文直接念；英文/日语先翻译再念（翻译失败退回中文原文，绝不静默无声）
+        lang = self.tts_volc_lang
+        tts_text = clean
+        if lang in ("en", "ja"):
+            translated = self._translate_for_tts(clean, lang)
+            if translated:
+                tts_text = translated
+            else:
+                log.warning("TTS 翻译失败（%s），改用中文原文朗读",
+                            TTS_LANG_NAMES.get(lang, lang))
+        log.info("TTS 声音复刻(%s): %s", TTS_LANG_NAMES.get(lang, lang), tts_text)
 
         def _play():
             # 串行化 TTS 播放：避免多线程同时写同名文件 / 共用 pygame.mixer
@@ -4712,7 +4802,7 @@ class DesktopPet:
                         "cluster": "volcano_icl"
                     },
                     "user": {
-                        "uid": "dafeiyu_pet"
+                        "uid": VOLC_TTS_UID
                     },
                     "audio": {
                         "voice_type": speaker_id,
@@ -4795,12 +4885,18 @@ class DesktopPet:
         clean = re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip()
         if not clean:
             return
-        if ENABLE_JAPANESE_TRANSLATION:
-            tts_text = self._translate_to_japanese(clean)
-            if not tts_text:
-                tts_text = clean
-        else:
-            tts_text = clean
+        # 语言：中文直接念；英文先翻译再念；翻译失败退回中文音色念原文（别用英文音色硬读中文）
+        lang = self.tts_edge_lang
+        voice = self.tts_edge_voice
+        tts_text = clean
+        if lang == "en":
+            translated = self._translate_for_tts(clean, "en")
+            if translated:
+                tts_text = translated
+            else:
+                voice = DEFAULT_EDGE_VOICE
+                log.warning("TTS 翻译失败（英文），改用中文音色朗读原文")
+        log.info("Edge TTS(%s/%s): %s", TTS_LANG_NAMES.get(lang, lang), voice, tts_text)
 
         def _play_edge():
             if not self._tts_lock.acquire(timeout=1):
@@ -4808,7 +4904,7 @@ class DesktopPet:
                 return
             temp_file = None
             try:
-                comm = edge_tts.Communicate(tts_text, EDGE_TTS_VOICE)
+                comm = edge_tts.Communicate(tts_text, voice)
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as _tf:
                     temp_file = _tf.name
                 asyncio.run(comm.save(temp_file))
@@ -4840,80 +4936,12 @@ class DesktopPet:
 
         threading.Thread(target=_play_edge, daemon=True).start()
 
-    def toggle_tts_mode(self):
-        """切换 TTS 模式：声音复刻 → Edge → 声音复刻"""
-        global ENABLE_JAPANESE_TRANSLATION
-        order = ["volc", "edge"]
-        idx = order.index(self.tts_mode) if self.tts_mode in order else order.index("edge")
-        nxt = order[(idx + 1) % len(order)]
-        if nxt == "volc":
-            # 切到声音复刻：先校验配置，API Key / Speaker ID 缺失则弹窗提醒且不切换
-            missing = [k for k, v in (("API Key", self.tts_api_key), ("Speaker ID", self.tts_speaker_id)) if not v]
-            if missing:
-                detail = "、".join(missing)
-                self.root.after(0, lambda d=detail: messagebox.showwarning(
-                    "未配置声音复刻",
-                    f"当前未配置 {d}，无法使用声音复刻。\n请先在 设置 → API 密钥 → 声音复刻 API / Speaker ID 中完成配置"))
-                return
-        self.tts_mode = nxt
-        self.show_bubble_text(f"(normal) TTS 已切换为 {TTS_MODE_NAMES.get(nxt, nxt)}", "normal")
-        if nxt == "volc":
-            try:
-                self.tts_submenu.entryconfigure(self.tts_japanese_menu_index, state="normal")
-            except Exception: pass
-        else:
-            # Edge 不需要日语翻译
-            ENABLE_JAPANESE_TRANSLATION = False
-            try:
-                self.tts_submenu.entryconfigure(self.tts_japanese_menu_index,
-                                                label="🌐 日语翻译 (关)", state="disabled")
-            except Exception: pass
-        try:
-            self.tts_submenu.entryconfigure(self.tts_mode_menu_index,
-                                            label=f"🔄 切换TTS ({TTS_MODE_NAMES.get(nxt, nxt)})")
-        except Exception:
-            pass
-        save_tts_config(self.tts_enabled, self.tts_mode, ENABLE_JAPANESE_TRANSLATION)
-
-    def toggle_tts(self):
-        if not self.tts_enabled:
-            if self.tts_mode == "volc":
-                if not self.tts_api_key:
-                    self.root.after(0, lambda: messagebox.showwarning("未配置 API Key", "请先在 设置 → API 密钥 → 声音复刻 API Key 中配置"))
-                    return
-                if not self.tts_speaker_id:
-                    self.root.after(0, lambda: messagebox.showwarning("未配置 Speaker ID", "请先在 设置 → API 密钥 → 声音复刻 Speaker ID 中配置"))
-                    return
-        self.tts_enabled = not self.tts_enabled
-        status = "开启" if self.tts_enabled else "关闭"
-        self.show_bubble_text(f"(normal) 语音已{status}", "normal")
-        new_label = "🔊 关闭语音" if self.tts_enabled else "🔊 开启语音"
-        try:
-            self.tts_submenu.entryconfigure(self.tts_voice_menu_index, label=new_label)
-        except Exception:
-            pass
-        save_tts_config(self.tts_enabled, self.tts_mode, ENABLE_JAPANESE_TRANSLATION)
-
-    def toggle_japanese_translation(self):
-        global ENABLE_JAPANESE_TRANSLATION
-        ENABLE_JAPANESE_TRANSLATION = not ENABLE_JAPANESE_TRANSLATION
-        status = "开" if ENABLE_JAPANESE_TRANSLATION else "关"
-        msg = "日语翻译已开启" if ENABLE_JAPANESE_TRANSLATION else "日语翻译已关闭"
-        self.show_bubble_text(f"(normal) {msg}", "normal")
-        new_label = f"🌐 日语翻译 ({status})"
-        try:
-            self.tts_submenu.entryconfigure(self.tts_japanese_menu_index, label=new_label)
-        except Exception:
-            pass
-        save_tts_config(self.tts_enabled, self.tts_mode, ENABLE_JAPANESE_TRANSLATION)
-
-
     # ---------- 事件气泡 ----------
     def show_event_bubble(self, context, opt1, opt2):
         self.clear_event_buttons()
         self.current_event_context = context
         self.current_event_options = [opt1, opt2]
-        self.show_bubble_text(f"(normal) {context}")
+        self.show_bubble_text(f"(normal) {context}", status=True)
         threading.Thread(target=self._tts_play, args=(context,), daemon=True).start()
         self.root.after(500, self.create_event_buttons, opt1, opt2)
 
@@ -4996,7 +5024,7 @@ class DesktopPet:
         self.consume_energy()
         with self.api_lock:
             if self.api_busy:
-                self.show_bubble_text("(worried) 等一下嘛，我现在有点忙...", "worried")
+                self.show_bubble_text("(worried) 等一下嘛，我现在有点忙...", "worried", status=True)
                 return
         selected = self.current_event_options[idx]
         context = self.current_event_context
@@ -5008,7 +5036,7 @@ class DesktopPet:
         """手动输入的话题回应"""
         with self.api_lock:
             if self.api_busy:
-                self.show_bubble_text("(worried) 等一下嘛，我现在有点忙...", "worried")
+                self.show_bubble_text("(worried) 等一下嘛，我现在有点忙...", "worried", status=True)
                 return
         context = self.current_event_context
         self.clear_event_buttons()
@@ -5362,7 +5390,7 @@ class DesktopPet:
         self.sleep_start_time = time.time()
         self.bubble_window.fade_out()
         self.set_emotion("sleep")
-        self.show_bubble_text("(sleep) Zzz...", "sleep")
+        self.show_bubble_text("(sleep) Zzz...", "sleep", status=True)
         self.input_entry.config(state=tk.DISABLED)
         if not manual:
             threading.Thread(target=self._sleep_monitor, daemon=True).start()
@@ -5453,14 +5481,14 @@ class DesktopPet:
         else:
             self.energy = max(0, self.energy - ENERGY_DECAY_PER_MINUTE * elapsed / 60.0)
             if self.energy <= 0 and not self.manual_sleep:
-                self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep")
+                self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep", status=True)
                 self.start_sleep_mode(manual=True)
         self._energy_job = self.root.after(5000, self._energy_tick)
 
     def consume_energy(self, amount=ENERGY_ACTIVE_COST):
         self.energy = max(0, self.energy - amount)
         if self.energy <= 0 and not self.sleep_mode and not self.manual_sleep:
-            self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep")
+            self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep", status=True)
             self.start_sleep_mode(manual=True)
 
     def get_energy_mood(self):
@@ -6760,14 +6788,14 @@ class DesktopPet:
     # ---------- 日常话题生成器 ----------
     def generate_topic_manual(self):
         if self.sleep_mode:
-            self.show_bubble_text("(sleep) Zzz... 等我睡醒再说吧...", "sleep")
+            self.show_bubble_text("(sleep) Zzz... 等我睡醒再说吧...", "sleep", status=True)
             return
         if self.api_busy:
-            self.show_bubble_text("(worried) 等一下，我还在想事情...", "worried")
+            self.show_bubble_text("(worried) 等一下，我还在想事情...", "worried", status=True)
             return
         now = time.time()
         if now - self.last_topic_time < 30:
-            self.show_bubble_text("(shy) 我们刚聊过这个话题呢，再想想别的吧~", "shy")
+            self.show_bubble_text("(shy) 我们刚聊过这个话题呢，再想想别的吧~", "shy", status=True)
             return
         self.last_topic_time = now
         self._fetch_topic()
@@ -7040,7 +7068,7 @@ class DesktopPet:
             if self.spine_enabled and self.spine:
                 self.spine.enqueue(('test_motion', 'Action', 1))
             self.root.after(800, lambda: self.set_emotion("normal"))
-            self.show_bubble_text("(shy) 下次记得再叫我", "shy")
+            self.show_bubble_text("(shy) 下次记得再叫我", "shy", status=True)
             log.info("陪玩模式已关闭")
         else:
             if self.sleep_mode:
@@ -7071,7 +7099,7 @@ class DesktopPet:
                 self.spine.enqueue(('test_motion', 'Action', 2))
             if self.input_visible:
                 self.toggle_input_frame(save=False)   # 陪玩自动收起不算用户选择，不写进配置
-            self.show_bubble_text("(happy) 我会在后面安静陪着你的，按 Ctrl+Shift+G 可以退出", "happy")
+            self.show_bubble_text("(happy) 我会在后面安静陪着你的，按 Ctrl+Shift+G 可以退出", "happy", status=True)
             log.info("陪玩模式已开启")
             self.start_watch_loop()
             self.root.after(500, lambda: self.analyze_and_comment(force=False))
@@ -7262,7 +7290,7 @@ class DesktopPet:
             try:
                 image_b64 = self.capture_screen_base64()
                 if not image_b64:
-                    self._ui(lambda: self.show_bubble_text("(normal) 唔...我现在看不到画面呢。", "normal"))
+                    self._ui(lambda: self.show_bubble_text("(normal) 唔...我现在看不到画面呢。", "normal"), status=True)
                     return
                 sig = self._frame_signature(image_b64)
                 if not force:
@@ -7397,9 +7425,9 @@ OCR文字：
         force_line = "这一轮一定要说一句。" if force else ""
         watch_instructions = f"""你在陪"{user_name}"一起看屏幕——可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件。
 你是{self.pet_name}，用你自己的语气说话，不用把自己调成某个样子。
-就当自己坐在旁边一块儿看着：画面里正在发生什么、你什么感觉，顺口说出来就行，有情绪就带上，不用写观后感，也别去猜他在想什么。
+就当自己坐在旁边一块儿看着：画面里正在发生什么，顺口说一句就行，不用写观后感，也别去猜他在想什么。
 要说的就一句，别分两段。
-多数时候是句感觉或感慨；偶尔顺着话头问他一句就行，别每句都问。
+多数时候就是对画面的一句感慨；偶尔顺着话头问他一句就行，别每句都问。
 画面里是直播平台、弹幕或别人的操作 → 他在看；是他自己在操作 → 他在玩。记忆只能当闲聊的由头，不许盖过你现在看到的东西。
 如果画面正好勾起了之前聊过的事，就自然提一句；没有就不用硬找。
 {rest_line}
@@ -7735,12 +7763,12 @@ OCR文字：
         if self.reading_companion.enabled:
             if self.spine_enabled and self.spine:
                 self.spine.enqueue(('test_motion', 'Action', 2))
-            self.show_bubble_text("(happy) 让我看看你在读什么", "happy")
+            self.show_bubble_text("(happy) 让我看看你在读什么", "happy", status=True)
         else:
             if self.spine_enabled and self.spine:
                 self.spine.enqueue(('test_motion', 'Action', 1))
             self.root.after(800, lambda: self.set_emotion("normal"))
-            self.show_bubble_text("(shy) 有机会再一起读吧", "shy")
+            self.show_bubble_text("(shy) 有机会再一起读吧", "shy", status=True)
         label = "📖 陪我读书 (停止)" if self.reading_companion.enabled else "📖 陪我读书 (开始)"
         self._safe_menu_config(self.reading_menu_index, label, self.mode_menu)
 
@@ -7838,6 +7866,28 @@ OCR文字：
         if not self._shutdown:
             self.root.after(60, self._ptt_tick)
 
+    def toggle_tts_speak(self):
+        """🔊 语音朗读开关（TTS）：菜单在「🎮 模式」里，音色与语言在设置窗里选"""
+        if not self.tts_enabled and self.tts_mode == "volc":
+            if not self.tts_api_key:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "未配置 API Key", "请先在 设置 → API 密钥 → 声音复刻 API / Speaker ID 中配置"))
+                return
+            if not self.tts_speaker_id:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "未配置 Speaker ID", "请先在 设置 → API 密钥 → 声音复刻 API / Speaker ID 中配置"))
+                return
+        self.tts_enabled = not self.tts_enabled
+        save_tts_config(enabled=self.tts_enabled)
+        status = "开启" if self.tts_enabled else "关闭"
+        self.show_bubble_text(f"(normal) 语音朗读已{status}", "normal", status=True)
+        new_label = "🔊 语音朗读 (停止)" if self.tts_enabled else "🔊 语音朗读 (开始)"
+        try:
+            self.mode_menu.entryconfigure(self.tts_speak_menu_index, label=new_label)
+        except Exception:
+            pass
+        log.info("语音朗读已%s", status)
+
     def toggle_voice(self, save=True, quiet=False):
         """开关语音识别。
 
@@ -7856,7 +7906,7 @@ OCR文字：
             self.voice_on = False
             self._update_voice_menu_label()
             if not quiet:
-                self.show_bubble_text("(normal) 语音识别已停止", "normal")
+                self.show_bubble_text("(normal) 语音识别已停止", "normal", status=True)
             log.info("语音识别已关闭")
         else:
             if self.sleep_mode:
@@ -7865,7 +7915,7 @@ OCR文字：
             self.voice_on = True
             self._update_voice_menu_label()
             if not quiet:
-                self.show_bubble_text("(happy) 我在听你说话", "happy")
+                self.show_bubble_text("(happy) 我在听你说话", "happy", status=True)
             log.info("语音识别已开启")
         if save:
             self._voice_wanted = self.voice_on
@@ -7944,6 +7994,227 @@ OCR文字：
         except Exception:
             pass
         return False
+
+    def _tts_preview(self, provider, lang, voice=""):
+        """试听：按当前选择合成一句样例并播放（不改配置、不写聊天）"""
+        if not TTS_AVAILABLE:
+            log.warning("试听失败：音频输出不可用")
+            return
+        text = TTS_PREVIEW_TEXT.get(lang, TTS_PREVIEW_TEXT["zh"])
+        api_key, speaker_id = self.tts_api_key, self.tts_speaker_id
+
+        def _run():
+            if not self._tts_lock.acquire(timeout=1):
+                log.warning("试听被跳过：上一条语音仍在播放")
+                return
+            temp_file = None
+            try:
+                if provider == "edge":
+                    if not EDGE_TTS_IMPORTED:
+                        log.warning("试听失败：edge-tts 不可用")
+                        return
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                        temp_file = tf.name
+                    asyncio.run(edge_tts.Communicate(text, voice or DEFAULT_EDGE_VOICE).save(temp_file))
+                else:
+                    if not api_key or not speaker_id:
+                        log.warning("试听失败：声音复刻的 API Key / Speaker ID 未配置")
+                        return
+                    payload = {
+                        "app": {"cluster": "volcano_icl"},
+                        "user": {"uid": VOLC_TTS_UID},
+                        "audio": {"voice_type": speaker_id, "encoding": "mp3", "speed_ratio": 1.0},
+                        "request": {"reqid": str(uuid.uuid4()).replace("-", "")[:40],
+                                    "text": text, "operation": "query"},
+                    }
+                    resp = requests.post(VOLC_TTS_URL,
+                                         headers={"x-api-key": api_key,
+                                                  "Content-Type": "application/json"},
+                                         json=payload, timeout=30)
+                    data = resp.json() if resp.status_code == 200 else {}
+                    if data.get("code") != 3000 or not data.get("data"):
+                        log.error("试听失败: http=%s code=%s msg=%s", resp.status_code,
+                                  data.get("code"), str(data.get("message"))[:80])
+                        return
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                        tf.write(base64.b64decode(data["data"]))
+                        temp_file = tf.name
+                ducked = self._music_duck_for_tts()
+                with self._audio_channel_lock:
+                    pygame.mixer.music.load(temp_file)
+                    pygame.mixer.music.play()
+                if self.stt is not None and self.voice_on:
+                    self.stt.set_muted(True)
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.05)
+                self._music_finish_tts(ducked)
+                log.info("试听完成: provider=%s lang=%s", provider, lang)
+            except Exception as e:
+                log.error("试听出错: %s", e)
+            finally:
+                if self.stt is not None and self.voice_on:
+                    self.stt.set_muted(False)
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+                self._tts_lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def open_tts_settings(self):
+        """🎧 TTS 音色与语言：火山声音复刻 / Edge 两档分页设置"""
+        win, frame = self._make_card_window("TTS 音色与语言", 470, 500)
+        s = self._dpi_scale
+        st = {"mode": self.tts_mode, "volc_lang": self.tts_volc_lang,
+              "edge_lang": self.tts_edge_lang, "edge_voice": self.tts_edge_voice}
+
+        # 底部按钮先 pack（内容变高时收尾按钮不被挤走）
+        btn_frame = tk.Frame(frame, bg=DIALOG_BG)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+
+        def save():
+            if st["mode"] == "volc" and not (self.tts_api_key and self.tts_speaker_id):
+                messagebox.showwarning("未配置声音复刻",
+                                       "现在选的是火山声音复刻，但 API Key / Speaker ID 还没填。\n"
+                                       "请先在 设置 → API 密钥 → 声音复刻 API / Speaker ID 里配置。")
+                return
+            try:
+                save_tts_config(enabled=self.tts_enabled, mode=st["mode"], volc_lang=st["volc_lang"],
+                                edge_lang=st["edge_lang"], edge_voice=st["edge_voice"])
+            except Exception as e:
+                log.warning("保存 TTS 设置失败: %s", e)
+            self.tts_mode = st["mode"]
+            self.tts_volc_lang = st["volc_lang"]
+            self.tts_edge_lang = st["edge_lang"]
+            self.tts_edge_voice = st["edge_voice"]
+            refresh_cur()
+            lang_now = st["volc_lang"] if st["mode"] == "volc" else st["edge_lang"]
+            messagebox.showinfo("成功", "TTS 设置已保存\n当前使用：%s · %s" %
+                                ("声音复刻" if st["mode"] == "volc" else "Edge", TTS_LANG_NAMES[lang_now]))
+            win.destroy()
+
+        RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
+                      radius=int(6 * s), font=(self.font_family, 11)).pack(side=tk.LEFT, padx=3)
+
+        # ---------- 顶部：当前生效的那一档（醒目）----------
+        cur_box = tk.Frame(frame, bg=DIALOG_BG, highlightbackground=CARD_BORDER_STRONG,
+                           highlightcolor=CARD_BORDER_STRONG, highlightthickness=max(1, int(1.5 * s)))
+        cur_box.pack(fill=tk.X, pady=(2, 8))
+        cur_in = tk.Frame(cur_box, bg=DIALOG_BG)
+        cur_in.pack(fill=tk.X, padx=int(10 * s), pady=int(8 * s))
+        tk.Label(cur_in, text="当前使用", font=(self.font_family, 9), fg=TEXT_SUB,
+                 bg=DIALOG_BG).pack(anchor='w')
+        cur_label = tk.Label(cur_in, text="", font=(self.font_family, 13, "bold"),
+                             fg=BTN_PRIMARY, bg=DIALOG_BG)
+        cur_label.pack(anchor='w')
+
+        # ---------- 页签 ----------
+        tab_row = tk.Frame(frame, bg=DIALOG_BG)
+        tab_row.pack(anchor='w', pady=(0, 6))
+        tab_btns = {}
+        page = tk.Frame(frame, bg=DIALOG_BG)
+        page.pack(fill=tk.BOTH, expand=True)
+
+        def refresh_cur():
+            if self.tts_mode == "volc":
+                desc = "🔥 火山声音复刻 · %s" % TTS_LANG_NAMES.get(self.tts_volc_lang, "中文")
+                if not (self.tts_api_key and self.tts_speaker_id):
+                    desc += "（未配置 API Key / Speaker ID）"
+            else:
+                vname = next((n for n, v in EDGE_VOICE_TABLE.get(self.tts_edge_lang, [])
+                              if v == self.tts_edge_voice), self.tts_edge_voice)
+                desc = "🎧 Edge TTS · %s · %s" % (TTS_LANG_NAMES.get(self.tts_edge_lang, "中文"), vname)
+            cur_label.config(text=desc)
+            for k, b in tab_btns.items():
+                try:
+                    b.set_variant("primary" if k == st["mode"] else "subtle")
+                except Exception:
+                    pass
+
+        def lang_row(parent, codes, cur, on_pick):
+            row = tk.Frame(parent, bg=DIALOG_BG)
+            row.pack(anchor='w')
+            for code in codes:
+                RoundedButton(row, text=TTS_LANG_NAMES[code], width=int(62 * s), height=int(30 * s),
+                              radius=int(8 * s), font=(self.font_family, 10),
+                              variant="primary" if code == cur() else "subtle",
+                              command=lambda c=code: on_pick(c)).pack(side=tk.LEFT, padx=(0, 6))
+
+        def build_page(kind):
+            for w in page.winfo_children():
+                w.destroy()
+
+            def pick(c):
+                if kind == "volc":
+                    st["volc_lang"] = c
+                else:
+                    st["edge_lang"] = c
+                    if not edge_voice_valid(c, st["edge_voice"]):
+                        st["edge_voice"] = EDGE_VOICE_DEFAULT.get(c) or EDGE_VOICE_TABLE[c][0][1]
+                build_page(kind)
+
+            tk.Label(page, text="语言", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
+                     bg=DIALOG_BG).pack(anchor='w', pady=(4, 2))
+            if kind == "volc":
+                lang_row(page, ("zh", "en", "ja"), lambda: st["volc_lang"], pick)
+                tip = "非中文时，她会把要说的话翻译成该语言再念（气泡和聊天记录仍是中文）。"
+            else:
+                lang_row(page, ("zh", "en"), lambda: st["edge_lang"], pick)
+                tip = "选英文时先翻译成英文再用英文音色念；翻译失败会退回中文音色念原文。"
+            tk.Label(page, text=tip, font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                     justify='left', wraplength=int(400 * s)).pack(anchor='w', pady=(6, 0))
+
+            tk.Frame(page, bg=CARD_BORDER, height=1).pack(fill=tk.X, pady=8)
+            tk.Label(page, text="音色", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
+                     bg=DIALOG_BG).pack(anchor='w', pady=(0, 2))
+            if kind == "volc":
+                sid = self.tts_speaker_id
+                shown = (sid[:4] + "…" + sid[-2:]) if sid else "未配置"
+                tk.Label(page, text="声音复刻音色：%s\n（音色属于你的账号，在 API 密钥里换）" % shown,
+                         font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                         justify='left').pack(anchor='w', pady=(2, 4))
+                RoundedButton(page, text="去配置 API / 音色", command=self.set_tts_api_and_speaker,
+                              width=int(160 * s), height=int(30 * s), radius=int(8 * s),
+                              font=(self.font_family, 10)).pack(anchor='w')
+            else:
+                vrow = tk.Frame(page, bg=DIALOG_BG)
+                vrow.pack(anchor='w', pady=(2, 0))
+                for name, vid in EDGE_VOICE_TABLE[st["edge_lang"]]:
+                    RoundedButton(vrow, text=name, width=int(80 * s), height=int(30 * s),
+                                  radius=int(8 * s), font=(self.font_family, 10),
+                                  variant="primary" if vid == st["edge_voice"] else "subtle",
+                                  command=lambda v=vid: (st.__setitem__("edge_voice", v),
+                                                         build_page("edge"))
+                                  ).pack(side=tk.LEFT, padx=(0, 6))
+
+            tk.Frame(page, bg=CARD_BORDER, height=1).pack(fill=tk.X, pady=8)
+            RoundedButton(page, text="▶ 试听",
+                          command=(lambda: self._tts_preview("volc", st["volc_lang"])) if kind == "volc"
+                          else (lambda: self._tts_preview("edge", st["edge_lang"], st["edge_voice"])),
+                          width=int(96 * s), height=int(32 * s), radius=int(8 * s),
+                          font=(self.font_family, 10), variant="primary").pack(anchor='w')
+
+        def set_mode(kind):
+            if kind == "volc" and not (self.tts_api_key and self.tts_speaker_id):
+                messagebox.showwarning("未配置声音复刻",
+                                       "火山区还没配置 API Key / Speaker ID，选了也不会出声。\n"
+                                       "可以先点下面「去配置 API / 音色」填好。")
+            st["mode"] = kind
+            build_page(kind)
+            refresh_cur()
+
+        for kind, label in (("volc", "🔥 火山声音复刻"), ("edge", "🎧 Edge TTS")):
+            b = RoundedButton(tab_row, text=label, width=int(150 * s), height=int(34 * s),
+                              radius=int(8 * s), font=(self.font_family, 10),
+                              command=lambda k=kind: set_mode(k))
+            b.pack(side=tk.LEFT, padx=(0, 8))
+            tab_btns[kind] = b
+
+        build_page(st["mode"])
+        refresh_cur()
+        return win, frame
 
     def open_voice_settings(self):
         """🎤 语音识别设置：免唤醒窗口（0 = 关闭）+ 按键说话（PTT）"""
