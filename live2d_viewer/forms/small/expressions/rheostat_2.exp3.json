@@ -1,0 +1,11 @@
+{
+    "Type": "Live2D Expression",
+    "IsModelCustomizationExpression": false,
+    "Parameters": [
+        {
+            "Id": "Param92",
+            "Value": 2.9802322387695312e-08,
+            "Blend": "Overwrite"
+        }
+    ]
+}

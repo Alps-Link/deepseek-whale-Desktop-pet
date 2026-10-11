@@ -1,7 +1,7 @@
 """
 Live2D 离屏渲染
 """
-import os, time, json, threading, sys, random
+import os, time, json, math, threading, sys, random, gc
 import numpy as np
 from PIL import Image
 import pygame
@@ -15,7 +15,132 @@ def _get_base_dir():
     except AttributeError:
         return os.path.dirname(os.path.abspath(__file__))
 
-MODEL_DIR = os.path.join(_get_base_dir(), 'live2d_viewer', 'model')
+MODEL_ROOT = os.path.join(_get_base_dir(), 'live2d_viewer')
+MODEL_DIR = os.path.join(MODEL_ROOT, 'model')      # 鲸鱼娘（形态 whale）的模型目录，保留旧名
+
+# ---------------------------------------------------------------------------
+# 形象（形态）表：一只桌宠可以挂多套 Live2D 形象，切换时整个渲染器按新形态重建。
+#   dir/json    形态目录与 model3.json（相对 live2d_viewer）
+#   fit_*       构图（SetScale/SetOffset，实测）：fit_scale/fit_offset_y 管大小与上下，
+#               fit_offset_x 管左右（默认 0 = 模型自己的横向位置；偏了才填，单位=画布宽的一半）
+#   normal_face 该形态的"日常脸"：None = 用模型自己的默认值（无动作素材的形态就属于这种）
+#   aliases     参数别名：模型里的参数不叫 ParamXxx 时映射到我们的规范名。
+#               **不配就会静默失效**（眨眼/表情/常态脸还原全都不生效，且不报错）
+#   has_motions 有没有动作素材。没有就把 StartMotion 系列变成空操作，行为全靠每帧写参数
+#   click_react 点击时来一下程序化的甩头（made-up 反应，代替本该有的触摸动作；两套新形态已改用下面那个）
+#   click_exprs 点击时随机播一个表情（按住 CLICK_EXPR_HOLD 秒后自动回到 normal）
+#   always_on   每帧固定写的参数（例：中肥鱼启动时套上"水印消除"）
+#   has_costumes 有没有装扮配件（按形态：鲸鱼娘 8 槽；小肥鱼 1 槽＝钢盆）
+FORMS = {
+    'whale': {
+        'label': 'Q肥鱼',
+        'dir': 'model', 'json': 'c_0120.model3.json',
+        'fit_scale': 1.277, 'fit_offset_y': -0.053, 'fit_offset_x': 0.0,
+        'normal_face': {'ParamEyeLOpen': 1.0, 'ParamEyeROpen': 1.0, 'ParamMouthForm': -0.5},
+        'aliases': {}, 'has_motions': True, 'click_react': False,
+        'always_on': {}, 'has_costumes': True,
+        # 情绪 → 表情池（whale 用下面那套默认，见 EMOTION_POOLS）
+        'emotion_pools': None, 'eye_owning': None, 'sleep_expr': 'drool',
+    },
+    'medium': {
+        'label': '中肥鱼',
+        'dir': os.path.join('forms', 'medium'), 'json': 'medium.model3.json',
+        # 构图在真实角色区（char_size × char_size*0.8）上重新标定：内容占区高 93%、上下居中、四边留 9px
+        'fit_scale': 1.0145, 'fit_offset_y': -0.0379, 'fit_offset_x': 0.0,
+        'normal_face': None,          # 没有动作素材 → 模型默认值就是日常状态
+        'aliases': {}, 'has_motions': False, 'click_react': True,
+        # 点击反应：随机挑一个表情播（用户拍板：》《眼 / O O 眼 / 脸红）+ 一次小幅甩头保底
+        'click_exprs': ['eyes_guillemet', 'eyes_oo', 'blush'],
+        # 403 个像素的差：中肥鱼默认带一个小水印，启动就把它消掉（实测 Paramcol_3=1 只改这一小块）
+        'always_on': {'Paramcol_3': 1.0}, 'has_costumes': False,
+        # 她这 15 个表情是"开关型"（改口型/眼型/部件），按名字对应到情绪上；
+        # 尾巴消失/耳朵消失/水印消除 不参与情绪（水印那件在 always_on 里常开）
+        # 实测（多帧平均比画面）：**能看出效果的是眼型/脸**——eyes_guillemet(》《)、eyes_oo(O O)、
+        # eyes_xx(X X)、face_dark(脸黑)、blush(脸红，较淡)、drool(流口水，很淡)；
+        # 而 mouth_switch/mouth_3/teeth/mouth_o/mouth_worry/mouth_chestnut 这几个是"口型开关"，
+        # 静止闭嘴时几乎看不出变化（它们本来就是说话时换嘴型用的）⇒ 不参与情绪。
+        'emotion_pools': {
+            'happy':     ['teeth'],          # 用户拍板：happy 用"龇牙"
+            'relaxed':   ['eyes_guillemet'],
+            'shy':       ['blush'],
+            'surprised': ['eyes_oo', 'eyes_xx'],
+            'worried':   ['face_dark'],
+            'hurried':   ['eyes_xx'],
+            'angry':     ['face_dark'],
+            'sleep':     ['drool'],
+        },
+        'eye_owning': [],          # 这几个是眼型开关，眨眼照常（关掉反而会不眨眼）
+        'sleep_expr': 'drool',
+    },
+    'adult': {
+        'label': '成年肥鱼',
+        'dir': os.path.join('forms', 'adult'), 'json': 'adult.model3.json',
+        'fit_scale': 1.1581, 'fit_offset_y': -0.1439,
+        # 水平构图：这套模型的人体在画布里偏左（上半身质心比区域中心左 17px），右移对齐
+        'fit_offset_x': 0.1516,
+        'normal_face': None,
+        # 这套模型的脸参数**没有 Param 前缀**，必须映射，否则眨眼/表情/常态脸还原全部静默失效
+        'aliases': {'ParamEyeLOpen': 'EyeLOpen', 'ParamEyeROpen': 'EyeROpen',
+                    'ParamEyeBallX': 'EyeBallX', 'ParamEyeBallY': 'EyeBallY',
+                    'ParamBrowLY': 'BrowLY', 'ParamBrowRY': 'BrowRY',
+                    'ParamBrowLForm': 'BrowLForm', 'ParamBrowRForm': 'BrowRForm',
+                    'ParamBodyAngleX': 'BodyAngleX', 'ParamBodyAngleY': 'BodyAngleY'},
+        'has_motions': False, 'click_react': True,
+        # 点击反应：随机挑一个表情播（用户拍板：三个都随机；"大小变"暂时不用）+ 一次小幅甩头保底
+        'click_exprs': ['cry', 'angry', 'blush'],
+        'always_on': {}, 'has_costumes': False,
+        # 这套只有 4 个表情（哭哭/生气/脸红/大小变），能对上的就对上，对不上的情绪不挂表情
+        'emotion_pools': {
+            'happy':     ['blush'],
+            'relaxed':   [],
+            'shy':       ['blush'],
+            'surprised': [],
+            'worried':   ['cry'],
+            'hurried':   [],
+            'angry':     ['angry'],
+            'sleep':     [],       # 没有"闭眼口水"那种表情，睡眠靠每帧强制闭眼
+        },
+        'eye_owning': [],
+        'sleep_expr': None,
+    },
+    'small': {
+        'label': '小肥鱼',
+        'dir': os.path.join('forms', 'small'), 'json': 'small.model3.json',
+        # 构图在真实角色区（char_size × char_size*0.8）上标定：内容占区高 93%、上下居中
+        # （实测 bbox=(94,9,258,254)：上留 9 / 下留 9、上半身质心 165.1 = 区中心）
+        'fit_scale': 1.0768, 'fit_offset_x': -0.0077, 'fit_offset_y': -0.0367,
+        'normal_face': None,          # 模型默认值就是日常状态
+        # 参数全是标准命名（实测头角度就是 ParamAngleX/Y/Z，画面差 23/14/27），不需要别名表
+        'aliases': {}, 'has_motions': True, 'click_react': False,
+        'entrance_sec': 2.35,         # 入场动作 eat_rice 全长 2.35 秒
+        # 钢盆改成了装扮配件（见 FORMS 下面的 has_costumes / Dafeiyu 的 FORM_COSTUMES），
+        # 所以这里不再配 click_exprs：点她＝纯动作反应（吃饭 / 吃token）
+        'always_on': {'Param100': 0.0, 'Param101': 0.0},
+        'has_costumes': True,         # 1 个槽位「头顶」：钢盆（写 Param89）
+        # 表情映射（括号里是实测可见强度）：钢盆 12.5 / 生气 6.1 / 气泡 6.2 最明显，
+        # 星星眼 0.38、爱心眼 0.21 很淡（她的眼睛在显示尺寸下太小）；滑动变阻器 6 档是彩蛋，不接情绪
+        'emotion_pools': {
+            'happy':     ['star_eyes'],     # 星星眼
+            'relaxed':   [],
+            'shy':       ['love_eyes'],     # 爱心眼
+            'surprised': ['basin'],         # 钢盆（搞笑式惊吓）
+            'worried':   [],
+            'hurried':   [],
+            'angry':     ['angry'],         # 用户彻底怒了
+            'sleep':     [],                # 没有睡眠表情：睡眠靠每帧强制闭眼
+        },
+        'eye_owning': [],
+        'sleep_expr': None,
+        # 她自己的动作池（索引对应 model3.json 里 Action 组的顺序），菜单与自动动作都用它。
+        # 只列单独播就看得见的：吃饭 / 吃token（转token 单播空转，已从 Action 组拿掉）
+        'action_pool': [(0, '吃饭'), (1, '吃token')],
+    },
+}
+FORM_ORDER = ['adult', 'medium', 'small', 'whale']
+# 默认形态（10/11 用户拍板："把成年肥鱼设置成默认形象吧，首次开机就是成年肥鱼"）：
+# 配置里没写过 form、或存了个认不出的名字时用它 —— 也就是新装/清空配置后的第一眼形象，
+# 同时它就是「🐟 形象」菜单里的第一条。
+DEFAULT_FORM = 'adult'
 
 # 反预乘查表：_UNPREMUL[a] = round(255 * 65536 / a)（定点 16.16），a=0 时为 0。
 # 帧数据保持预乘 alpha（Windows 分层窗口本就要求预乘），
@@ -131,6 +256,8 @@ EYE_OWNING_EXPRESSIONS = {'excited', 'playful', 'dizzy', 'sunglasses'}
 # 所以脸上已经有表情时，先把旧的按"回归常态"那套过渡淡掉（trans_dur_return = 0.8 秒），
 # 淡完再由渲染循环把新表情挂上；只多出这一小段等待，换来的是任何两个表情都不再叠画。
 EXPR_SWAP_WAIT = 0.85
+# 点击反应的表情挂多久（之后自动回到 normal；用户要的是"点一下有个反应"，不是换脸）
+CLICK_EXPR_HOLD = 2.2
 
 
 def _parse_curve(segments):
@@ -195,6 +322,20 @@ def _hand_active_until(curves):
     return last
 
 
+def _resolve_param_names(actual_ids, aliases):
+    """把模型的实际参数名解析成"我们的规范名"。
+    返回 (param_ids, name_of)：
+      param_ids = 与模型同序的规范名列表（_param_ids.index(规范名) 得到的下标可直接给 Get/SetParameterValue）
+      name_of   = 规范名 → 模型里的真名（写参数时用它翻译）
+    aliases 的方向是 **规范名 → 模型真名**（例：{'ParamEyeLOpen': 'EyeLOpen'}）。
+    """
+    actual_set = set(actual_ids)
+    real_to_canon = {real: canon for canon, real in (aliases or {}).items() if real in actual_set}
+    param_ids = [real_to_canon.get(a, a) for a in actual_ids]
+    name_of = {canon: real for canon, real in zip(param_ids, actual_ids)}
+    return param_ids, name_of
+
+
 def _face_param_ids(param_ids, mouth_param):
     """挑出"脸"这一层的参数：眼/眉/嘴型/说话口型/脸型/泪/脸颊/牙/舌/汗/发青/脸红/口水。"""
     return [p for p in param_ids
@@ -203,7 +344,8 @@ def _face_param_ids(param_ids, mouth_param):
 
 
 class Live2DRenderer:
-    def __init__(self, tk_root):
+    def __init__(self, tk_root, form=DEFAULT_FORM):
+        self.form = form if form in FORMS else DEFAULT_FORM
         self._thread = None
         self._cmd_q = []
         self._q_lock = threading.Lock()
@@ -211,6 +353,7 @@ class Live2DRenderer:
         self._frame = None
         self._frame_lock = threading.Lock()
         self._on_frame = None
+        self._exited = threading.Event()   # 渲染线程真的退出（GL 上下文释放完）时置位
         self.face_row = None      # 注视基准行（渲染线程按当前构图更新，主线程读）
 
     def enqueue(self, cmd):
@@ -221,7 +364,8 @@ class Live2DRenderer:
     def start(self, width=600, height=480, on_frame=None):
         self._cmd_q = []
         self._on_frame = on_frame
-        def run(): _render_offscreen(self, width, height)
+        self._exited.clear()
+        def run(): _render_offscreen(self, width, height, self.form)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         self._ready = True
@@ -257,32 +401,76 @@ class Live2DRenderer:
     def track_mouse(self, mx, my):
         self.enqueue(('mouse', mx, my))
 
-    def destroy(self):
+    def destroy(self, wait=0.0):
+        """停渲染线程。wait>0 时等它真的退出再返回。
+
+        为什么要等：GL 上下文是渲染线程建的，也只有它能安全释放。不等就起新线程，
+        等于两份驱动状态（旧的在 teardown、新的在 set_mode/glInit）同时动手 ——
+        用户日志里那些 nvoglv64.dll 访问冲突（0xc0000005）就是这种抢出来的。
+        返回 True=已退出（或本来就没了）；False=超时。
+        """
         self._ready = False
         self.enqueue(('quit',))
+        if wait and self._thread is not None and self._thread.is_alive():
+            return self._exited.wait(wait)
+        return True
 
     def is_ready(self):
         return self._ready
 
 
-def _render_offscreen(bridge, width, height):
+def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
+    FORM = FORMS.get(form_key) or FORMS[DEFAULT_FORM]
+    model_dir = os.path.join(MODEL_ROOT, FORM['dir'])
+    ALIASES = FORM.get('aliases') or {}
+    always_on = dict(DEFAULT_OFF_PARAMS)
+    always_on.update(FORM.get('always_on') or {})
+    emo_pools = FORM.get('emotion_pools') or EMOTION_POOLS
+    eye_owning = set(FORM.get('eye_owning') or EYE_OWNING_EXPRESSIONS)
+    sleep_expr = FORM.get('sleep_expr', 'drool')
     os.environ['SDL_VIDEO_WINDOW_POS'] = '-9999,-9999'
-    pygame.init()
+    # 只初始化 display：pygame.init()/quit() 是**全库级**的，会顺手把主线程正在用的
+    # pygame.mixer（音乐播放和 TTS 都走它）一起初始化/销毁 —— 换形象时音乐就哑了
+    pygame.display.init()
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL | HIDDEN)
 
     live2d.init()
     live2d.glInit()
     model = live2d.LAppModel()
-    model.LoadModelJson(os.path.join(MODEL_DIR, 'c_0120.model3.json'))
+    model.LoadModelJson(os.path.join(model_dir, FORM['json']))
 
     model.SetAutoBreathEnable(True)
     model.SetAutoBlinkEnable(True)
 
-    # 嘴部参数名因模型而异（部分模型导出为 ParamParmOpenY），探测实际存在的名字
+    # 参数名：先取模型实际参数名，再按形态的别名表翻译成"我们的规范名"。
+    # 列表顺序与模型一致 ⇒ _param_ids.index(规范名) 拿到的下标可直接给 Get/SetParameterValue 用。
     try:
-        _param_ids = list(model.GetParamIds())
+        _actual_ids = list(model.GetParamIds())
     except Exception:
-        _param_ids = []
+        _actual_ids = []
+    # 别名方向：ALIASES 是"规范名 → 模型真名"，_resolve_param_names 负责翻成我们要的两种视图
+    _param_ids, _name_of = _resolve_param_names(_actual_ids, ALIASES)
+    _setpv_raw = model.SetParameterValue
+
+    def _setpv(name, value):
+        """按规范名写参数：别名翻译 + 不存在的参数直接跳过（例：别的形态才有的 point/装扮参数）"""
+        if isinstance(name, str):
+            real = _name_of.get(name)
+            if real is None:
+                return
+            _setpv_raw(real, value)
+        else:
+            _setpv_raw(name, value)
+
+    model.SetParameterValue = _setpv
+
+    if not FORM['has_motions']:
+        # 这一形态没有动作素材（用户拍板：动作一个都不做）→ 引擎动作接口全部变空操作，
+        # 入场/待机/点击的时序逻辑照常跑，只是不再播模型动作，观感全靠下面的每帧参数写入。
+        model.StartMotion = lambda *a, **k: None
+        model.StartRandomMotion = lambda *a, **k: None
+        model.StopAllMotions = lambda *a, **k: None
+
     MOUTH_PARAM = next((p for p in ('ParamMouthOpenY', 'ParamParmOpenY') if p in _param_ids), None)
 
     fbo = glGenFramebuffers(1); tex = glGenTextures(1)
@@ -309,8 +497,9 @@ def _render_offscreen(bridge, width, height):
     disp_w, disp_h = width, height   # 显示尺寸（主线程推送）
     act_w, act_h = width, height     # 活动渲染区域（FBO 分配尺寸为上限）
 
-    cur_fit_scale = FIT_SCALE      # 当前生效的构图（装扮会临时改小，见 COSTUME_FIT）
-    cur_fit_offset = FIT_OFFSET_Y
+    # 当前生效的构图：**按形态取**（装扮会临时改小，见 COSTUME_FIT）
+    cur_fit_scale = FORM['fit_scale']
+    cur_fit_offset = FORM['fit_offset_y']
 
     def apply_area():
         """按 显示尺寸 × 聚焦缩放 设定渲染区域；上限是 FBO 分配尺寸。
@@ -354,16 +543,18 @@ def _render_offscreen(bridge, width, height):
     trans_dur_return = 0.8  # 回归常态的过渡时长（太短会显得被拽回去，太长像僵住）
     trans_from = {}; trans_to = {}
     face_restore_at = 0.0    # 触摸动作播完、开始还原的时刻
+    click_react_until = 0.0  # 无动作形态：点击后甩头反应的截止时刻
+    click_expr_until = 0.0   # 点击表情要挂到什么时候（到点自动回 normal）
     normal_face = {}         # 脸的还原目标 = 模型脸参数 × NORMAL_FACE（首次用到时按模型现状建）
     trans_return = False      # 是否处于回归中性的过渡中
     # 预加载Scene参数（从 model3.json 读取，兼容命名文件）
     scene_params = {}
-    m3_path = os.path.join(MODEL_DIR, 'c_0120.model3.json')
+    m3_path = os.path.join(model_dir, FORM['json'])
     with open(m3_path, 'r', encoding='utf-8') as _f:
         _md = json.load(_f)
-    scene_files = _md['FileReferences']['Motions']['Scene']
+    scene_files = (_md.get('FileReferences', {}).get('Motions', {}) or {}).get('Scene', []) or []
     for i, sc in enumerate(scene_files):
-        fpath = os.path.join(MODEL_DIR, sc['File'])
+        fpath = os.path.join(model_dir, sc['File'])
         try:
             with open(fpath,'r') as f:
                 md = json.load(f)
@@ -373,7 +564,7 @@ def _render_offscreen(bridge, width, height):
     touch_durations, touch_needs_hands, touch_hand_until = [], [], []
     try:
         for _it in (_md.get('FileReferences', {}).get('Motions', {}).get('Touch', []) or []):
-            with open(os.path.join(MODEL_DIR, _it['File']), 'r', encoding='utf-8') as _f:
+            with open(os.path.join(model_dir, _it['File']), 'r', encoding='utf-8') as _f:
                 _mo = json.load(_f)
             touch_durations.append(_mo.get('Meta', {}).get('Duration', 0) or 0)
             touch_needs_hands.append(
@@ -394,7 +585,7 @@ def _render_offscreen(bridge, width, height):
     action_hand_until = []     # 每段动作：手部参数偏离起始值的最后时刻（秒）
     try:
         for _it in (_md.get('FileReferences', {}).get('Motions', {}).get('Action', []) or []):
-            with open(os.path.join(MODEL_DIR, _it['File']), 'r', encoding='utf-8') as _f:
+            with open(os.path.join(model_dir, _it['File']), 'r', encoding='utf-8') as _f:
                 _mo = json.load(_f)
             action_durations.append(_mo.get('Meta', {}).get('Duration', 0) or 0)
             _curves = {}
@@ -415,17 +606,28 @@ def _render_offscreen(bridge, width, height):
         pass
 
     # 模型默认参数即中性：所有动作/表情结束后的统一回归目标
-    defaults = {pid: model.GetParameterValue(i) for i, pid in enumerate(model.GetParamIds())}
+    defaults = {pid: model.GetParameterValue(i) for i, pid in enumerate(_param_ids)}
+    # 这一形态的"日常脸"：配了就用配的，没配就用模型自己的默认值（无动作素材的形态属于这种）
+    _face_ids = _face_param_ids(_param_ids, MOUTH_PARAM)
+    if FORM.get('normal_face'):
+        FORM_NORMAL_FACE = {p: FORM['normal_face'].get(p, 0.0) for p in _face_ids}
+    else:
+        FORM_NORMAL_FACE = {p: defaults.get(p, 0.0) for p in _face_ids}
     mouth_level = 0.0   # 嘴部开合目标（App 的 mouth 命令推送）
     mouth_disp = 0.0    # 实际写入值（速率限制 0.25/帧，避免闭嘴时一跳）
     try:
-        # 形象定位纠正（见 FIT_SCALE/FIT_OFFSET_Y 注释）
+        # 形象定位纠正（该形态的构图，见 FORMS 里的 fit_scale/fit_offset_y）
         model.SetScale(cur_fit_scale)
-        model.SetOffset(0.0, cur_fit_offset)
+        model.SetOffset(FORM.get('fit_offset_x', 0.0), cur_fit_offset)
     except Exception:
         pass
-    model.StartMotion('FirstImpression', 0, 3)
-    first_impression_end = time.time() + 4.767  # FirstImpression 3.817s：自然播完（Loop=false）后切待机
+    if FORM['has_motions']:
+        model.StartMotion('FirstImpression', 0, 3)
+        # 入场动作时长按形态取（见 FORMS 的 entrance_sec；没写的形态沿用鲸鱼娘那套）
+        first_impression_end = time.time() + FORM.get('entrance_sec', 4.767)
+    else:
+        # 没有入场动作：给一小段"站定"时间就走同一套回归流程（收脸 + 进待机状态）
+        first_impression_end = time.time() + 1.2
 
     try:
         while bridge._ready:
@@ -446,10 +648,13 @@ def _render_offscreen(bridge, width, height):
                         trans_return = False
                         sleep_eyes = True
                         pending_expr = None            # 睡眠优先：还在排队的表情作废
-                        last_emo_expr = EMOTION_POOLS['sleep'][0]
-                        model.SetExpression(last_emo_expr)
-                    elif cmd[1] in EMOTION_POOLS:
-                        _pool = EMOTION_POOLS[cmd[1]]
+                        last_emo_expr = sleep_expr
+                        if sleep_expr:
+                            model.SetExpression(sleep_expr)   # 没有睡眠表情的形态：只强制闭眼
+                    elif cmd[1] in emo_pools:
+                        _pool = emo_pools[cmd[1]]
+                        if not _pool:
+                            continue               # 这个形态没有对应表情：保持现状
                         _prev = pending_expr[0] if pending_expr else last_emo_expr
                         _cands = [e for e in _pool if e != _prev] or _pool
                         _pick = random.choice(_cands)
@@ -464,8 +669,7 @@ def _render_offscreen(bridge, width, height):
                             # 注意 trans_from 必须在这之前取：此时参数里存的还是旧表情插值后的值，
                             # 由本过渡逐帧写回、平滑衰减；ResetExpressions 一调用就没了
                             if not normal_face:
-                                normal_face = {p: NORMAL_FACE.get(p, 0.0)
-                                               for p in _face_param_ids(_param_ids, MOUTH_PARAM)}
+                                normal_face = dict(FORM_NORMAL_FACE)
                             trans_from = {pid: model.GetParameterValue(i)
                                 for i, pid in enumerate(model.GetParamIds())}
                             trans_to = dict(defaults)
@@ -491,8 +695,7 @@ def _render_offscreen(bridge, width, height):
                             # 直接回归默认会把嘴推到 1.0，0.8s 后过渡结束又被逐帧写入拉回 0 —— 看着就是"张一下又闭上"
                             trans_to[MOUTH_PARAM] = 0.0
                         if not normal_face:
-                            normal_face = {p: NORMAL_FACE.get(p, 0.0)
-                                           for p in _face_param_ids(_param_ids, MOUTH_PARAM)}
+                            normal_face = dict(FORM_NORMAL_FACE)
                         trans_to.update(normal_face)     # 脸回"日常状态"，其余照旧回默认值
                         trans_start = time.time()
                         trans_return = True
@@ -532,6 +735,8 @@ def _render_offscreen(bridge, width, height):
                         for _p in (action_curves[_idx] if _idx < len(action_curves) else {}):
                             if _p in _param_ids:
                                 action_props[_p] = model.GetParameterValue(_param_ids.index(_p))
+                elif cmd[0] == 'costume' and not FORM['has_costumes']:
+                    pass          # 这一形态没有装扮配件，收到装扮指令直接忽略
                 elif cmd[0] == 'costume':
                     # 装扮配件（按槽位互斥）：换的时候先把该槽位旧参数写回 0，再写新装扮；
                     # 然后每帧强制写入——动作会把这些参数顶掉（卡梅莉亚那套同理）
@@ -540,7 +745,7 @@ def _render_offscreen(bridge, width, height):
                     _new_params = {}
                     for _nm in _names:
                         try:
-                            with open(os.path.join(MODEL_DIR, 'expressions', _nm + '.exp3.json'),
+                            with open(os.path.join(model_dir, 'expressions', _nm + '.exp3.json'),
                                       encoding='utf-8') as _f:
                                 for _it in json.load(_f)['Parameters']:
                                     _new_params[_it['Id']] = _it['Value']
@@ -582,9 +787,9 @@ def _render_offscreen(bridge, width, height):
                     if _fits:
                         cur_fit_scale, cur_fit_offset = min(_fits, key=lambda _f: _f[0])
                     else:
-                        cur_fit_scale, cur_fit_offset = FIT_SCALE, FIT_OFFSET_Y
+                        cur_fit_scale, cur_fit_offset = FORM['fit_scale'], FORM['fit_offset_y']
                     model.SetScale(cur_fit_scale)
-                    model.SetOffset(0.0, cur_fit_offset)
+                    model.SetOffset(FORM.get('fit_offset_x', 0.0), cur_fit_offset)
                     apply_area()      # 注视基准行要跟着新构图一起重算
                 elif cmd[0] == 'test_motion':
                     model.StartMotion(cmd[1], cmd[2], 5)
@@ -622,17 +827,36 @@ def _render_offscreen(bridge, width, height):
                     if touch_durations:
                         _ti = random.randint(0, len(touch_durations) - 1)
                         model.StartMotion('Touch', _ti, 3)
+                        if FORM['click_react']:
+                            # 没有触摸动作素材 → 用程序化的甩头代替（阻尼正弦，0.7 秒收回来）
+                            click_react_until = time.time() + 0.7
                         _touch_dur = touch_durations[_ti]
                         need_hand_yield = (_ti < len(touch_needs_hands)
                                            and touch_needs_hands[_ti])
                         hand_busy_until = (time.time() + touch_hand_until[_ti]
                                            if _ti < len(touch_hand_until) else 0.0)
                     else:
+                        # 没有动作素材的形态（中肥鱼/成年肥鱼）：点击全靠下面那段"点击表情"
                         model.StartRandomMotion('Touch', 3)
                         _touch_dur = 0.0
                         need_hand_yield = False
+                        if FORM['click_react']:
+                            # 保底：表情可能很淡（成年肥鱼那三个），再叠一次小幅甩头，点一下必定看得见
+                            click_react_until = time.time() + 0.7
+                    # 点击表情：两种形态通用（有动作的形态＝动作 + 表情一起上，用户拍板给小肥鱼配"钢盆"）
+                    # ⚠ 这里必须直接 SetExpression(表情名)：不能投 ('emotion', 表情名) 命令 ——
+                    # emotion 命令按"情绪词"（happy/shy…）分派，表情名不在 emo_pools 里会掉进
+                    # else 分支被当成 normal 处理（＝立刻 ResetExpressions），表现就是"点了没反应"。
+                    if FORM.get('click_exprs'):
+                        _pick = random.choice(FORM['click_exprs'])
+                        model.ResetExpressions()          # 旧脸先摘掉，避免两段淡入交叉叠画
+                        model.SetExpression(_pick)
+                        last_emo_expr = _pick
+                        pending_expr = None
+                        click_expr_until = time.time() + CLICK_EXPR_HOLD
                     # 脸会在动作末帧定格：记下动作时长，播完把脸还原回她的日常状态（NORMAL_FACE）
-                    face_restore_at = time.time() + (_touch_dur or 1.0)
+                    # （没有动作素材的形态不排这个还原：它会把刚挂上的点击表情按回常态）
+                    face_restore_at = time.time() + _touch_dur if _touch_dur else 0.0
                 elif cmd[0] == 'mouth':
                     mouth_level = float(cmd[1])  # 只记录，由每帧写入（见渲染循环）
                 elif cmd[0] == 'mouse':
@@ -654,8 +878,7 @@ def _render_offscreen(bridge, width, height):
                 # 入场末帧不是她的日常状态（实测莫娜卡/艾丽卡右眼停在 0.78、卡梅莉亚左眼停在 0.81
                 # 就是大小眼），所以入场一结束就用同一套回归过渡把脸收回到 NORMAL_FACE，再由 Idling 接管
                 if not normal_face:
-                    normal_face = {p: NORMAL_FACE.get(p, 0.0)
-                                   for p in _face_param_ids(_param_ids, MOUTH_PARAM)}
+                    normal_face = dict(FORM_NORMAL_FACE)
                 trans_from = {p: model.GetParameterValue(_param_ids.index(p)) for p in normal_face}
                 trans_to = dict(normal_face)
                 trans_start = time.time()
@@ -667,8 +890,7 @@ def _render_offscreen(bridge, width, height):
                 face_restore_at = 0.0
                 if not trans_return:      # 正好有表情回归在跑，就让给它
                     if not normal_face:
-                        normal_face = {p: NORMAL_FACE.get(p, 0.0)
-                                       for p in _face_param_ids(_param_ids, MOUTH_PARAM)}
+                        normal_face = dict(FORM_NORMAL_FACE)
                     trans_from = {p: model.GetParameterValue(_param_ids.index(p)) for p in normal_face}
                     trans_to = dict(normal_face)
                     trans_start = time.time()
@@ -727,7 +949,7 @@ def _render_offscreen(bridge, width, height):
             # 自动眨眼的归属：睡眠 / 自己写眼睛的表情（excited、playful、dizzy）/ 写眼睛的装扮（墨镜）
             # 挂着时一律关掉眨眼 —— 眨眼在 Update 里每帧覆盖眼睛参数，不关就会把"闭眼/遮眼"盖掉。
             # 状态没变就不重复调用（这只是个开关，但没必要每帧设一次）。
-            _eyes_owned = (sleep_eyes or last_emo_expr in EYE_OWNING_EXPRESSIONS
+            _eyes_owned = (sleep_eyes or last_emo_expr in eye_owning
                            or 'ParamEyeLOpen' in costume_params or 'ParamEyeROpen' in costume_params)
             if _eyes_owned != blink_off:
                 model.SetAutoBlinkEnable(not _eyes_owned)
@@ -754,7 +976,7 @@ def _render_offscreen(bridge, width, height):
                 model.SetParameterValue(_cp, _cv)
             # 默认收起的东西（见 DEFAULT_OFF_PARAMS）：每帧写一次，但**装扮正在管这个参数时不写** ——
             # 否则会把装扮要的值盖掉（蛋包饭选项写的是 point=-1，被这里写成 0 就走样了）
-            for _dp, _dv in DEFAULT_OFF_PARAMS.items():
+            for _dp, _dv in always_on.items():
                 if _dp not in costume_params:
                     model.SetParameterValue(_dp, _dv)
             if action_until:
@@ -779,6 +1001,18 @@ def _render_offscreen(bridge, width, height):
             model.SetParameterValue('ParamEyeBallY', mouse_y)
             if active_scene is None:
                 model.Drag(mouse_x * DRAG_SCALE_X, mouse_y * DRAG_SCALE_Y)
+            if click_expr_until and time.time() >= click_expr_until:
+                click_expr_until = 0.0
+                bridge._cmd_q.append(('emotion', 'normal'))   # 点击反应到期：表情收回常态
+            if click_react_until:
+                if time.time() < click_react_until:
+                    # 阻尼正弦：0 → 最大 → 0，写在 Drag 之后，这一帧以它为准
+                    _rp = 1.0 - (click_react_until - time.time()) / 0.7
+                    _sw = math.sin(_rp * math.pi * 1.6) * 6.0 * (1.0 - _rp)
+                    model.SetParameterValue('ParamAngleZ', _sw)
+                    model.SetParameterValue('ParamAngleX', _sw * 0.4)
+                else:
+                    click_react_until = 0.0
             model.Update()
 
             glBindFramebuffer(GL_FRAMEBUFFER, fbo)
@@ -809,5 +1043,24 @@ def _render_offscreen(bridge, width, height):
         print(f'[Live2D] CRASH: {e}')
         traceback.print_exc()
     finally:
+        # 【收尾顺序是关键】所有 native 资源都必须在"GL 上下文还活着 + 还在这个线程里"
+        # 的时候释放掉，上下文最后才销毁。否则这些东西会被 Python 的 GC 拖到进程退出时
+        # 才析构，那时上下文早没了 —— 析构里的 GL 调用直接变成访问冲突：
+        # 用户日志里退出时崩在 nvoglv64.dll（0xc0000005）就是这么来的。
+        # 实测：这一步之前"启动→退出"必崩（3/3），按这个顺序放干净后不再崩。
+        try:
+            model.DestroyRenderer()      # 模型自己的贴图/VBO/遮罩缓冲
+        except Exception:
+            pass
         glDeleteFramebuffers(1, [fbo]); glDeleteTextures([tex]); glDeleteRenderbuffers(1, [rbo])
-        live2d.glRelease(); pygame.quit()
+        glFinish()                       # 等 GPU 队列排空再拆上下文
+        live2d.glRelease()
+        try:
+            live2d.dispose()             # Cubism 框架 + native 模型对象
+        except Exception:
+            pass
+        model = None
+        gc.collect()                     # 当场回收，别留给进程退出时的最后一次 GC
+        pygame.display.quit()            # 上下文最后销毁；只关 display，不动主线程的 mixer
+        bridge._ready = False            # 线程没了就别再往里推命令
+        bridge._exited.set()             # 告诉主线程：上下文释放完了，可以安全建新的

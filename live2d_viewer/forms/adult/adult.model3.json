@@ -1,0 +1,45 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "adult.moc3",
+    "Textures": [
+      "adult.4096/texture_00.png"
+    ],
+    "Physics": "adult.physics3.json",
+    "DisplayInfo": "adult.cdi3.json",
+    "Motions": {},
+    "Expressions": [
+      {
+        "Name": "cry",
+        "File": "expressions/cry.exp3.json"
+      },
+      {
+        "Name": "size_change",
+        "File": "expressions/size_change.exp3.json"
+      },
+      {
+        "Name": "angry",
+        "File": "expressions/angry.exp3.json"
+      },
+      {
+        "Name": "blush",
+        "File": "expressions/blush.exp3.json"
+      }
+    ]
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "EyeLOpen",
+        "EyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": []
+    }
+  ]
+}

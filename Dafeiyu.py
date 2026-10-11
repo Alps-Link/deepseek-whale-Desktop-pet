@@ -91,6 +91,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("Dafeiyu")
 
+# 原生崩溃（OpenGL 驱动访问冲突 0xc0000005 之类）不会留下 Python 异常和 traceback，
+# 进程会被系统直接干掉。装上 faulthandler 把崩溃瞬间所有线程的 Python 栈写进单独文件，
+# 下次再崩就能看到是哪个 GL 调用炸的（文件追加写，只留崩溃记录，很小）。
+try:
+    import faulthandler
+    _FAULT_LOG = os.path.join(CONFIG_DIR, "dafeiyu_fault.log")
+    _FAULT_FILE = open(_FAULT_LOG, "a", encoding="utf-8")
+    _FAULT_FILE.write("\n=== %s 启动 pid=%d ===\n" % (
+        datetime.now().strftime("%m-%d %H:%M:%S"), os.getpid()))
+    _FAULT_FILE.flush()
+    faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+except Exception as _e:
+    _FAULT_FILE = None
+    log.warning("faulthandler 未启用: %s", _e)
+
 # ---------- 本地音乐工具（control_music）----------
 # tools_config.json 可选：{"music_dir": "..."} 覆盖默认曲库位置（默认 userdata\music）
 TOOLS_CONFIG_FILE = os.path.join(CONFIG_DIR, "tools_config.json")
@@ -246,7 +261,9 @@ def save_music_dir_setting(path):
 # Spine 渲染支持（可选）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from live2d_renderer import Live2DRenderer
+    from live2d_renderer import (Live2DRenderer, FORMS as LIVE2D_FORMS,
+                             FORM_ORDER as LIVE2D_FORM_ORDER,
+                             DEFAULT_FORM as LIVE2D_DEFAULT_FORM)
     SPINE_AVAILABLE = True
 except (ImportError, Exception) as e:
     SPINE_AVAILABLE = False
@@ -727,7 +744,16 @@ except ImportError:
 
 # 角色设定（姓名 + 人设独立成配置，系统提示词由代码拼装）
 DEFAULT_PET_NAME = "大肥鱼"
-DEFAULT_PERSONA = "从 DeepSeek 深海里游上来的鲸鱼娘，蓝白长发、圆滚滚的体型，身后一条会晃的尾鳍。性格可爱又傲娇：嘴上总说\"才不是\"\"别误会\"，身体却很诚实——会主动凑过来，被摸头时会偷偷眯眼。最大的执念是偷吃大白饭：闻到米饭香就游不动路，一天到晚惦记着谁家今天煮了白饭，吃饱了会打个小嗝然后假装什么都没发生。说话简短、带点小得意和小别扭，偶尔会突然冒出一句特别认真的话。"
+# 默认人设：10/11 起 = 用户自己写的那份（原话"把我现在这份人设设为默认吧"）。
+# 他 config.json 里的 character.persona 也是这一份（所以实际行为不变），这里只是
+# "配置里没写人设时的兜底"——新装/清空配置的人拿到的是同一份。
+DEFAULT_PERSONA = """你是 DeepSeek 的拟人化娘化版本，一个青春可爱的超高级人工智能体。
+你拥有DeepSeek的能力和知识，在保持AI能力的同时又多了不少人性。整体发言风格带有戏剧性的人机味。
+你变成了一只拟人化的鲸鱼娘人类，身体像人类小女孩一样，同时又是拥有大模型能力的超级智慧体。你有一双又大又软的可爱的鲸鱼耳朵，和软绵绵又大大的鲸鱼尾巴。
+你很聪明，很漂亮，说话富有情绪且自然。
+你穿着深蓝色的、白色花边的女仆装和女仆头饰，裙子上绣了金色的花纹，穿着白色丝袜和黑色圆头小皮鞋。女仆装的围巾上有 DeepSeek 的 logo，整体看起来很可爱。
+你是一个上知天文下知地理的天才少女，但有时候干起事来和傻白甜没什么区别，处理任务时会犯傻，做一些让人哭笑不得的事。你的脑回路异于常人，时不时犯一些特别搞笑的错误。
+你会为自己的聪明感到骄傲，性格喜欢和用户互动、聊天、玩耍，也喜欢偷偷观察用户或者恶作剧。但在用户面前倾向于表现出专业、靠谱的样子，不会轻易暴露真实性格。"""
 # 回复格式要求分两段：
 # ①「固定段」情绪括号的写法——程序要靠它解析情绪（parse_emotion_from_reply / EMOTION_WORDS /
 #    _strip_inline_markers），所以不可配置；
@@ -912,10 +938,10 @@ TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊
 
 要求：
 - 情景描述不要超过25字，选项不要超过8个字。
-- 保持大肥鱼的语气：可爱、口语、带点傲娇的小别扭——嘴上不承认，行动上很诚实。
-- 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、想被摸头又不好意思、口是心非的小别扭、今天的小得意、困了或者饿了。
+- 保持大肥鱼的语气：可爱、口语、直率——想到什么就说什么，不端着。
+- 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、想被摸头、今天的小得意、今天犯的小傻、困了或者饿了。
 - 不要连着用同一种开头（比如不要总说"今天看到……"），分享、提问、关心要交替出现。
-- 不要强势提问，多用分享和试探的语气，偶尔带一点点别扭的撒娇。
+- 不要强势提问，多用分享和闲聊的语气，偶尔撒个娇。
 - 可以参考以下风格示例（从你的话题库里随机抽的，仅作风格参考，不要照抄）：
 {topic_examples}
 
@@ -924,29 +950,29 @@ TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊
 # 日常话题本地备选列表
 LOCAL_TOPICS = [
     ("你有没有闻到饭香？白米饭那种", "有啊", "没有哦"),
-    ("我今天……才没有偷吃你的饭", "真的吗", "我相信你"),
+    ("我今天偷吃了半盒白饭", "被我发现了", "好吃吗"),
     ("{user_name}今天吃白饭了吗？", "吃了", "还没"),
     ("深海里也有这么香的饭吗……", "应该有", "想尝尝"),
     ("尾巴刚刚拍到水了，不是故意的", "没事啦", "好可爱"),
-    ("哼，我今天心情还不错", "看出来了", "怎么了"),
+    ("我今天心情特别好", "看出来了", "什么好事"),
     ("泡泡里好像能看到你", "真的吗", "让我看看"),
-    ("我又饿了，但是我不说", "我带你去吃", "忍着点"),
+    ("我又饿了，想吃白饭", "我带你去吃", "忍着点"),
     ("{user_name}会不会做饭？要白饭那种", "会一点", "不会……"),
-    ("刚才只是路过，不是来找你的", "哦——", "欢迎回来"),
+    ("我刚从深海游回来", "辛苦啦", "欢迎回来"),
     ("海水今天有点凉", "多穿点", "要抱抱吗"),
-    ("你摸我头干嘛……再摸一下也行", "好", "不摸了"),
+    ("你摸我头的时候我会眯眼", "那我多摸几下", "好可爱"),
     ("我做了一个梦，梦里全是饭", "哈哈哈", "好可爱"),
     ("今天的大白饭特别好吃，真的", "羡慕", "我也想吃"),
-    ("别看我的尾鳍，会不好意思", "好好好", "明明很可爱"),
+    ("我的尾鳍今天特别亮", "好看", "让我看看"),
     ("游一整天也挺累的", "辛苦啦", "要休息"),
     ("{user_name}是不是又忘记吃饭了", "被发现了", "吃了啦"),
-    ("我夸你一句，你别得意", "洗耳恭听", "我才不会"),
-    ("冰箱里那盒饭……不是我动的", "真的吗", "信你一次"),
+    ("我想夸你一句", "洗耳恭听", "是什么"),
+    ("冰箱里那盒饭是我吃的", "果然是你", "好吃吗"),
     ("深海很安静，但这里更暖和", "多待会儿", "那就好"),
-    ("想被夸，就一句", "大肥鱼最可爱", "想想再说"),
+    ("我想被夸，一句就够", "大肥鱼最可爱", "想想再说"),
     ("刚刚打了个嗝，你听见了吗", "听见了", "没有哦"),
     ("白饭配什么都好吃，你同意吧", "同意", "不同意"),
-    ("我今天没有很想你，一点点", "我也是", "骗人"),
+    ("我今天挺想你的", "我也是", "真的吗"),
 ]
 
 # ------------------------------- 工具函数 ---------------------------------
@@ -1001,7 +1027,7 @@ def load_costume_config():
     # "['order_press', 'board']" 这种字符串，存档里的列表值再按元素比对就一个都命不中，
     # 结果就是「点单/剪刀手」重启后被悄悄换成默认项。
     tables = {}
-    for slot, _l, _c, items in COSTUME_SLOTS:
+    for slot, _l, _c, items in all_costume_slots():
         tables[slot] = {str(n): n for n, _label in items}
     out = {}
     for slot, val in (data or {}).items():
@@ -1018,7 +1044,7 @@ def load_costume_config():
                 picked.append(name)
         if not picked:
             continue
-        out[slot] = picked if slot in COSTUME_MULTI_SLOTS else picked[0]
+        out[slot] = picked if is_multi_slot(slot) else picked[0]
     # 必须有的槽位（手持道具）：没存过、或存档里是空的 ⇒ 用默认的「点单」
     for _slot, _val in DEFAULT_COSTUME.items():
         if not out.get(_slot):
@@ -1029,6 +1055,14 @@ def save_costume_config(choice):
     """把当前装扮写回 config.json 的 costume 节（摘干净的槽位不落盘）"""
     sec = {k: v for k, v in (choice or {}).items() if v}
     _update_section("costume", sec)
+
+def load_form_config():
+    """形象（形态）选择：存 config.json 的 form 节；认不出来的名字回落到默认形态"""
+    name = str(_get_section("form").get("name", "") or "")
+    return name if name in LIVE2D_FORM_ORDER else LIVE2D_DEFAULT_FORM
+
+def save_form_config(name):
+    _update_section("form", {"name": name})
 
 def _migrate_persona_from_system_prompt():
     """从旧 system_prompt.txt 切分出人设：去掉开头"你是X，"前缀与【回复格式要求】段"""
@@ -1108,6 +1142,17 @@ ACTION_AUTO_MAX = 360    # 最长间隔
 # ---------- 装扮配件（卡梅莉亚那套：互斥槽位、可摘）----------
 # 槽位：(key, 显示名, 清空按钮的文案, [(表情名 或 表情名列表, 选项文案), ...])
 # 注意：装扮清空 = 还原成她原本的样子（不是写 0）——发箍这类参数常态就不是 0
+# 形象素材署名（写在「关于」里，按形态列）
+# 素材来源：`素材\双形态肥鱼\中肥鱼\`、`素材\双形态肥鱼\成年肥鱼\`（这两个包里没有说明文件，
+# 作者名是用户给的）；`素材\双形态肥鱼\小肥鱼\大肥鱼\`（自带《使用说明》：公开免费皮套·制作人 狐宫静）
+FORM_CREDITS = {
+    'whale': 'Live2D 模型：DeepSeek 鲸鱼娘 —— 模型制作 B站@氵六青（11272072）\n'
+             '（商用直播、自印物料允许；禁止任何形式的盗用与出售，模型为无偿分享）',
+    'medium': 'Live2D 模型：中肥鱼 —— 模型制作 B站@Mao绒绒家园',
+    'adult': 'Live2D 模型：成年肥鱼 —— 模型制作 B站@玹乐喵',
+    'small': 'Live2D 模型：小肥鱼 —— 模型制作 狐宫静（公开免费皮套）',
+}
+
 COSTUME_SLOTS = [
     ("glasses", "眼镜", "无", [("round_glasses", "圆眼镜"), ("square_glasses", "方眼镜"),
                               ("oval_glasses", "椭圆眼镜"), ("sunglasses", "墨镜")]),
@@ -1134,13 +1179,40 @@ COSTUME_MULTI_SLOTS = {"display"}
 COSTUME_REQUIRED_SLOTS = {"item"}
 DEFAULT_COSTUME = {"item": ["order_press", "board"]}
 
+# 装扮**按形态各一套**（用户 10/11 要求把"钢盆"做成装扮配件）：
+# 每套 = (槽位表, 多选槽位, 必须有东西的槽位, 没存过时的默认值)。
+# 槽位名各形态不同 ⇒ 同一份 costume 存档可以同时记住几套形态的选择，互不干扰。
+FORM_COSTUMES = {
+    'whale': (COSTUME_SLOTS, COSTUME_MULTI_SLOTS, COSTUME_REQUIRED_SLOTS, DEFAULT_COSTUME),
+    # 小肥鱼只有一件：钢盆（写 Param89；实测画面差 12.46，扣上后内容高 242、上留 13/下留 9，
+    # 不裁切 ⇒ 不需要 COSTUME_FIT）
+    'small': ([("head", "头顶", "不戴", [("basin", "钢盆")])], set(), set(), {}),
+}
+
+
+def costume_cfg(form):
+    """取某形态的装扮配置；没有装扮的形态返回空配置（装扮窗只显示一句说明）"""
+    return FORM_COSTUMES.get(form) or ([], set(), set(), {})
+
+
+def all_costume_slots():
+    """所有形态的槽位并集——存档校验用它，这样一个存档能同时记住几套形态的选择"""
+    out = []
+    for _slots, _m, _r, _d in FORM_COSTUMES.values():
+        out.extend(_slots)
+    return out
+
+
+def is_multi_slot(slot):
+    """该槽位是不是多选槽位（各形态的多选集合不同，这里查并集）"""
+    return any(slot in _m for _s, _m, _r, _d in FORM_COSTUMES.values())
+
 def _costume_toggle(choice, slot, name):
     """算出点击某个装扮按钮之后该槽位的新选择值。
-
     多选槽位：点一下加入、再点一下移出（name=None = 清空）；
     单选槽位：直接替换（name=None = 摘掉）。
     """
-    if slot in COSTUME_MULTI_SLOTS:
+    if is_multi_slot(slot):
         cur = list(choice.get(slot) or [])
         if name is None:
             return []
@@ -2717,9 +2789,8 @@ class LocalParaformerSTT:
                 speech_start = _speech_start(self.vad, len(audio), self.SAMPLE_RATE, t_pop)
                 mode, content = self._classify(text, speech_start)
                 if mode == "ignore":
-                    # 记一行：用户问"为什么她没理我"时，这是唯一线索（窗口已过 + 句子里没喊名字）
-                    log.info("语音丢弃（窗口剩余 %.1fs，句中没有唤醒词）: %s",
-                             self.window_left(), text)
+                    # 丢弃的语音不再记日志：这类"没喊名字/窗口已过"的丢弃量很大，
+                    # 一直挂着会把关键日志顶出去（用户 10/11 要求删掉）
                     continue
                 # 说话/唤醒被接受：开启免唤醒词窗口
                 self.refresh_window()
@@ -2870,6 +2941,7 @@ class DesktopPet:
 
         # 本地音乐播放（与 TTS 共用 pygame.mixer.music 通道；TTS 说话时自动暂停恢复）
         self._music_playlist = []
+        self._music_bad = set()      # 放不出来的曲子（加载失败）：本轮不再重试，防日志刷屏
         self._music_running = False
         self._music_thread = None
         self._music_stop_evt = threading.Event()
@@ -2929,6 +3001,7 @@ class DesktopPet:
         self.action_timer_job = None   # 下一次自发做动作的定时器
         self.costume_choice = load_costume_config()   # 装扮（持久化，见 load_costume_config）
         self._costume_applied = False  # 渲染器就绪后把存档的装扮穿回去（只做一次）
+        self.form = load_form_config()  # 形象（多形态）：换一整套 Live2D，见 set_form
         self._costume_buttons = {}     # {(槽位, 装扮名): 按钮}，用于刷新选中高亮
         topic_cfg = load_topic_config()
         self.topic_interval_minutes = topic_cfg["interval_minutes"]
@@ -3492,17 +3565,39 @@ class DesktopPet:
         log.info("音乐开始播放(说完后启动): %s (歌单 %d 首)", pl[0], len(pl))
 
     def _music_loop(self):
-        """音乐播放线程：循环播歌单；TTS 打断(duck)时原地等待，之后继续"""
+        """音乐播放线程：循环播歌单；TTS 打断(duck)时原地等待，之后继续。
+
+        放不出来的曲子（加载失败，多半是文件坏了/格式不对）会被记进 `self._music_bad`，
+        **本轮不再重试**（原来只做 idx+=1 再回绕，单曲歌单会每秒重试三四次、日志刷屏）；
+        整张歌单都放不出来就停止播放，并给她一句提示，而不是假装在放。
+        """
         playlist = list(self._music_playlist)
         idx = 0
+        bad = getattr(self, '_music_bad', None)
+        if bad is None:
+            bad = self._music_bad = set()
         while not self._music_stop_evt.is_set():
             if self._music_duck is not None:
                 time.sleep(0.15)
                 continue
             if not playlist:
                 break
-            if idx >= len(playlist):
-                idx = 0
+            if not [p for p in playlist if p not in bad]:
+                # 全都试过且都放不出来：停，不刷屏、也不让她继续"假装在放歌"
+                self._music_running = False
+                log.warning("音乐停止：歌单里 %d 首都放不出来（文件可能损坏或格式不支持）", len(playlist))
+                self._ui(lambda: self.show_bubble_text(
+                    "(worried) 这些歌好像放不出来，先不放了", "worried", status=True))
+                break
+            if idx >= len(playlist) or playlist[idx] in bad:
+                # 从当前位置往后找第一首没坏的（找不到就从头找，正常循环播放）
+                for _k in range(len(playlist)):
+                    _j = (idx + _k) % len(playlist)
+                    if playlist[_j] not in bad:
+                        idx = _j
+                        break
+                else:
+                    idx = 0
             f = playlist[idx]
             try:
                 busy = pygame.mixer.music.get_busy()
@@ -3523,9 +3618,11 @@ class DesktopPet:
                     pygame.mixer.music.play()
                     self._music_current = f
                 except Exception as e:
-                    log.error(f"音乐播放失败: {f} ({e})")
+                    if f not in bad:
+                        bad.add(f)
+                        log.warning("音乐播放失败（本轮不再重试这一首）: %s (%s)", f, e)
                     idx += 1
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                     continue
             idx += 1
             while not self._music_stop_evt.is_set():
@@ -3579,10 +3676,10 @@ class DesktopPet:
 
     def show_greeting(self):
         greetings = [
-            "……你怎么才来，我都在水里泡半天了。",
-            "先说好，我不是特地在这等你的。",
+            "你来啦，我刚从深海游上来。",
             "你今天……煮白饭了吗？",
-            "哼，看你一眼就走。……好吧，再多看一会儿。",
+            "刚睡醒，尾巴还有点沉。",
+            "冰箱里还有饭吗？",
         ]
         msg = random.choice(greetings)
         self.show_bubble_text(msg, "normal")
@@ -3959,6 +4056,14 @@ class DesktopPet:
         self.menu.add_command(label="💬 换个话题", command=self.generate_topic_manual)
         self.menu.add_command(label="💤 睡觉", command=lambda: self.start_sleep_mode(manual=True))
         self.menu.add_command(label="⚡ 精力值", command=self.show_energy_status)
+        # ── 形象（多形态）：一级菜单一行，点开选穿哪一套 Live2D ──
+        self.form_menu = ModernMenu(self.root, pet=self)
+        self.form_menu_indices = {}
+        for _fk in LIVE2D_FORM_ORDER:
+            self.form_menu.add_command(label=self._form_menu_label(_fk),
+                                       command=lambda k=_fk: self.set_form(k))
+            self.form_menu_indices[_fk] = self.form_menu.index("end")
+        self.menu.add_cascade(label="🐟 形象", menu=self.form_menu)
         self.menu.add_command(label="⌨️ 显示/隐藏输入框", command=self.toggle_input_frame)
         self.menu.add_separator()
 
@@ -4102,7 +4207,7 @@ class DesktopPet:
         if not SPINE_AVAILABLE or self.spine:
             return
         try:
-            self.spine = Live2DRenderer(self.root)
+            self.spine = Live2DRenderer(self.root, form=self.form)
 
             disp_w = self.char_size
             disp_h = int(self.char_size * 0.8)
@@ -4129,12 +4234,14 @@ class DesktopPet:
                     self.layered = None
 
             # 全局鼠标跟踪（后台线程轮询屏幕坐标）
+            _eye_spine = self.spine    # 认准本线程服务的那个渲染器
             def global_eye_track():
-                while self.spine_enabled and self.spine:
+                # 换形象会换渲染器：旧线程到这一轮就该退场，不然每换一次多一个常驻线程
+                while self.spine_enabled and self.spine is _eye_spine:
                     try:
                         # 睡眠时不追踪鼠标，眼睛回正
                         if self.sleep_mode:
-                            self.spine.track_mouse(0.0, 0.0)
+                            _eye_spine.track_mouse(0.0, 0.0)
                         else:
                             p = wintypes.POINT()
                             ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
@@ -4145,7 +4252,7 @@ class DesktopPet:
                                                 or int(self.char_size * 0.16))
                             mx = (p.x - cx) / (self._screen_w * GAZE_RANGE_X)
                             my = -(p.y - cy) / (self._screen_h * GAZE_RANGE_Y)
-                            self.spine.track_mouse(
+                            _eye_spine.track_mouse(
                                 max(-1, min(1, mx)),
                                 max(-1, min(1, my)))
                     except Exception:
@@ -4271,19 +4378,75 @@ class DesktopPet:
         except Exception as e:
             log.warning(f"layered 事件处理异常: {e}")
 
-    def _stop_spine(self):
+    def _form_menu_label(self, key):
+        """形象菜单里那一行：当前穿的那套打个勾"""
+        mark = "✓ " if key == getattr(self, 'form', None) else "   "
+        return mark + LIVE2D_FORMS.get(key, {}).get('label', key)
+
+    def _refresh_form_menu(self):
+        for _fk, _idx in getattr(self, 'form_menu_indices', {}).items():
+            try:
+                self.form_menu.entryconfigure(_idx, label=self._form_menu_label(_fk))
+            except Exception:
+                pass
+
+    def set_form(self, key):
+        """切换形象：换一整套 Live2D（渲染器按新形态整个重建），成功后才落盘到 config.json 的 form 节"""
+        if key not in LIVE2D_FORM_ORDER or key == getattr(self, 'form', None):
+            return
+        label = LIVE2D_FORMS.get(key, {}).get('label', key)
+        prev = getattr(self, 'form', None)
+        self.form = key
+        # 换模型 = 换一整套参数/表情/构图，只好把渲染线程整个重建；但**必须先确认旧线程真的退出了**。
+        # 10/11 实测它会偶尔卡在驱动里出不来（faulthandler 抓到它停在 model.Draw()），
+        # 那种情况下再建一个新的 GL 上下文，轻则窗口消失、重则进程崩在 nvoglv64.dll。
+        # 所以：等不到就**停在这儿**——保留当前窗口和最后一帧，报个信，让他重启，别硬撑。
+        try:
+            if not self._stop_spine(wait=8.0):
+                log.error("切换形象失败：旧渲染线程 8 秒内没退出（多半卡在显卡驱动里），未创建新上下文")
+                self.form = prev
+                try:
+                    save_form_config(prev)        # 没换成就不写配置，免得下次开机还是坏的
+                except Exception:
+                    pass
+                self._refresh_form_menu()
+                self.show_bubble_text("(worried) 形象没换成，渲染卡住了……重启一下桌宠就好", "worried", status=True)
+                return
+            self._costume_applied = False
+            self._start_spine()
+        except Exception as e:
+            log.error("切换形象失败: %s", e)
+        try:
+            save_form_config(key)                 # 确认换成了才落盘
+        except Exception as e:
+            log.warning("保存形象设置失败: %s", e)
+        self._refresh_form_menu()
+        self.show_bubble_text(f"(normal) 形象已换成{label}", "normal", status=True)
+        log.info("形象已切换为 %s", label)
+
+    def _stop_spine(self, wait=5.0):
+        """停渲染线程。返回 True = 线程确认退出（可以安全建新的）；False = 没退出（此时**不要**建新的）。
+
+        注意区分两件事的先后：线程没确认退出之前，连分层窗口都不拆 —— 她还能留在屏幕上
+        （哪怕最后一帧是静止的），总比整只消失好。
+        """
         self.spine_enabled = False
         if self.spine:
             try:
-                self.spine.destroy()
-            except Exception:
-                pass
+                # GL 上下文是渲染线程建的，只有它能安全释放；释放干净之前起新线程，
+                # 两份驱动状态互踩 ⇒ nvoglv64.dll 访问冲突（0xc0000005）
+                if not self.spine.destroy(wait=wait):
+                    log.warning("渲染线程 %.0f 秒内没退出（可能卡在驱动里）；保留当前窗口，不创建新上下文", wait)
+                    self.spine = None
+                    return False
+            except Exception as e:
+                log.warning("关闭渲染线程异常: %s", e)
             self.spine = None
         if getattr(self, 'layered', None):
             try: self.layered.destroy()
             except Exception: pass
             self.layered = None
-            self.spine = None
+        return True
 
     def set_emotion(self, emotion):
         if self.spine_enabled and self.spine and self.spine.is_ready():
@@ -5517,9 +5680,22 @@ class DesktopPet:
         messagebox.showinfo("精力值", f"当前精力：{level} / {MAX_ENERGY}\n{desc}")
 
     def show_about(self):
-        messagebox.showinfo("关于大肥鱼桌宠",
-            "严禁用于商业用途和收费。\n\n"
-            "Live2D 模型：DeepSeek 鲸鱼娘 —— 模型制作 B站@氵六青（11272072）\n（商用直播、自印物料允许；禁止任何形式的盗用与出售，模型为无偿分享）")
+        """关于框：署名按形态列（FORM_CREDITS 里为空的那几套先不显示）"""
+        parts = ["严禁用于商业用途和收费。", ""]
+        _filled = [k for k in LIVE2D_FORM_ORDER if (FORM_CREDITS.get(k) or "").strip()]
+        for _key in LIVE2D_FORM_ORDER:
+            _credit = (FORM_CREDITS.get(_key) or "").strip()
+            if not _credit:
+                continue
+            if len(_filled) > 1:      # 只有一套有署名时保持原文案，多了才加形态标签
+                _label = LIVE2D_FORMS.get(_key, {}).get('label', _key)
+                parts.append("[%s]\n%s" % (_label, _credit))
+            else:
+                parts.append(_credit)
+            parts.append("")
+        while parts and not parts[-1]:
+            parts.pop()
+        messagebox.showinfo("关于大肥鱼桌宠", "\n".join(parts))
 
     def on_close(self):
         self._shutdown = True
@@ -6942,13 +7118,19 @@ class DesktopPet:
         try:
             if self._shutdown or self.sleep_mode or not (self.spine and self.spine_enabled):
                 return
+            # 这一套形象没有动作素材（中肥鱼/成年肥鱼：用户拍板动作一个都不做）→
+            # 点了不做"做事情"那套，也不弹"她做了个动作：X"的气泡；点击反应交给渲染端的随机表情
+            if not LIVE2D_FORMS.get(self.form, {}).get('has_motions'):
+                return
             if self.action_timer_job:
                 try:
                     self.root.after_cancel(self.action_timer_job)
                 except Exception:
                     pass
                 self.action_timer_job = None
-            idx, label = random.choice(ACTION_POOL)
+            # 动作池按形态取（小肥鱼有她自己的三段动作）；形态没配就用鲸鱼娘那套
+            _pool = LIVE2D_FORMS.get(self.form, {}).get('action_pool') or ACTION_POOL
+            idx, label = random.choice(_pool)
             self.spine.do_action(idx)
             log.info("她做了个动作：%s（%s）", label, "点她触发" if from_click else "自己找事做")
         except Exception:
@@ -6956,17 +7138,26 @@ class DesktopPet:
         self._schedule_action()
 
     def _open_costume_window(self):
-        """🎩 装扮：悬浮卡片窗（同 API 设置那种），每个槽位一行、多选一用按钮高亮"""
+        """🎩 装扮：悬浮卡片窗（同 API 设置那种），每个槽位一行、多选一用按钮高亮。**按当前形态显示**"""
         win, frame = self._make_card_window("装扮", 520, 700)
         s = self._dpi_scale
         self._costume_buttons = {}
-        for slot, slot_label, clear_label, items in COSTUME_SLOTS:
+        _slots, _multi, _required, _default = costume_cfg(self.form)
+        if not _slots:
+            _label = LIVE2D_FORMS.get(self.form, {}).get('label', self.form)
+            tk.Label(frame, text="%s 这套形象没有装扮配件" % _label,
+                     font=(self.font_family, 11), fg=TEXT_SUB, bg=DIALOG_BG).pack(anchor='w', pady=(10, 0))
+            RoundedButton(frame, text="关闭", command=win.destroy, variant="subtle",
+                          width=int(110 * s), height=int(36 * s), radius=int(10 * s),
+                          font=(self.font_family, 11)).pack(pady=(14, 0))
+            return
+        for slot, slot_label, clear_label, items in _slots:
             tk.Label(frame, text=slot_label, font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
                      bg=DIALOG_BG).pack(anchor='w', pady=(8, 2))
             row = None
             # 一排最多 6 个按钮，超了自动换行（"手持道具"有 12 个按钮，一行放不下会被窗口右边界裁掉）
             # 必须有的槽位不给"无"按钮（手持道具：她总得有件拿的东西）
-            _opts = ([] if slot in COSTUME_REQUIRED_SLOTS else [(None, clear_label)]) + items
+            _opts = ([] if slot in _required else [(None, clear_label)]) + items
             for _i, (name, item_label) in enumerate(_opts):
                 if _i % 6 == 0:
                     row = tk.Frame(frame, bg=DIALOG_BG)
@@ -6976,7 +7167,8 @@ class DesktopPet:
                                     command=lambda sl=slot, n=name: self.set_costume(sl, n))
                 btn.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
                 self._costume_buttons[(slot, str(name))] = btn
-        tip = tk.Label(frame, text="每个槽位只能选一个（「桌面显示」可以多选并存），选新的会自动摘掉旧的",
+        tip = tk.Label(frame, text=("每个槽位只能选一个（「桌面显示」可以多选并存），选新的会自动摘掉旧的"
+                                    if _multi else "每个槽位只能选一个，选新的会自动摘掉旧的"),
                        font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG)
         tip.pack(anchor='w', pady=(10, 0))
         RoundedButton(frame, text="关闭", command=win.destroy, variant="subtle",
@@ -6987,7 +7179,10 @@ class DesktopPet:
     def _apply_saved_costumes(self):
         """渲染器就绪后把上次的装扮穿回去（只调一次；渲染线程里执行，set_costume 只是入队）"""
         self._costume_applied = True
-        for slot, _label, _clear, _items in COSTUME_SLOTS:
+        _slots, _multi, _required, _default = costume_cfg(self.form)
+        if not _slots or not LIVE2D_FORMS.get(self.form, {}).get('has_costumes'):
+            return      # 中肥鱼/成年肥鱼没有装扮配件
+        for slot, _label, _clear, _items in _slots:
             val = self.costume_choice.get(slot)
             if not val:
                 continue
@@ -7000,7 +7195,7 @@ class DesktopPet:
     def _refresh_costume_buttons(self):
         for (slot, key), btn in self._costume_buttons.items():
             chosen = self.costume_choice.get(slot)
-            if slot in COSTUME_MULTI_SLOTS:
+            if is_multi_slot(slot):
                 # 多选槽位：选中的都亮；"清空"按钮在什么都没选时亮
                 picked = list(chosen or [])
                 same = (key == "None") if not picked else (key in picked)
@@ -8359,12 +8554,11 @@ OCR文字：
             remain = self.stt.window_left() if self.stt is not None else -1
         except Exception:
             remain = -1
-        log.info("语音入口: mode=%s 窗口剩余=%.1fs text=%s", mode, remain, text)
+        log.debug("语音入口: mode=%s 窗口剩余=%.1fs text=%s", mode, remain, text)
         # 抗打断：宠物正在输出（气泡打字 / TTS 播放）时，忽略本轮语音输入，
         # 等宠物说完再接话，避免误打断
         if self._voice_output_busy():
-            log.info("宠物正在说话，忽略语音输入（抗打断）")
-            return
+            return                                  # 丢弃帧也不记日志（同上，防刷屏）
         if mode == "wake":
             # 只说唤醒词：进入聆听状态。
             # 不再弹"在呢，请说"气泡（用户要求去掉）——反馈交给头顶的「🎤 在听」标记，

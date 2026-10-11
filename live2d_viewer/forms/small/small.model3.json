@@ -1,0 +1,134 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "small.moc3",
+    "Textures": [
+      "small.4096/texture_00.png",
+      "small.4096/texture_01.png",
+      "small.4096/texture_02.png"
+    ],
+    "Physics": "small.physics3.json",
+    "DisplayInfo": "small.cdi3.json",
+    "Motions": {
+      "Idling": [
+        {
+          "File": "motions/idle.motion3.json"
+        }
+      ],
+      "FirstImpression": [
+        {
+          "File": "motions/eat_rice.motion3.json"
+        }
+      ],
+      "Touch": [
+        {
+          "File": "motions/eat_rice.motion3.json"
+        },
+        {
+          "File": "motions/eat_token.motion3.json"
+        }
+      ],
+      "Action": [
+        {
+          "File": "motions/eat_rice.motion3.json"
+        },
+        {
+          "File": "motions/eat_token.motion3.json"
+        }
+      ],
+      "Sleep": [
+        {
+          "File": "motions/sleep.motion3.json"
+        }
+      ],
+      "Scene": [
+        {
+          "File": "motions/scene1.motion3.json"
+        }
+      ]
+    },
+    "Expressions": [
+      {
+        "Name": "token",
+        "File": "expressions/token.exp3.json"
+      },
+      {
+        "Name": "star_eyes",
+        "File": "expressions/star_eyes.exp3.json"
+      },
+      {
+        "Name": "bubble",
+        "File": "expressions/bubble.exp3.json"
+      },
+      {
+        "Name": "bubble_slide",
+        "File": "expressions/bubble_slide.exp3.json"
+      },
+      {
+        "Name": "rheostat_1",
+        "File": "expressions/rheostat_1.exp3.json"
+      },
+      {
+        "Name": "rheostat_2",
+        "File": "expressions/rheostat_2.exp3.json"
+      },
+      {
+        "Name": "rheostat_3",
+        "File": "expressions/rheostat_3.exp3.json"
+      },
+      {
+        "Name": "rheostat_4",
+        "File": "expressions/rheostat_4.exp3.json"
+      },
+      {
+        "Name": "rheostat_5",
+        "File": "expressions/rheostat_5.exp3.json"
+      },
+      {
+        "Name": "rheostat_6",
+        "File": "expressions/rheostat_6.exp3.json"
+      },
+      {
+        "Name": "rheostat_switch",
+        "File": "expressions/rheostat_switch.exp3.json"
+      },
+      {
+        "Name": "rheostat_bubble",
+        "File": "expressions/rheostat_bubble.exp3.json"
+      },
+      {
+        "Name": "love_eyes",
+        "File": "expressions/love_eyes.exp3.json"
+      },
+      {
+        "Name": "angry",
+        "File": "expressions/angry.exp3.json"
+      },
+      {
+        "Name": "basin",
+        "File": "expressions/basin.exp3.json"
+      },
+      {
+        "Name": "reset_all",
+        "File": "expressions/reset_all.exp3.json"
+      }
+    ]
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "ParamEyeLOpen",
+        "ParamEyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": [
+        "ParamMouthOpenY"
+      ]
+    }
+  ]
+}

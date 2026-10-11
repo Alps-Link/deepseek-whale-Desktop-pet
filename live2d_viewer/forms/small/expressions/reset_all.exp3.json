@@ -1,0 +1,51 @@
+{
+    "Type": "Live2D Expression",
+    "IsModelCustomizationExpression": false,
+    "Parameters": [
+        {
+            "Id": "Param89",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param91",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param92",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param95",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param96",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param93",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param94",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param97",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        },
+        {
+            "Id": "Param98",
+            "Value": 0.0,
+            "Blend": "Overwrite"
+        }
+    ]
+}

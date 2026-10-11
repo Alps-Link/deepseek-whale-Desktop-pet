@@ -1,0 +1,89 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "medium.moc3",
+    "Textures": [
+      "medium.4096/texture_00.png"
+    ],
+    "Physics": "medium.physics3.json",
+    "DisplayInfo": "medium.cdi3.json",
+    "Motions": {},
+    "Expressions": [
+      {
+        "Name": "mouth_switch",
+        "File": "expressions/mouth_switch.exp3.json"
+      },
+      {
+        "Name": "mouth_3",
+        "File": "expressions/mouth_3.exp3.json"
+      },
+      {
+        "Name": "teeth",
+        "File": "expressions/teeth.exp3.json"
+      },
+      {
+        "Name": "face_dark",
+        "File": "expressions/face_dark.exp3.json"
+      },
+      {
+        "Name": "blush",
+        "File": "expressions/blush.exp3.json"
+      },
+      {
+        "Name": "eyes_oo",
+        "File": "expressions/eyes_oo.exp3.json"
+      },
+      {
+        "Name": "eyes_guillemet",
+        "File": "expressions/eyes_guillemet.exp3.json"
+      },
+      {
+        "Name": "eyes_xx",
+        "File": "expressions/eyes_xx.exp3.json"
+      },
+      {
+        "Name": "drool",
+        "File": "expressions/drool.exp3.json"
+      },
+      {
+        "Name": "mouth_o",
+        "File": "expressions/mouth_o.exp3.json"
+      },
+      {
+        "Name": "mouth_worry",
+        "File": "expressions/mouth_worry.exp3.json"
+      },
+      {
+        "Name": "mouth_chestnut",
+        "File": "expressions/mouth_chestnut.exp3.json"
+      },
+      {
+        "Name": "hide_tail",
+        "File": "expressions/hide_tail.exp3.json"
+      },
+      {
+        "Name": "hide_ears",
+        "File": "expressions/hide_ears.exp3.json"
+      },
+      {
+        "Name": "no_watermark",
+        "File": "expressions/no_watermark.exp3.json"
+      }
+    ]
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "ParamEyeLOpen",
+        "ParamEyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": []
+    }
+  ]
+}
