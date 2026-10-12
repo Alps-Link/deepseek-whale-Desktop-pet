@@ -1,13 +1,18 @@
 """
 Live2D 离屏渲染
 """
-import os, time, json, math, threading, sys, random, gc
+import os, time, json, math, threading, sys, random, gc, logging
 import numpy as np
 from PIL import Image
 import pygame
 from pygame.locals import *
 from OpenGL.GL import *
 import live2d.v3 as live2d
+
+# 渲染线程的异常走标准日志：Dafeiyu.py 里 basicConfig 配的是根 logger，
+# 所以这里的记录会一并落进 userdata/dafeiyu.log（打包版没有控制台，print 等于扔掉）
+log = logging.getLogger("live2d_renderer")
+
 
 def _get_base_dir():
     try:
@@ -343,6 +348,42 @@ def _face_param_ids(param_ids, mouth_param):
             and p != mouth_param]
 
 
+def _missing_model_file(model_dir, json_name):
+    """装载前的存在性预检：返回第一个缺失/读不了的文件（全都在就返回 None）。
+
+    为什么必须做：live2d 的原生 `LAppModel.LoadModelJson()` 碰到缺文件**不是抛 Python 异常**，
+    而是直接访问违例（0xC0000005）把整个桌宠进程带崩 —— faulthandler 栈停在
+    `lapp_model.py LoadModelJson`，`try/except` 根本接不住。所以在调用它之前先把
+    "素材不在/读不了"翻译成普通异常，交给上层回滚。
+    只查存在性与可读性，不做完整性校验（贴图截断这类拦不住）。
+    """
+    path = os.path.join(model_dir, json_name)
+    if not os.path.isfile(path):
+        return path
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            md = json.load(fh)
+    except Exception as e:
+        return "%s（读不了：%s）" % (path, e)
+    refs = md.get("FileReferences", {}) or {}
+    want = []
+    if refs.get("Moc"):
+        want.append(refs["Moc"])
+    want += list(refs.get("Textures") or [])
+    for _motions in (refs.get("Motions") or {}).values():
+        for _it in (_motions or []):
+            if _it.get("File"):
+                want.append(_it["File"])
+    for _ex in (refs.get("Expressions") or []):
+        if _ex.get("File"):
+            want.append(_ex["File"])
+    for rel in want:
+        p = os.path.join(model_dir, rel)
+        if not os.path.isfile(p):
+            return p
+    return None
+
+
 class Live2DRenderer:
     def __init__(self, tk_root, form=DEFAULT_FORM):
         self.form = form if form in FORMS else DEFAULT_FORM
@@ -353,7 +394,12 @@ class Live2DRenderer:
         self._frame = None
         self._frame_lock = threading.Lock()
         self._on_frame = None
-        self._exited = threading.Event()   # 渲染线程真的退出（GL 上下文释放完）时置位
+        self._exited = threading.Event()
+        # 换形象的异步回执（10/12）：装载完某形态就写在 form_loaded；
+        # 崩了就把原因留在 crash_note/crash_form —— 主线程据此决定"落盘+报成功"还是"回滚+提示"
+        self.form_loaded = None
+        self.crash_note = None
+        self.crash_form = None   # 渲染线程真的退出（GL 上下文释放完）时置位
         self.face_row = None      # 注视基准行（渲染线程按当前构图更新，主线程读）
 
     def enqueue(self, cmd):
@@ -474,6 +520,10 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
 
     except Exception as e:
         import traceback
+        _tb = traceback.format_exc()
+        bridge.crash_note = "%s: %s" % (type(e).__name__, e)   # 留给主线程：据此回滚 + 提示
+        bridge.crash_form = form_key
+        log.error("[Live2D] 渲染线程异常退出（正在装载 %s）：%s\n%s", form_key, e, _tb)
         print(f'[Live2D] CRASH: {e}')
         traceback.print_exc()
     finally:
@@ -510,6 +560,10 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
     emo_pools = FORM.get('emotion_pools') or EMOTION_POOLS
     eye_owning = set(FORM.get('eye_owning') or EYE_OWNING_EXPRESSIONS)
     sleep_expr = FORM.get('sleep_expr', 'drool')
+    # 先预检：缺文件的话原生装载会把进程带崩（见 _missing_model_file 的说明）
+    _miss = _missing_model_file(model_dir, FORM['json'])
+    if _miss:
+        raise FileNotFoundError("形象素材缺失，装载中止：%s" % _miss)
     model = live2d.LAppModel()
     model.LoadModelJson(os.path.join(model_dir, FORM['json']))
 
@@ -683,6 +737,8 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
         # 没有入场动作：给一小段"站定"时间就走同一套回归流程（收脸 + 进待机状态）
         first_impression_end = time.time() + 1.2
 
+    # 装载到位了（模型 + 参数表 + 构图 + 入场都就绪）才对外承认 —— 主线程看到它才落盘、才报成功
+    bridge.form_loaded = form_key
     next_form = None      # 被要求换形态时记在这里；外层据此重进 _render_form
     try:
         while bridge._ready:

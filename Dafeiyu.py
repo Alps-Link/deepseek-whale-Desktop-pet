@@ -3076,6 +3076,7 @@ class DesktopPet:
         self.action_timer_job = None   # 下一次自发做动作的定时器
         self.costume_choice = load_costume_config()   # 装扮（持久化，见 load_costume_config）
         self._costume_applied = False  # 渲染器就绪后把存档的装扮穿回去（只做一次）
+        self._form_pending = None      # 换形象待确认：(目标, 上一个, 起算时刻, 显示名)；见 _check_form_swap
         self.form = load_form_config()  # 形象（多形态）：换一整套 Live2D，见 set_form
         self._costume_buttons = {}     # {(槽位, 装扮名): 按钮}，用于刷新选中高亮
         topic_cfg = load_topic_config()
@@ -4344,6 +4345,46 @@ class DesktopPet:
             self.spine = None
             self.spine_enabled = False
 
+    def _check_form_swap(self):
+        """换形象的异步核对（10/12）。
+
+        渲染线程装载完会在 spine.form_loaded 写下形态名 ⇒ 这时才落盘、才报"已换成"；
+        如果它崩了（crash_note 有值 / is_ready() 变 False）或等太久，就把"账"回滚：
+        self.form 退回上一个、配置不写成坏形态、菜单勾回去，并提示"再选一次形象"。
+        画面上她仍停在旧形态的最后一帧 —— 再选任意形态会走回退路径重建渲染器救回来。
+        """
+        pend = getattr(self, '_form_pending', None)
+        if not pend:
+            return
+        key, prev, t0, label = pend
+        spine = self.spine
+        if spine is not None and getattr(spine, 'form_loaded', None) == key:
+            self._form_pending = None
+            try:
+                save_form_config(key)             # 确认装载成功了才落盘
+            except Exception as e:
+                log.warning("保存形象设置失败: %s", e)
+            self._refresh_form_menu()
+            self.show_bubble_text(f"(normal) 形象已换成{label}", "normal", status=True)
+            log.info("形象已切换为 %s", label)
+            return
+        dead = (spine is None) or (not self.spine_enabled) or (not spine.is_ready())
+        overtime = (time.time() - t0) > 20.0      # 装载再慢也不该超过 20 秒
+        if not dead and not overtime:
+            return                                 # 还在装，接着等
+        self._form_pending = None
+        why = getattr(spine, 'crash_note', None) if spine is not None else None
+        log.error("换形象没成功（%s）：目标=%s 回滚=%s%s", "渲染线程崩了" if dead else "超时",
+                  key, prev, ("；原因=" + str(why)) if why else "")
+        self.form = prev                           # 账回滚：菜单能再点、重启也不会进坏状态
+        try:
+            save_form_config(prev)
+        except Exception:
+            pass
+        self._refresh_form_menu()
+        self.show_bubble_text("(worried) 形象没换成，渲染卡住了……再选一次形象试试，还不行就重启桌宠",
+                              "worried", status=True)
+
     def _on_renderer_frame(self, src_w_full, src_h_full, rgba_bytes):
         if not self._costume_applied and self.spine is not None and self.spine.is_ready():
             try:
@@ -4384,6 +4425,7 @@ class DesktopPet:
     def _spine_render_loop(self):
         """主线程：消费 layered 事件 + 尺寸变更时重建 layered。
         像素更新已搬到 renderer 线程的 _on_renderer_frame。"""
+        self._check_form_swap()          # 换形象是异步的：在这一 tick 里核对"究竟换成了没"
         if not self.spine_enabled or not self.spine:
             return
         disp_w = self.char_size
@@ -4492,13 +4534,9 @@ class DesktopPet:
                 log.error("切换形象失败: %s", e)
                 self.form = prev
                 return
-            try:
-                save_form_config(key)
-            except Exception as e:
-                log.warning("保存形象设置失败: %s", e)
-            self._refresh_form_menu()
-            self.show_bubble_text(f"(normal) 形象已换成{label}", "normal", status=True)
-            log.info("形象已切换为 %s（渲染线程内换模型）", label)
+            # 换模型是异步的：先记下"在等确认"，等渲染线程报回装载成功才落盘、才报成功（10/12）
+            self._form_pending = (key, prev, time.time(), label)
+            self.show_bubble_text("(normal) 正在换形象……", "normal", status=True)
             return
 
         # 回退路径：渲染器还没起（或已经挂了）→ 老办法，重建；等不到旧线程退出就停住别硬撑
@@ -4518,13 +4556,9 @@ class DesktopPet:
             self._start_spine()
         except Exception as e:
             log.error("切换形象失败: %s", e)
-        try:
-            save_form_config(key)                 # 确认换成了才落盘
-        except Exception as e:
-            log.warning("保存形象设置失败: %s", e)
-        self._refresh_form_menu()
-        self.show_bubble_text(f"(normal) 形象已换成{label}", "normal", status=True)
-        log.info("形象已切换为 %s", label)
+        # 重建同样是异步装载：一样等渲染线程报回成功再落盘/报成功
+        self._form_pending = (key, prev, time.time(), label)
+        self.show_bubble_text("(normal) 正在换形象……", "normal", status=True)
 
     def _stop_spine(self, wait=5.0):
         """停渲染线程。返回 True = 线程确认退出（可以安全建新的）；False = 没退出（此时**不要**建新的）。
