@@ -395,6 +395,14 @@ class Live2DRenderer:
         """显示尺寸：渲染区域按它 ×（聚焦缩放）推算，读回裁剪后仍是它 —— 放大也 1:1"""
         self.enqueue(('size', int(w), int(h)))
 
+    def set_form(self, key):
+        """换形态：交给渲染线程在**同一个 GL 上下文里**换模型（不重建线程/上下文/分层窗口）。
+
+        10/12 加。旧做法要停线程、等它退出再重建上下文，而它偶尔卡在驱动里（停在 model.Draw），
+        等不到就会建出第二个 GL 上下文 —— 轻则窗口消失、重则崩在 nvoglv64.dll。
+        """
+        self.enqueue(('form', key))
+
     def begin_click(self):
         self.enqueue(('click',))
 
@@ -420,14 +428,15 @@ class Live2DRenderer:
 
 
 def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
-    FORM = FORMS.get(form_key) or FORMS[DEFAULT_FORM]
-    model_dir = os.path.join(MODEL_ROOT, FORM['dir'])
-    ALIASES = FORM.get('aliases') or {}
-    always_on = dict(DEFAULT_OFF_PARAMS)
-    always_on.update(FORM.get('always_on') or {})
-    emo_pools = FORM.get('emotion_pools') or EMOTION_POOLS
-    eye_owning = set(FORM.get('eye_owning') or EYE_OWNING_EXPRESSIONS)
-    sleep_expr = FORM.get('sleep_expr', 'drool')
+    """渲染线程入口：**上下文只建一次**（display + live2d init + FBO），
+    之后在同一条线程、同一个 GL 上下文里反复调 `_render_form` 装载形态。
+
+    10/12 改：换形象不再"销毁线程 + 重建上下文"。旧做法要先等旧线程退出再建新的，
+    而它偶尔卡在显卡驱动里（faulthandler 抓到停在 `lapp_model.py Draw`），等不到就会
+    建出第二个 GL 上下文 —— 轻则窗口消失、重则崩在 nvoglv64.dll。现在换形态只是
+    在同一上下文里换模型，主线程也不再拆分层窗口，从根上消掉这条路径。
+    """
+
     os.environ['SDL_VIDEO_WINDOW_POS'] = '-9999,-9999'
     # 只初始化 display：pygame.init()/quit() 是**全库级**的，会顺手把主线程正在用的
     # pygame.mixer（音乐播放和 TTS 都走它）一起初始化/销毁 —— 换形象时音乐就哑了
@@ -436,6 +445,71 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
 
     live2d.init()
     live2d.glInit()
+    fbo = glGenFramebuffers(1); tex = glGenTextures(1)
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0)
+    # Live2D 的遮罩(clipping mask)依赖模板缓冲：离屏 FBO 必须挂 depth-stencil，
+    # 否则被遮罩裁掉的部分（描边/阴影网格）会露出来，放大后尤其明显
+    rbo = glGenRenderbuffers(1)
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo)
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height)
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+    glClearStencil(0)
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, width, height, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+    clock = pygame.time.Clock()
+    try:
+        while bridge._ready:
+            _next = _render_form(bridge, width, height, fbo, clock, form_key)
+            if not _next:
+                break                      # None = 该退出了（quit 命令或线程被叫停）
+            form_key = _next
+
+    except Exception as e:
+        import traceback
+        print(f'[Live2D] CRASH: {e}')
+        traceback.print_exc()
+    finally:
+        # 【收尾顺序是关键】所有 native 资源都必须在"GL 上下文还活着 + 还在这个线程里"
+        # 的时候释放掉，上下文最后才销毁。否则这些东西会被 Python 的 GC 拖到进程退出时
+        # 才析构，那时上下文早没了 —— 析构里的 GL 调用直接变成访问冲突：
+        # 用户日志里退出时崩在 nvoglv64.dll（0xc0000005）就是这么来的。
+        # 实测：这一步之前"启动→退出"必崩（3/3），按这个顺序放干净后不再崩。
+        glDeleteFramebuffers(1, [fbo]); glDeleteTextures([tex]); glDeleteRenderbuffers(1, [rbo])
+        glFinish()                       # 等 GPU 队列排空再拆上下文
+        live2d.glRelease()
+        try:
+            live2d.dispose()             # Cubism 框架 + native 模型对象
+        except Exception:
+            pass
+        gc.collect()                     # 当场回收，别留给进程退出时的最后一次 GC
+        pygame.display.quit()            # 上下文最后销毁；只关 display，不动主线程的 mixer
+        bridge._ready = False            # 线程没了就别再往里推命令
+        bridge._exited.set()             # 告诉主线程：上下文释放完了，可以安全建新的
+
+
+
+def _render_form(bridge, width, height, fbo, clock, form_key):
+    """装载一个形态并跑它的帧循环。返回下一个形态 key（换形态）或 None（退出）。
+
+    所有"形态相关"的东西都在这里建立：模型本体、参数表、构图、表情/动作/装扮/触摸的
+    状态机、入场时序。所以换形态 = 重进本函数，而 GL 上下文与 FBO 一点没动。
+    """
+    FORM = FORMS.get(form_key) or FORMS[DEFAULT_FORM]
+    model_dir = os.path.join(MODEL_ROOT, FORM['dir'])
+    ALIASES = FORM.get('aliases') or {}
+    always_on = dict(DEFAULT_OFF_PARAMS)
+    always_on.update(FORM.get('always_on') or {})
+    emo_pools = FORM.get('emotion_pools') or EMOTION_POOLS
+    eye_owning = set(FORM.get('eye_owning') or EYE_OWNING_EXPRESSIONS)
+    sleep_expr = FORM.get('sleep_expr', 'drool')
     model = live2d.LAppModel()
     model.LoadModelJson(os.path.join(model_dir, FORM['json']))
 
@@ -473,26 +547,6 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
 
     MOUTH_PARAM = next((p for p in ('ParamMouthOpenY', 'ParamParmOpenY') if p in _param_ids), None)
 
-    fbo = glGenFramebuffers(1); tex = glGenTextures(1)
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo)
-    glBindTexture(GL_TEXTURE_2D, tex)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0)
-    # Live2D 的遮罩(clipping mask)依赖模板缓冲：离屏 FBO 必须挂 depth-stencil，
-    # 否则被遮罩裁掉的部分（描边/阴影网格）会露出来，放大后尤其明显
-    rbo = glGenRenderbuffers(1)
-    glBindRenderbuffer(GL_RENDERBUFFER, rbo)
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height)
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo)
-    glBindFramebuffer(GL_FRAMEBUFFER, 0)
-
-    glClearStencil(0)
-    glViewport(0, 0, width, height)
-    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, width, height, 0, -1, 1)
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-    clock = pygame.time.Clock()
     cmd_idx = 0; mouse_x, mouse_y = 0.0, 0.0
     disp_w, disp_h = width, height   # 显示尺寸（主线程推送）
     act_w, act_h = width, height     # 活动渲染区域（FBO 分配尺寸为上限）
@@ -629,6 +683,7 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
         # 没有入场动作：给一小段"站定"时间就走同一套回归流程（收脸 + 进待机状态）
         first_impression_end = time.time() + 1.2
 
+    next_form = None      # 被要求换形态时记在这里；外层据此重进 _render_form
     try:
         while bridge._ready:
             clock.tick(60)
@@ -636,6 +691,10 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
             while cmd_idx < len(bridge._cmd_q):
                 cmd = bridge._cmd_q[cmd_idx]; cmd_idx += 1
                 if cmd[0] == 'quit': bridge._ready = False; break
+                elif cmd[0] == 'form':
+                    # 换形态：**不重建线程/上下文**，记下目标后跳出帧循环，回外层重新装载模型
+                    next_form = cmd[1]
+                    break
                 elif cmd[0] == 'emotion':
                     # 这只模型的表情是 .exp3.json（原生表达式，Add 混合，Update 时叠加一层）
                     # → 不再走"Scene 动作参数插值"，直接 SetExpression；不需要动用参数过渡
@@ -868,6 +927,8 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
             with bridge._q_lock:
                 bridge._cmd_q = bridge._cmd_q[cmd_idx:]
                 cmd_idx = 0
+            if next_form is not None:
+                break                      # 换形态：交给外层重进 _render_form
 
             for event in pygame.event.get(): pass
 
@@ -1038,29 +1099,11 @@ def _render_offscreen(bridge, width, height, form_key=DEFAULT_FORM):
                 except Exception: pass
             glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
-    except Exception as e:
-        import traceback
-        print(f'[Live2D] CRASH: {e}')
-        traceback.print_exc()
     finally:
-        # 【收尾顺序是关键】所有 native 资源都必须在"GL 上下文还活着 + 还在这个线程里"
-        # 的时候释放掉，上下文最后才销毁。否则这些东西会被 Python 的 GC 拖到进程退出时
-        # 才析构，那时上下文早没了 —— 析构里的 GL 调用直接变成访问冲突：
-        # 用户日志里退出时崩在 nvoglv64.dll（0xc0000005）就是这么来的。
-        # 实测：这一步之前"启动→退出"必崩（3/3），按这个顺序放干净后不再崩。
+        # 模型自己的 native 资源必须趁上下文还活着、还在本线程时释放（否则会被 GC 拖到
+        # 进程退出时才析构，那时上下文早没了 → 析构里的 GL 调用直接访问冲突）
         try:
-            model.DestroyRenderer()      # 模型自己的贴图/VBO/遮罩缓冲
+            model.DestroyRenderer()
         except Exception:
             pass
-        glDeleteFramebuffers(1, [fbo]); glDeleteTextures([tex]); glDeleteRenderbuffers(1, [rbo])
-        glFinish()                       # 等 GPU 队列排空再拆上下文
-        live2d.glRelease()
-        try:
-            live2d.dispose()             # Cubism 框架 + native 模型对象
-        except Exception:
-            pass
-        model = None
-        gc.collect()                     # 当场回收，别留给进程退出时的最后一次 GC
-        pygame.display.quit()            # 上下文最后销毁；只关 display，不动主线程的 mixer
-        bridge._ready = False            # 线程没了就别再往里推命令
-        bridge._exited.set()             # 告诉主线程：上下文释放完了，可以安全建新的
+    return next_form

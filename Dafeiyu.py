@@ -19,6 +19,10 @@ import tempfile
 import shutil
 import ctypes
 from ctypes import wintypes
+try:
+    import winreg          # 读系统代理（Edge TTS 用，见 resolve_edge_proxy）
+except ImportError:
+    winreg = None
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, font as tkfont
 from PIL import Image, ImageTk
@@ -525,6 +529,66 @@ def edge_voice_valid(lang, voice):
     return any(v == voice for _, v in EDGE_VOICE_TABLE.get(lang, []))
 
 
+# ------------------------------- Edge 走不走代理 ---------------------------------
+# 起因（10/12）：微软的朗读接口会按来源 IP 拒掉部分直连——WebSocket 握手回 403
+# "Invalid response status"，而 HTTPS 的 voices/list 仍返回 200，走本机代理就能通。
+# 默认 auto = 跟随 Windows 系统代理（代理端口换了也不用改配置）；off = 强制直连。
+EDGE_PROXY_AUTO = "auto"
+EDGE_PROXY_OFF = ("off", "none", "direct", "false", "0")
+
+
+def _system_proxy_url():
+    """读 Windows 系统代理，返回 aiohttp 能用的地址；没开或读不到返回 None"""
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            if not winreg.QueryValueEx(key, "ProxyEnable")[0]:
+                return None
+            server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "").strip()
+    except OSError:
+        return None
+    if not server:
+        return None
+    if "=" in server:                      # 分协议写法：http=host:port;https=host:port
+        parts = {}
+        for item in server.split(";"):
+            name, _, value = item.partition("=")
+            parts[name.strip().lower()] = value.strip()
+        server = parts.get("https") or parts.get("http") or ""
+        if not server:                     # 只配了 socks 之类：宁可不走，也别把 TTS 弄坏
+            return None
+    return server if "://" in server else "http://" + server
+
+
+def resolve_edge_proxy(val=None):
+    """把 tts.edge_proxy 解析成实际代理地址：空/auto=跟随系统代理，off=直连，其它=显式地址"""
+    v = str(val if val is not None else "").strip()
+    if not v or v.lower() == EDGE_PROXY_AUTO:
+        return _system_proxy_url()
+    if v.lower() in EDGE_PROXY_OFF:
+        return None
+    return v if "://" in v else "http://" + v
+
+
+# ------------------------- 火山火山区走哪个集群 -------------------------
+# 10/12：cluster 原来写死 volcano_icl（声音复刻），用户填的却是大模型预置音色
+# `zh_female_vv_uranus_bigtts` ⇒ 服务端回 400 / code 3001 "model invalid key"。
+# 判据：复刻音色 ID 形如 `S_xxxx`（走 volcano_icl），其余预置音色走 volcano_tts。
+VOLC_CLUSTER_ICL = "volcano_icl"
+VOLC_CLUSTER_TTS = "volcano_tts"
+VOLC_CLUSTER_LABELS = {VOLC_CLUSTER_ICL: "声音复刻", VOLC_CLUSTER_TTS: "大模型语音"}
+
+
+def resolve_volc_cluster(speaker_id, configured=None):
+    """按音色 ID 判集群；tts.volc_cluster 填了非 auto 的值就以它为准"""
+    v = str(configured if configured is not None else "").strip()
+    if v and v.lower() != "auto":
+        return v
+    return VOLC_CLUSTER_ICL if str(speaker_id or "").strip()[:2].upper() == "S_" else VOLC_CLUSTER_TTS
+
+
 def load_tts_config():
     """加载 TTS 状态（开关/模式/语言/音色），避免每次启动重新设置"""
     data = _get_section("tts")
@@ -541,6 +605,8 @@ def load_tts_config():
     edge_voice = str(data.get("edge_voice", "") or "")
     if not edge_voice_valid(edge_lang, edge_voice):
         edge_voice = EDGE_VOICE_DEFAULT.get(edge_lang) or EDGE_VOICE_TABLE[edge_lang][0][1]
+    edge_proxy = str(data.get("edge_proxy", "") or "").strip() or EDGE_PROXY_AUTO
+    volc_cluster = str(data.get("volc_cluster", "") or "").strip() or "auto"
     return {
         "enabled": bool(data.get("enabled", False)),
         "mode": mode,
@@ -548,10 +614,13 @@ def load_tts_config():
         "volc_lang": volc_lang,
         "edge_lang": edge_lang,
         "edge_voice": edge_voice,
+        "edge_proxy": edge_proxy,
+        "volc_cluster": volc_cluster,
     }
 
 def save_tts_config(enabled=None, mode=None, japanese=None,
-                    volc_lang=None, edge_lang=None, edge_voice=None):
+                    volc_lang=None, edge_lang=None, edge_voice=None,
+                    edge_proxy=None, volc_cluster=None):
     """只写传入的字段，其余保持原值（同节的 api_key / speaker_id 一律保留）"""
     sec = _get_section("tts")
     if enabled is not None:
@@ -566,6 +635,10 @@ def save_tts_config(enabled=None, mode=None, japanese=None,
         sec["edge_lang"] = edge_lang
     if edge_voice is not None:
         sec["edge_voice"] = edge_voice
+    if edge_proxy is not None:
+        sec["edge_proxy"] = str(edge_proxy).strip() or EDGE_PROXY_AUTO
+    if volc_cluster is not None:
+        sec["volc_cluster"] = str(volc_cluster).strip() or "auto"
     sec["japanese"] = (sec.get("volc_lang") == "ja")  # 旧键跟着走，别的版本读它也不会错
     _update_section("tts", sec)
 
@@ -2921,6 +2994,8 @@ class DesktopPet:
         self.tts_volc_lang = tts_cfg["volc_lang"]      # 火山区语言：zh/en/ja
         self.tts_edge_lang = tts_cfg["edge_lang"]      # Edge 区语言：zh/en
         self.tts_edge_voice = tts_cfg["edge_voice"]    # Edge 音色（ShortName）
+        self.tts_edge_proxy = tts_cfg["edge_proxy"]    # Edge 代理：auto=跟随系统代理 / off=直连 / 显式地址
+        self.tts_volc_cluster = tts_cfg["volc_cluster"]  # 火山集群：auto=按音色 ID 判 / 显式覆盖
         self.tts_api_key = load_tts_api_key() or os.environ.get("VOLC_TTS_API_KEY", "")
         self.tts_speaker_id = load_tts_speaker_id() or os.environ.get("VOLC_TTS_SPEAKER_ID", "")
         self.tts_mode = tts_cfg["mode"]  # "volc" 或 "edge"
@@ -3677,9 +3752,11 @@ class DesktopPet:
     def show_greeting(self):
         greetings = [
             "你来啦，我刚从深海游上来。",
-            "你今天……煮白饭了吗？",
+            "大白饭！先给我大白饭！",
             "刚睡醒，尾巴还有点沉。",
-            "冰箱里还有饭吗？",
+            "冰箱里的饭你应该不吃了吧。",
+            "deep...deep...",
+            "seek...seek...",
         ]
         msg = random.choice(greetings)
         self.show_bubble_text(msg, "normal")
@@ -4391,16 +4468,41 @@ class DesktopPet:
                 pass
 
     def set_form(self, key):
-        """切换形象：换一整套 Live2D（渲染器按新形态整个重建），成功后才落盘到 config.json 的 form 节"""
+        """切换形象。
+
+        10/12 改：正常路径走"**渲染线程内换模型**" —— 不销毁渲染线程、不重建 GL 上下文、
+        也不拆分层窗口。旧做法（停线程 → 等它退出 → 重建上下文）偶尔会卡在显卡驱动里
+        （faulthandler 抓到停在 `lapp_model.py Draw`），等不到就只能放弃这次切换；而且那整套
+        "上下文 churn" 本身就是退出/换形象崩溃的触发源。现在换形态只是同一个上下文里换个模型，
+        下面那段"等不到就停住"的回退只在渲染器还没起来时才会走到。
+        """
         if key not in LIVE2D_FORM_ORDER or key == getattr(self, 'form', None):
             return
         label = LIVE2D_FORMS.get(key, {}).get('label', key)
         prev = getattr(self, 'form', None)
-        self.form = key
-        # 换模型 = 换一整套参数/表情/构图，只好把渲染线程整个重建；但**必须先确认旧线程真的退出了**。
-        # 10/11 实测它会偶尔卡在驱动里出不来（faulthandler 抓到它停在 model.Draw()），
-        # 那种情况下再建一个新的 GL 上下文，轻则窗口消失、重则进程崩在 nvoglv64.dll。
-        # 所以：等不到就**停在这儿**——保留当前窗口和最后一帧，报个信，让他重启，别硬撑。
+
+        # 正常路径：渲染器活着 → 线程内换模型（主线程不碰窗口、不碰上下文）
+        if self.spine is not None and self.spine_enabled and self.spine.is_ready():
+            self.form = key
+            self._costume_applied = False   # 新形态的装扮要重新穿一遍（_on_renderer_frame 里做）
+            self._pushed_size = None        # 让 _spine_render_loop 重新推一次显示尺寸
+            try:
+                self.spine.set_form(key)
+            except Exception as e:
+                log.error("切换形象失败: %s", e)
+                self.form = prev
+                return
+            try:
+                save_form_config(key)
+            except Exception as e:
+                log.warning("保存形象设置失败: %s", e)
+            self._refresh_form_menu()
+            self.show_bubble_text(f"(normal) 形象已换成{label}", "normal", status=True)
+            log.info("形象已切换为 %s（渲染线程内换模型）", label)
+            return
+
+        # 回退路径：渲染器还没起（或已经挂了）→ 老办法，重建；等不到旧线程退出就停住别硬撑
+        self.form = key                           # _start_spine 按 self.form 建，这里必须先改过来
         try:
             if not self._stop_spine(wait=8.0):
                 log.error("切换形象失败：旧渲染线程 8 秒内没退出（多半卡在显卡驱动里），未创建新上下文")
@@ -4951,7 +5053,9 @@ class DesktopPet:
             else:
                 log.warning("TTS 翻译失败（%s），改用中文原文朗读",
                             TTS_LANG_NAMES.get(lang, lang))
-        log.info("TTS 声音复刻(%s): %s", TTS_LANG_NAMES.get(lang, lang), tts_text)
+        cluster = resolve_volc_cluster(speaker_id, self.tts_volc_cluster)
+        log.info("TTS %s(%s): %s", VOLC_CLUSTER_LABELS.get(cluster, cluster),
+                 TTS_LANG_NAMES.get(lang, lang), tts_text)
 
         def _play():
             # 串行化 TTS 播放：避免多线程同时写同名文件 / 共用 pygame.mixer
@@ -4962,7 +5066,7 @@ class DesktopPet:
             try:
                 payload = {
                     "app": {
-                        "cluster": "volcano_icl"
+                        "cluster": cluster
                     },
                     "user": {
                         "uid": VOLC_TTS_UID
@@ -5059,7 +5163,9 @@ class DesktopPet:
             else:
                 voice = DEFAULT_EDGE_VOICE
                 log.warning("TTS 翻译失败（英文），改用中文音色朗读原文")
-        log.info("Edge TTS(%s/%s): %s", TTS_LANG_NAMES.get(lang, lang), voice, tts_text)
+        proxy = resolve_edge_proxy(self.tts_edge_proxy)
+        log.info("Edge TTS(%s/%s%s): %s", TTS_LANG_NAMES.get(lang, lang), voice,
+                 "·代理" if proxy else "", tts_text)
 
         def _play_edge():
             if not self._tts_lock.acquire(timeout=1):
@@ -5067,7 +5173,7 @@ class DesktopPet:
                 return
             temp_file = None
             try:
-                comm = edge_tts.Communicate(tts_text, voice)
+                comm = edge_tts.Communicate(tts_text, voice, proxy=proxy)
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as _tf:
                     temp_file = _tf.name
                 asyncio.run(comm.save(temp_file))
@@ -8210,13 +8316,15 @@ OCR文字：
                         return
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
                         temp_file = tf.name
-                    asyncio.run(edge_tts.Communicate(text, voice or DEFAULT_EDGE_VOICE).save(temp_file))
+                    asyncio.run(edge_tts.Communicate(
+                        text, voice or DEFAULT_EDGE_VOICE,
+                        proxy=resolve_edge_proxy(self.tts_edge_proxy)).save(temp_file))
                 else:
                     if not api_key or not speaker_id:
                         log.warning("试听失败：声音复刻的 API Key / Speaker ID 未配置")
                         return
                     payload = {
-                        "app": {"cluster": "volcano_icl"},
+                        "app": {"cluster": resolve_volc_cluster(speaker_id, self.tts_volc_cluster)},
                         "user": {"uid": VOLC_TTS_UID},
                         "audio": {"voice_type": speaker_id, "encoding": "mp3", "speed_ratio": 1.0},
                         "request": {"reqid": str(uuid.uuid4()).replace("-", "")[:40],
@@ -8226,10 +8334,14 @@ OCR文字：
                                          headers={"x-api-key": api_key,
                                                   "Content-Type": "application/json"},
                                          json=payload, timeout=30)
-                    data = resp.json() if resp.status_code == 200 else {}
-                    if data.get("code") != 3000 or not data.get("data"):
-                        log.error("试听失败: http=%s code=%s msg=%s", resp.status_code,
-                                  data.get("code"), str(data.get("message"))[:80])
+                    try:
+                        data = resp.json()
+                    except ValueError:          # 非 JSON（比如网关直接回 400）时别把正文丢了
+                        data = {}
+                    if resp.status_code != 200 or data.get("code") != 3000 or not data.get("data"):
+                        log.error("试听失败: http=%s code=%s msg=%s body=%s", resp.status_code,
+                                  data.get("code"), data.get("message"),
+                                  (resp.text or "")[:200].replace("\n", " "))
                         return
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
                         tf.write(base64.b64decode(data["data"]))
