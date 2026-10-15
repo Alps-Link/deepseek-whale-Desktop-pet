@@ -5164,18 +5164,27 @@ class DesktopPet:
             except Exception as e:
                 log.error(f"TTS 播放错误: {e}")
             finally:
-                if self.stt is not None and self.voice_on:
-                    self.stt.set_muted(False)
-                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
-                if refresh_voice:
-                    self._on_output_finished(True, from_tts=True)
-                if temp_file and os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except Exception:
-                        pass
-                self._tts_lock.release()
-                self._start_pending_music()  # TTS 说完：启动挂起的音乐（若有）
+                # 【锁必须一定放掉】10/14 定位到的"TTS 哑掉、只能重启"就是这里漏的：
+                # 原来 release() 排在收尾最后，前面 set_muted(False) 任何一步抛异常都会连它
+                # 一起跳过 ⇒ 之后每条 TTS 都被"上一条语音仍在播放"挡在门外，直到重启。
+                # 现在收尾整段包进 try、release 放内层 finally —— 以后谁再往收尾里加东西，
+                # 也炸不掉这把锁。执行顺序与原来完全一致。
+                try:
+                    if self.stt is not None and self.voice_on:
+                        self.stt.set_muted(False)
+                    # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
+                    if refresh_voice:
+                        self._on_output_finished(True, from_tts=True)
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.warning("TTS 收尾出错（锁照常释放）: %s", e)
+                finally:
+                    self._tts_lock.release()
+                    self._start_pending_music()  # TTS 说完：启动挂起的音乐（若有）
 
         threading.Thread(target=_play, daemon=True).start()
 
@@ -5226,16 +5235,21 @@ class DesktopPet:
             except Exception as e:
                 log.error(f"Edge TTS 播放错误: {e}")
             finally:
-                if self.stt is not None and self.voice_on:
-                    self.stt.set_muted(False)
-                # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
-                if refresh_voice:
-                    self._on_output_finished(True, from_tts=True)
-                if temp_file and os.path.exists(temp_file):
-                    try: os.remove(temp_file)
-                    except Exception: pass
-                self._tts_lock.release()
-                self._start_pending_music()  # TTS 说完：启动挂起的音乐（若有）
+                # 【锁必须一定放掉】见 _tts_play 里同款注释：哑掉的根因就是 release 排在收尾最后。
+                try:
+                    if self.stt is not None and self.voice_on:
+                        self.stt.set_muted(False)
+                    # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
+                    if refresh_voice:
+                        self._on_output_finished(True, from_tts=True)
+                    if temp_file and os.path.exists(temp_file):
+                        try: os.remove(temp_file)
+                        except Exception: pass
+                except Exception as e:
+                    log.warning("Edge TTS 收尾出错（锁照常释放）: %s", e)
+                finally:
+                    self._tts_lock.release()
+                    self._start_pending_music()  # TTS 说完：启动挂起的音乐（若有）
 
         threading.Thread(target=_play_edge, daemon=True).start()
 
@@ -8393,14 +8407,19 @@ OCR文字：
             except Exception as e:
                 log.error("试听出错: %s", e)
             finally:
-                if self.stt is not None and self.voice_on:
-                    self.stt.set_muted(False)
-                if temp_file and os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except Exception:
-                        pass
-                self._tts_lock.release()
+                # 【锁必须一定放掉】见 _tts_play 里同款注释
+                try:
+                    if self.stt is not None and self.voice_on:
+                        self.stt.set_muted(False)
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.warning("试听收尾出错（锁照常释放）: %s", e)
+                finally:
+                    self._tts_lock.release()
 
         threading.Thread(target=_run, daemon=True).start()
 

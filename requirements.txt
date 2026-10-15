@@ -20,5 +20,5 @@ PyAudio==0.2.14               # 语音输入
 onnxruntime==1.23.2           # silero VAD + sherpa 后端
 mss==10.2.0                   # 陪玩（截屏）
 easyocr==1.7.2                # 读书 OCR（体积最大，连带 torch）
-edge-tts==7.2.8               # Edge TTS 音色
+edge-tts==7.3.1               # Edge TTS 音色
 sentence-transformers==6.0.0  # 记忆向量召回，缺了回退旧排序
