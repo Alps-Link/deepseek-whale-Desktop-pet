@@ -946,8 +946,8 @@ MAX_HISTORY_TURNS = 15
 # 精力值系统
 MAX_ENERGY = 100
 ENERGY_DECAY_PER_MINUTE = 0.5       # 清醒时每分钟自然消耗
-ENERGY_ACTIVE_COST = 2              # 每次主动交互（聊天/选项点击）额外消耗
-ENERGY_RECOVER_PER_MINUTE = 6       # 睡眠时每分钟恢复
+ENERGY_ACTIVE_COST = 1              # 每次主动交互（聊天/选项点击）额外消耗（10/16: 2→1）
+ENERGY_RECOVER_PER_MINUTE = 10      # 睡眠时每分钟恢复（10/16: 6→10，10 分钟睡满）
 ENERGY_LOW = 30                     # 低于此值开始显疲态
 ENERGY_CRITICAL = 10                # 低于此值有气无力
 # 记忆系统常量
@@ -3106,6 +3106,7 @@ class DesktopPet:
 
         # 精力值系统
         self.energy = MAX_ENERGY
+        self._energy_warned = set()   # 已提醒过的精力档位（"low"/"zero"）：同一档只提醒一次
         self.energy_last_tick = time.time()
 
         # 记忆锚点（新格式：topics + events + profile）
@@ -4711,6 +4712,11 @@ class DesktopPet:
         msg = self.input_entry.get().strip()
         if not msg:
             return
+        if self.sleep_mode:
+            # 睡着时打字不唤醒她、不进模型、不出声，只提示一句
+            self._show_sleep_hint()
+            self.input_entry.delete(0, tk.END)
+            return
         # 10/15：这里原来调 _stop_music_for_chat()（一对话就把音乐彻底停掉、之后不再续播）。
         # 现在她说话时只把音乐音量压低当背景音（见 _music_duck_for_tts），所以聊天也不停音乐了。
         self.last_interaction_time = time.time()
@@ -5778,13 +5784,21 @@ class DesktopPet:
             log.warning("背景故事关系总结失败: %s", e)
 
     # ---------- 睡眠 ----------
+    def _show_sleep_hint(self):
+        """睡着时收到任何输入：只弹一句气泡，不出声、不苏醒（10/16 用户要求）。
+
+        刻意**不**走 TTS——他要的是"只是提示"，别再把她吵起来。
+        """
+        self.show_bubble_text("（还没睡醒呢）", "sleep", status=True)
+
     def start_sleep_mode(self, manual=False):
         if self.sleep_mode:
             return
         if self.watch_mode:
             self.toggle_watch_mode()
-        if self.voice_on:
-            self.toggle_voice(save=False)   # 睡着自动关麦不算用户选择，别把它写进配置
+        # 10/16：睡觉一律**不关麦克风**（手动睡、无互动自动睡都一样）——他要能随时喊她。
+        # 睡着时听到/收到任何输入都只弹一句提示，不苏醒也不出声：
+        # 语音走 on_speech_recognized 的守卫，打字走 send_message 的守卫（都调 _show_sleep_hint）。
         if self.reading_companion.enabled:
             self.toggle_reading()
         self.sleep_mode = True
@@ -5793,7 +5807,7 @@ class DesktopPet:
         self.bubble_window.fade_out()
         self.set_emotion("sleep")
         self.show_bubble_text("(sleep) Zzz...", "sleep", status=True)
-        self.input_entry.config(state=tk.DISABLED)
+        # 输入框保持可用：睡着时打字不会唤醒她，只会弹一句「（还没睡醒呢）」（见 send_message）
         if not manual:
             threading.Thread(target=self._sleep_monitor, daemon=True).start()
 
@@ -5882,16 +5896,37 @@ class DesktopPet:
             self.energy = min(MAX_ENERGY, self.energy + ENERGY_RECOVER_PER_MINUTE * elapsed / 60.0)
         else:
             self.energy = max(0, self.energy - ENERGY_DECAY_PER_MINUTE * elapsed / 60.0)
-            if self.energy <= 0 and not self.manual_sleep:
-                self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep", status=True)
-                self.start_sleep_mode(manual=True)
+            self._energy_check_warn()   # 10/16：不再强制睡觉，只提醒
         self._energy_job = self.root.after(5000, self._energy_tick)
 
     def consume_energy(self, amount=ENERGY_ACTIVE_COST):
         self.energy = max(0, self.energy - amount)
-        if self.energy <= 0 and not self.sleep_mode and not self.manual_sleep:
-            self.show_bubble_text("(sleep) 好累...让我休息一下...", "sleep", status=True)
-            self.start_sleep_mode(manual=True)
+        self._energy_check_warn()       # 10/16：不再强制睡觉，只提醒
+
+    def _energy_check_warn(self):
+        """精力跨档时提醒她累了、并劝用户歇一会儿（10/16 起不再强制睡觉）。
+
+        原先归零会 start_sleep_mode(manual=True) —— 那会顺手关掉陪玩/麦克风/读书，
+        打断所有工作，陪玩时还容易卡住。现在只出一句提醒，睡不睡由用户决定：
+        菜单「💤 睡觉」随时能用；一小时无互动的自动睡是另一条路，不受影响。
+        去重：clearing 靠"精力回到 ENERGY_LOW 以上"（睡醒之后会重新提醒）。
+        """
+        if self.sleep_mode:
+            return
+        if self.energy > ENERGY_LOW:
+            self._energy_warned.clear()
+            return
+        key = "zero" if self.energy <= 0 else "low"
+        if key in self._energy_warned:
+            return
+        self._energy_warned.add(key)
+        if key == "zero":
+            msg = "我真的撑不住了，得去躺一会儿。你也把电脑关了歇歇，好不好？"
+        else:
+            msg = "有点累了……你也别一直盯着屏幕，起来走两步、喝口水吧。"
+        log.info("精力提醒（%s，当前 %.1f）：不强制睡觉，只提醒", key, self.energy)
+        self.show_bubble_text(f"(sleep) {msg}", "sleep", status=True)
+        threading.Thread(target=self._tts_play, args=(msg,), daemon=True).start()
 
     def get_energy_mood(self):
         """返回精力值对情绪的影响描述，用于 AI 提示词"""
@@ -8804,6 +8839,11 @@ OCR文字：
                       font=(self.font_family, 10)).pack(side=tk.LEFT)
 
     def on_speech_recognized(self, text, mode="content"):
+        # 睡着时听到什么都只提示一句：不唤醒、不进模型、不出声（连 last_interaction_time 都不动，
+        # 免得"越喊越睡"那套时间账被搅乱）
+        if self.sleep_mode:
+            self._show_sleep_hint()
+            return
         self.last_interaction_time = time.time()
         try:
             remain = self.stt.window_left() if self.stt is not None else -1
