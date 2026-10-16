@@ -3,9 +3,9 @@
   "FileReferences": {
     "Moc": "small.moc3",
     "Textures": [
-      "small.4096/texture_00.png",
-      "small.4096/texture_01.png",
-      "small.4096/texture_02.png"
+      "small.2048/texture_00.png",
+      "small.2048/texture_01.png",
+      "small.2048/texture_02.png"
     ],
     "Physics": "small.physics3.json",
     "DisplayInfo": "small.cdi3.json",

@@ -237,7 +237,7 @@ def _parse_pick_num(text):
 
 
 def load_music_dir():
-    """音乐来源（按优先级）：1) 用户显式设置的音乐库（tools_config.json 的 music_dir，
+    """音乐来源（按优先级）：1) 用户显式设置的音乐库（config.json 的 tools 节 music_dir，
     通过右键 设置 → 音乐库设置 填写，免迁移）；2) 内置曲库 userdata\\music。
     不做任何自动扫描/迁移——未设置时内置曲库为空就是为空。"""
     try:
@@ -250,7 +250,7 @@ def load_music_dir():
 
 
 def save_music_dir_setting(path):
-    """保存/清除自定义音乐库路径（tools_config.json 的 music_dir）；传空值=恢复内置曲库"""
+    """保存/清除自定义音乐库路径（config.json 的 tools 节 music_dir）；传空值=恢复内置曲库"""
     try:
         sec = _get_section("tools")
         if path and path.strip():
@@ -261,6 +261,33 @@ def save_music_dir_setting(path):
         return True
     except Exception as e:
         log.warning("保存音乐库设置失败: %s", e)
+        return False
+
+
+def load_music_volume():
+    """音乐基础音量，百分比 0~100（config.json 的 tools 节 music_volume）。
+
+    这是"没有她说话时"的音量基准；她说话期间会在此基础上再按 TTS_DUCK_RATIO 压低
+    （见 _music_volume_now）。没设过就返回 MUSIC_VOLUME_DEFAULT。
+    """
+    try:
+        v = _get_section("tools").get("music_volume")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return max(0, min(100, int(round(float(v)))))
+    except Exception:
+        pass
+    return int(round(MUSIC_VOLUME_DEFAULT * 100))
+
+
+def save_music_volume_setting(percent):
+    """保存音乐基础音量（百分比 0~100）；越界值会被夹进区间"""
+    try:
+        sec = _get_section("tools")
+        sec["music_volume"] = max(0, min(100, int(percent)))
+        _update_section("tools", sec)
+        return True
+    except Exception as e:
+        log.warning("保存音乐音量失败: %s", e)
         return False
 # Spine 渲染支持（可选）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2434,7 +2461,16 @@ class SileroVAD:
     def __init__(self, model_path, sample_rate=16000, threshold=0.5,
                  min_silence_duration=0.8, min_speech_duration=0.25, window_size=512):
         import onnxruntime as ort
-        self.sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        # 10/16：ORT 的线程池默认按**逻辑核数**建，且 `session.intra_op.allow_spinning` 默认 true
+        # （干完一个任务原地自旋等下一个）。VAD 每 ~32ms 就被喂一次音频 ⇒ 池子永远等不到休眠，
+        # 实测空转烧掉 13 个核（20 核机器），一玩游戏就卡。VAD 是 1MB 的小模型，单线程足够。
+        _so = ort.SessionOptions()
+        _so.intra_op_num_threads = 1
+        try:
+            _so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        except Exception as e:
+            log.warning("VAD 关闭线程池自旋失败（继续）: %s", e)
+        self.sess = ort.InferenceSession(model_path, _so, providers=["CPUExecutionProvider"])
         self.threshold = threshold
         self.window_size = window_size
         self.min_silence_frames = max(1, int(min_silence_duration * sample_rate / window_size))
@@ -2878,6 +2914,17 @@ class LocalParaformerSTT:
                 log.error(f"语音转写错误: {e}")
 
 # ------------------------------- 桌宠主类 ---------------------------------
+# ---- TTS 与音乐：通道与音量（10/15）----
+# 以前两者共用 pygame.mixer.music（全局只有一条流）⇒ 她说话时只能把音乐停掉、说完再从断点续播。
+# 现在 TTS 走自己的 pygame.mixer.Channel，音乐继续放，只把音量压下去当背景音。
+# pygame 没有"音量淡变"（set_volume 是瞬时的，fadeout 只能淡到停），所以自己按步长走。
+TTS_DUCK_RATIO = 0.25        # 她说话时音乐降到原音量的这个比例
+TTS_FADE_OUT_MS = 350        # 压下去用多久（快一点，别拖）
+TTS_FADE_IN_MS = 700         # 恢复用多久（慢一点，听感更自然）
+TTS_FADE_STEP_MS = 30        # 淡变步长
+MUSIC_VOLUME_DEFAULT = 1.0   # 音乐基准音量的出厂值（音乐库设置里可调，存 config.json 的 tools.music_volume）
+
+
 class DesktopPet:
     @staticmethod
     def _init_dpi():
@@ -3014,14 +3061,17 @@ class DesktopPet:
         self._energy_job = None
         self._spine_loop_job = None
 
-        # 本地音乐播放（与 TTS 共用 pygame.mixer.music 通道；TTS 说话时自动暂停恢复）
+        # 本地音乐播放（音乐留在 pygame.mixer.music；TTS 走自己的声道，说话时只把音乐音量压低）
+        self._music_volume = load_music_volume() / 100.0   # 音乐基准音量（音乐库设置里可调，淡变的回归目标）
+        self._tts_channel = None                    # 她的专属声道（说话与音乐互不抢占）
+        self._fade_gen = 0                          # 淡变世代号：新的淡变让旧的自己退出
         self._music_playlist = []
         self._music_bad = set()      # 放不出来的曲子（加载失败）：本轮不再重试，防日志刷屏
         self._music_running = False
         self._music_thread = None
         self._music_stop_evt = threading.Event()
         self._music_current = None
-        self._music_duck = None          # TTS 打断时记录 (曲目路径, 秒)
+        self._music_duck = None          # 她正在说话（音乐音量被压低）：非 None 即置位，只作"别切歌"标志
         self._music_pending = None       # 等待 TTS 说完再开播的挂起歌单
         self._music_browse = []          # 最近一次候选 [(编号, 路径)]，供“放第X首”点歌
         self._music_list_state = {}      # list_songs 轮转: key=(lang|artist) -> [顺序列表, 游标]
@@ -3603,20 +3653,6 @@ class DesktopPet:
         t = _split_artist_title(hit)[1]
         return True, f"好的，准备播放《{t}》（我说完就开始）"
 
-    def _stop_music_for_chat(self):
-        """用户发起对话时调用：音乐（含挂起的歌单）彻底停止，之后不再续播"""
-        self._music_pending = None
-        if self._music_running or self._music_thread is not None:
-            self._music_stop_evt.set()
-            self._music_running = False
-            self._music_current = None
-            self._music_duck = None
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-            log.info("对话打断音乐: 已停止且不再续播")
-
     def _start_pending_music(self):
         """（TTS 说完/兜底定时器触发）真正开播挂起的歌单"""
         pl = self._music_pending
@@ -3690,6 +3726,7 @@ class DesktopPet:
                 if busy2 or self._music_duck is not None:
                     continue
                 try:
+                    pygame.mixer.music.set_volume(self._music_volume_now())   # 按"此刻是否在说话"定音量
                     pygame.mixer.music.load(f)
                     pygame.mixer.music.play()
                     self._music_current = f
@@ -3714,41 +3751,85 @@ class DesktopPet:
         self._music_running = False
         self._music_current = None
 
+    def _music_volume_now(self):
+        """当前该用的音乐音量：她在说话时是压低值，否则是基准值。
+
+        新歌开播前要按它定音量 —— 否则"她说话期间换的那首歌"会把压低的状态带下去。
+        """
+        return self._music_volume * (TTS_DUCK_RATIO if self._music_duck is not None else 1.0)
+
+    def _fade_music_to(self, target, ms):
+        """把音乐音量在 ms 毫秒内线性淡到 target（非阻塞，自己开一条短命线程）。
+
+        pygame 没有音量淡变接口，只能自己步进。世代号让新的淡变取代旧的：
+        连说两句时不会有两个线程抢音量，也不会从错误的基准起算（每步都读当前实际音量）。
+        """
+        self._fade_gen += 1
+        gen = self._fade_gen
+
+        def _run():
+            try:
+                base = pygame.mixer.music.get_volume()
+            except Exception:
+                return
+            steps = max(1, int(ms / TTS_FADE_STEP_MS))
+            for i in range(1, steps + 1):
+                if gen != self._fade_gen:
+                    return                      # 被更新的淡变取代，交给它继续
+                try:
+                    pygame.mixer.music.set_volume(base + (target - base) * i / steps)
+                except Exception:
+                    return
+                time.sleep(TTS_FADE_STEP_MS / 1000.0)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _play_tts_file(self, temp_file):
+        """在**她自己的声道**上播一段音频并等它播完。
+
+        不再借 pygame.mixer.music（那是音乐的地盘，一 load 就把她顶掉）。等的是自己声道的
+        get_busy()，所以别人换歌停歌都与她无关；再用"已知时长 + 1 秒"兜底，免得任何情况下卡死。
+        """
+        snd = pygame.mixer.Sound(temp_file)
+        if self._tts_channel is None:
+            self._tts_channel = pygame.mixer.Channel(0)     # 0 号声道专属她（本项目不用其它 Sound）
+        ch = self._tts_channel
+        try:
+            ch.stop()
+        except Exception:
+            pass
+        ch.play(snd)
+        deadline = time.time() + snd.get_length() + 1.0
+        while ch.get_busy() and time.time() < deadline:
+            time.sleep(0.05)
+
     def _music_duck_for_tts(self):
-        """TTS 开播前调用：若正在放音乐则记录曲目与进度并暂停；返回是否打断了音乐"""
+        """她开口前调用：若音乐在放就把音量压下去当背景音（不停、不记断点），返回是否压过。
+
+        10/15 改：以前是 music.stop() + 记 (曲目, 位置)、说完 play(start=位置) 续播；
+        现在 TTS 有自己的声道，音乐不必让位 —— 背景音不断，也不会再出现"等她说完
+        音乐才从断点跳回来"那一下。
+        """
         with self._audio_channel_lock:
             if not self._music_running or not self._music_current:
                 return False
             try:
                 if not pygame.mixer.music.get_busy():
                     return False
-                pos = max(0, pygame.mixer.music.get_pos() / 1000.0)
             except Exception:
                 return False
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-            self._music_duck = (self._music_current, pos)
-            return True
+        self._music_duck = True
+        self._fade_music_to(self._music_volume * TTS_DUCK_RATIO, TTS_FADE_OUT_MS)
+        return True
 
     def _music_finish_tts(self, ducked):
-        """TTS 播完调用：ducked=True 时从断点恢复音乐，否则卸载 TTS 音频"""
+        """她说完（或被打断）时调用：把音乐音量淡回基准值。
+
+        10/15 起不再"从断点续播"、也不再 unload（她的音频在自己的声道上，与音乐无关）。
+        """
+        self._music_duck = None
         if ducked:
-            with self._audio_channel_lock:
-                d = self._music_duck
-                self._music_duck = None
-            if d:
-                try:
-                    pygame.mixer.music.load(d[0])
-                    pygame.mixer.music.play(start=d[1])
-                except Exception as e:
-                    log.error(f"恢复音乐失败: {e}")
-            return
-        try:
-            pygame.mixer.music.unload()
-        except Exception:
-            pass
+            self._fade_music_to(self._music_volume, TTS_FADE_IN_MS)
 
     def show_greeting(self):
         greetings = [
@@ -4630,8 +4711,8 @@ class DesktopPet:
         msg = self.input_entry.get().strip()
         if not msg:
             return
-        # 用户发起对话：正在放的音乐彻底停止，之后不续播
-        self._stop_music_for_chat()
+        # 10/15：这里原来调 _stop_music_for_chat()（一对话就把音乐彻底停掉、之后不再续播）。
+        # 现在她说话时只把音乐音量压低当背景音（见 _music_duck_for_tts），所以聊天也不停音乐了。
         self.last_interaction_time = time.time()
         self.consume_energy()
         self.input_entry.delete(0, tk.END)
@@ -5149,18 +5230,13 @@ class DesktopPet:
                     tf.write(full_audio)
                     temp_file = tf.name
 
-                # TTS 说话前：若在放音乐则暂停并记录进度（说完恢复）
-                ducked = self._music_duck_for_tts()
-                with self._audio_channel_lock:
-                    pygame.mixer.music.load(temp_file)
-                    pygame.mixer.music.play()
+                # 她开口前：把音乐压低当背景音（不停音乐、不记断点）；
+                # 音量恢复统一放在 finally —— 她那边无论怎么退出（含异常），音乐都不会一直闷着
+                self._music_duck_for_tts()
                 # 播放期间静音语音识别，避免宠物“听见自己”触发识别
                 if self.stt is not None and self.voice_on:
                     self.stt.set_muted(True)
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-                # 播完：被打断的音乐从此处恢复；否则卸载 TTS 音频
-                self._music_finish_tts(ducked)
+                self._play_tts_file(temp_file)
             except Exception as e:
                 log.error(f"TTS 播放错误: {e}")
             finally:
@@ -5170,6 +5246,13 @@ class DesktopPet:
                 # 现在收尾整段包进 try、release 放内层 finally —— 以后谁再往收尾里加东西，
                 # 也炸不掉这把锁。执行顺序与原来完全一致。
                 try:
+                    if self._tts_channel is not None:
+                        try:
+                            self._tts_channel.stop()    # 超时提前退出时，别让她的声音漏到下一句
+                        except Exception:
+                            pass
+                    # 无论她那边怎么退出，都把音乐音量淡回基准（读标志本身，不看局部变量）
+                    self._music_finish_tts(self._music_duck is not None)
                     if self.stt is not None and self.voice_on:
                         self.stt.set_muted(False)
                     # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
@@ -5220,23 +5303,25 @@ class DesktopPet:
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as _tf:
                     temp_file = _tf.name
                 asyncio.run(comm.save(temp_file))
-                # TTS 说话前：若在放音乐则暂停并记录进度（说完恢复）
-                ducked = self._music_duck_for_tts()
-                with self._audio_channel_lock:
-                    pygame.mixer.music.load(temp_file)
-                    pygame.mixer.music.play()
+                # 她开口前：把音乐压低当背景音（不停音乐、不记断点）；
+                # 音量恢复统一放在 finally —— 她那边无论怎么退出（含异常），音乐都不会一直闷着
+                self._music_duck_for_tts()
                 # 播放期间静音语音识别，避免宠物“听见自己”触发识别
                 if self.stt is not None and self.voice_on:
                     self.stt.set_muted(True)
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-                # 播完：被打断的音乐从此处恢复；否则卸载 TTS 音频
-                self._music_finish_tts(ducked)
+                self._play_tts_file(temp_file)
             except Exception as e:
                 log.error(f"Edge TTS 播放错误: {e}")
             finally:
                 # 【锁必须一定放掉】见 _tts_play 里同款注释：哑掉的根因就是 release 排在收尾最后。
                 try:
+                    if self._tts_channel is not None:
+                        try:
+                            self._tts_channel.stop()    # 超时提前退出时，别让她的声音漏到下一句
+                        except Exception:
+                            pass
+                    # 无论她那边怎么退出，都把音乐音量淡回基准（读标志本身，不看局部变量）
+                    self._music_finish_tts(self._music_duck is not None)
                     if self.stt is not None and self.voice_on:
                         self.stt.set_muted(False)
                     # TTS 播完：仅对用户输入的回应才刷新免唤醒词窗口（from_tts=True = "真念完了"）
@@ -8394,21 +8479,26 @@ OCR文字：
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
                         tf.write(base64.b64decode(data["data"]))
                         temp_file = tf.name
-                ducked = self._music_duck_for_tts()
-                with self._audio_channel_lock:
-                    pygame.mixer.music.load(temp_file)
-                    pygame.mixer.music.play()
+                # 她开口前：把音乐压低当背景音（不停音乐、不记断点）；
+                # 音量恢复统一放在 finally —— 她那边无论怎么退出（含异常），音乐都不会一直闷着
+                self._music_duck_for_tts()
+                # 播放期间静音语音识别，避免宠物“听见自己”触发识别
                 if self.stt is not None and self.voice_on:
                     self.stt.set_muted(True)
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-                self._music_finish_tts(ducked)
+                self._play_tts_file(temp_file)
                 log.info("试听完成: provider=%s lang=%s", provider, lang)
             except Exception as e:
                 log.error("试听出错: %s", e)
             finally:
                 # 【锁必须一定放掉】见 _tts_play 里同款注释
                 try:
+                    if self._tts_channel is not None:
+                        try:
+                            self._tts_channel.stop()    # 超时提前退出时，别让她的声音漏到下一句
+                        except Exception:
+                            pass
+                    # 无论她那边怎么退出，都把音乐音量淡回基准（读标志本身，不看局部变量）
+                    self._music_finish_tts(self._music_duck is not None)
                     if self.stt is not None and self.voice_on:
                         self.stt.set_muted(False)
                     if temp_file and os.path.exists(temp_file):
@@ -8758,7 +8848,7 @@ OCR文字：
     # ---------- 音乐库设置 ----------
     def open_music_library_settings(self):
         """音乐库设置：直接填写本地音乐文件夹路径（免迁移），或恢复内置曲库"""
-        win, frame = self._make_card_window("音乐库设置", 680, 320)
+        win, frame = self._make_card_window("音乐库设置", 680, 400)
         s = self._dpi_scale
         cfg_dir = ""
         try:
@@ -8780,18 +8870,48 @@ OCR文字：
         tk.Label(frame, text="留空并点“保存”= 恢复内置曲库；填了不存在的路径会提示",
                  font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG).pack(anchor="w", padx=16)
 
+        # 音乐基础音量（她说话时在此基础上再压低，不影响那个压低比例）
+        vol_row = tk.Frame(frame, bg=DIALOG_BG)
+        vol_row.pack(anchor="w", padx=16, pady=(12, 2))
+        tk.Label(vol_row, text="音量", width=4, anchor="w", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(side=tk.LEFT)
+        vol_entry = RoundedEntry(vol_row, width=int(80 * s), height=int(34 * s),
+                                 radius=int(8 * s), font=(self.font_family, 10))
+        vol_entry.pack(side=tk.LEFT, padx=(4, 4))
+        vol_entry.set(str(int(round(self._music_volume * 100))))
+        tk.Label(vol_row, text="%（0~100）", font=(self.font_family, 10),
+                 fg=TEXT_SUB, bg=DIALOG_BG).pack(side=tk.LEFT)
+
         def do_save(reset=False):
             path = "" if reset else entry.get().strip()
             if path and not os.path.isdir(path):
                 messagebox.showwarning("路径无效", f"文件夹不存在：\n{path}")
                 return
-            if save_music_dir_setting(path):
+            raw_vol = str(vol_entry.get()).strip()
+            try:
+                vol = int(raw_vol)
+            except (TypeError, ValueError):
+                messagebox.showwarning("音量无效", "音量请填 0~100 之间的整数")
+                return
+            if not (0 <= vol <= 100):
+                messagebox.showwarning("音量无效", "音量请填 0~100 之间的整数")
+                return
+            ok_dir = save_music_dir_setting(path)
+            ok_vol = save_music_volume_setting(vol)
+            if ok_dir or ok_vol:
                 # 换库后清掉旧的轮转/浏览/挂起/卡片状态
                 self._music_list_state.clear()
                 self._music_browse = []
                 self._music_pending = None
                 try:
                     self.clear_song_picker()
+                except Exception:
+                    pass
+                # 音量立刻生效：取消正在进行的淡变，按"此刻是否在说话"设一次
+                self._music_volume = vol / 100.0
+                self._fade_gen += 1
+                try:
+                    pygame.mixer.music.set_volume(self._music_volume_now())
                 except Exception:
                     pass
                 msg = "已恢复内置曲库" if reset else "音乐库已更新"
