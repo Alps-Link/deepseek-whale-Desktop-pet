@@ -939,7 +939,7 @@ DEFAULT_USER_PROFILE = {
     "story": ""
 }
 
-IDLE_TIMEOUT = 60 * 60
+IDLE_TIMEOUT = 60 * 60        # 多久没操作电脑算「离开」（自动睡/关陪玩保护）；判定还要求系统级输入也空闲
 MAX_AUTO_SLEEP_DURATION = 2 * 60 * 60  # 自动睡眠最大时长，超时自动唤醒
 MAX_HISTORY_TURNS = 15
 
@@ -4716,9 +4716,46 @@ class DesktopPet:
         except Exception:
             pass
 
+    def _system_idle_seconds(self):
+        """整个 Windows 会话的空闲秒数（GetLastInputInfo：鼠标/键盘，跨程序都算）。
+
+        取不到就返回 0（宁可"不自动睡"，也不要误判他在用电脑时把她哄睡）。
+        """
+        try:
+            class _LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+            info = _LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return 0.0
+            tick = ctypes.windll.kernel32.GetTickCount()
+            elapsed_ms = (tick - info.dwTime) & 0xFFFFFFFF     # 32 位计数回绕也安全
+            return max(0.0, elapsed_ms / 1000.0)
+        except Exception:
+            return 0.0
+
+    def _should_auto_sleep(self):
+        """够不够格自动睡：她的交互时间够久 **且** 系统（鼠标键盘）也空闲够久。
+
+        10/17 改：原来只看 last_interaction_time —— 它只在**真实互动**（点她/发消息/对她说话）时刷新，
+        动鼠标、打字都不算 ⇒ 他人在电脑前（只是没碰桌宠）也会被判"走了"，表现为"回来一动鼠标她才睡"。
+        陪玩/陪读**故意不刷新**它（用户的设计）：开着陪玩离开一小时 ⇒ 自动睡 ⇒ 顺手关掉陪玩，防止白烧 API。
+        """
+        if self.sleep_mode:
+            return False
+        if time.time() - self.last_interaction_time <= IDLE_TIMEOUT:
+            return False
+        return self._system_idle_seconds() > IDLE_TIMEOUT
+
     def start_idle_check(self):
         def check():
-            if not self.sleep_mode and time.time() - self.last_interaction_time > IDLE_TIMEOUT:
+            if self._should_auto_sleep():
+                try:
+                    log.info("自动睡：无互动 %.1f 分钟，系统空闲 %.1f 分钟（阈值 %.0f 分钟）",
+                             (time.time() - self.last_interaction_time) / 60.0,
+                             self._system_idle_seconds() / 60.0, IDLE_TIMEOUT / 60.0)
+                except Exception:
+                    pass
                 self.start_sleep_mode(manual=False)
             self.idle_check_job = self.root.after(60000, check)
         check()
@@ -8878,7 +8915,6 @@ OCR文字：
         if self.sleep_mode:
             self._show_sleep_hint()
             return
-        self.last_interaction_time = time.time()
         try:
             remain = self.stt.window_left() if self.stt is not None else -1
         except Exception:
@@ -8888,6 +8924,9 @@ OCR文字：
         # 等宠物说完再接话，避免误打断
         if self._voice_output_busy():
             return                                  # 丢弃帧也不记日志（同上，防刷屏）
+        # 只有**真被接受**的语音才算互动（10/17 用户要求）：她正在说话时插的话被抗打断丢掉，
+        # 不续命；"没喊名字"的语音在 _transcribe_loop 里就 continue 了，压根到不了这里。
+        self.last_interaction_time = time.time()
         if mode == "wake":
             # 只说唤醒词：进入聆听状态。
             # 不再弹"在呢，请说"气泡（用户要求去掉）——反馈交给头顶的「🎤 在听」标记，
