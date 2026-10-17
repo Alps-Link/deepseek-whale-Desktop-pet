@@ -1606,12 +1606,12 @@ def build_full_system_prompt(base_prompt, user_profile):
     story_text = ""
     if user_profile.get("story", "").strip():
         story_text = f"\n【角色背景故事】\n{user_profile['story'].strip()}\n"
-    info = f"""【用户档案】
-- 你的称呼：{user_profile.get('call_name', '你')}
-- 我的昵称：{user_profile.get('nickname', '你')}
-- 我的生日：{user_profile.get('birthday', '未知')}
+    info = f"""【用户档案】（下面说的是正在跟你说话的人，不是你自己；你自己的名字看人设里"你是…"那句）
+- 你叫他：{user_profile.get('call_name', '你')}
+- 他的昵称：{user_profile.get('nickname', '你')}
+- 他的生日：{user_profile.get('birthday', '未知')}
 {story_text}
-请记住这些信息，并用合适的语气与我对话。
+请记住这些信息，用合适的语气跟他说话。
 {base_prompt}
 """
     return info
@@ -3351,19 +3351,22 @@ class DesktopPet:
             "type": "function",
             "function": {
                 "name": "control_music",
-                "description": "控制本地音乐播放（播放用户电脑曲库里的本地歌曲文件）。"
+                "description": "控制本地音乐播放与音量（播放用户电脑曲库里的本地歌曲文件）。"
                                "用户说“放首歌/来点音乐/播放某首歌/我想听xxx/把音乐停了/别放了”时调用；"
                                "用户想听某语言的歌（日语/英语/俄语/韩语/中文歌）或某歌手的歌时用 lang/artist 过滤；"
-                               "用户不知道歌名时用 list_songs 弹出歌曲选择框，之后说“放第X首”用 play_index。",
+                               "用户不知道歌名时用 list_songs 弹出歌曲选择框，之后说“放第X首”用 play_index；"
+                               "用户说“声音小一点/太吵了/调大点/音量调到60”这类话时用 set_volume，"
+                               "给绝对数用 value，只说要大点小点用 delta（正数调大、负数调小）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string",
                                    "enum": ["play_random", "play_song", "play_index",
-                                            "list_songs", "stop"],
+                                            "list_songs", "stop", "set_volume"],
                                    "description": "play_random=随机播放；play_song=按歌名播放；"
                                                   "play_index=按编号播放(配 index)；"
-                                                  "list_songs=弹歌曲选择框(配 lang/artist)；stop=停止"},
+                                                  "list_songs=弹歌曲选择框(配 lang/artist)；stop=停止；"
+                                                  "set_volume=调音量(配 value 或 delta)"},
                         "song": {"type": "string",
                                  "description": "play_song 时用户点名的歌名或关键词（可选，缺省则随机）"},
                         "lang": {"type": "string",
@@ -3371,7 +3374,12 @@ class DesktopPet:
                         "artist": {"type": "string",
                                    "description": "歌手过滤（可选）：用户提到歌手名时填"},
                         "index": {"type": "integer",
-                                  "description": "play_index 用的歌曲编号（list_songs 弹框里的第几首）"}
+                                  "description": "play_index 用的歌曲编号（list_songs 弹框里的第几首）"},
+                        "value": {"type": "integer",
+                                  "description": "set_volume 的绝对音量 0~100（用户说了具体数值时用）"},
+                        "delta": {"type": "integer",
+                                  "description": "set_volume 的相对调整量，正数调大负数调小"
+                                                 "（用户只说“大一点/小一点”时用，比如 +10 / -20）"}
                     },
                     "required": ["action"],
                 },
@@ -3391,14 +3399,38 @@ class DesktopPet:
                     files.append(os.path.join(root, n))
         return d, sorted(files)
 
-    def control_music(self, action, song="", lang="", artist="", index=0):
+    def control_music(self, action, song="", lang="", artist="", index=0,
+                      value=None, delta=None):
         """本地音乐控制（工具入口）：
-        play_random / play_song / play_index / list_songs / stop；
+        play_random / play_song / play_index / list_songs / stop / set_volume；
         支持按语言(lang=日文/英文/…)或歌手(artist)过滤，支持“第X首”编号点歌。
+        set_volume 用 value(0~100 绝对) 或 delta(±相对) 调音乐基础音量（10/16 新增）。
         播放采用“先说话后开播”：挂起歌单，等本轮 TTS 说完再真正开始。"""
         action = (action or "").strip().lower()
-        log.info("本地音乐控制: action=%s song=%s lang=%s artist=%s index=%s",
-                 action, song, lang, artist, index)
+        log.info("本地音乐控制: action=%s song=%s lang=%s artist=%s index=%s value=%s delta=%s",
+                 action, song, lang, artist, index, value, delta)
+        if action in ("set_volume", "volume"):
+            # 用对话调音乐音量：先算目标值（不给就报当前），夹到 0~100，落盘并立刻生效
+            cur = int(round(self._music_volume * 100))
+            if value is None and delta is None:
+                return True, f"现在音乐音量是 {cur}%（说“大一点/小一点”或给个 0~100 的数都行）"
+            try:
+                if value is not None:
+                    new = int(round(float(value)))
+                else:
+                    new = cur + int(round(float(delta)))
+            except (TypeError, ValueError):
+                return False, "没听清要调到多少，给个 0~100 的数吧"
+            new = max(0, min(100, new))
+            self._music_volume = new / 100.0
+            save_music_volume_setting(new)
+            self._fade_gen += 1            # 取消进行中的淡变，免得旧的把新值盖掉
+            try:
+                pygame.mixer.music.set_volume(self._music_volume_now())
+            except Exception:
+                pass
+            log.info("音乐音量 %d%% → %d%%（对话设置）", cur, new)
+            return True, f"音乐音量调到 {new}% 了"
         if action in ("stop",):
             self._music_pending = None
             self._music_stop_evt.set()
@@ -4834,7 +4866,9 @@ class DesktopPet:
                                 str(args.get("song", "") or ""),
                                 str(args.get("lang", "") or ""),
                                 str(args.get("artist", "") or ""),
-                                args.get("index") or 0)
+                                args.get("index") or 0,
+                                args.get("value"),
+                                args.get("delta"))
                         else:
                             tool_msgs.append((tid, f"ERROR 未知工具: {fname}"))
                             continue
