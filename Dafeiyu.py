@@ -3384,6 +3384,26 @@ class DesktopPet:
                     "required": ["action"],
                 },
             },
+        }, {
+            "type": "function",
+            "function": {
+                "name": "look_at_screen",
+                "description": "看一眼用户当前的屏幕，并按他的关注点说一句话（你会真的看到画面）。"
+                               "只要他说的话意思是“你来看我的屏幕/看我这边”，就调用，比如："
+                               "“快看”“看看”“看看这个”“你看一眼”“看看我拿到了什么”“看看我在干嘛”"
+                               "“帮我看看这个界面是啥”“这是什么东西”。"
+                               "注意：这种时候不要去问他“你手上是啥呀”——直接看屏幕。"
+                               "普通聊天、问时间、问天气、聊感受这类不需要看屏幕的，别调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "focus": {"type": "string",
+                                  "description": "他明确想让你看的东西（如“我手上的东西”“这个界面”）；"
+                                                 "没指定就留空"},
+                    },
+                    "required": [],
+                },
+            },
         }]
 
     # ---------- 本地音乐播放（control_music 工具）----------
@@ -4906,6 +4926,8 @@ class DesktopPet:
                                 args.get("index") or 0,
                                 args.get("value"),
                                 args.get("delta"))
+                        elif fname == "look_at_screen":
+                            ok, note = self.look_at_screen(str(args.get("focus", "") or ""))
                         else:
                             tool_msgs.append((tid, f"ERROR 未知工具: {fname}"))
                             continue
@@ -7835,7 +7857,7 @@ class DesktopPet:
                 sig = self._frame_signature(image_b64)
                 if not force:
                     diff = self._frame_diff(self.last_screen_sig, sig)
-                    if diff < WATCH_SIMILARITY_THRESHOLD:
+                    if diff < WATCH_SIMILARITY_THRESHOLD and not force:   # 用户明确要看时不去重
                         log.debug("陪看: 画面与上次评论时几乎没变（平均像素差 %.2f < %.1f），跳过不调模型",
                                   diff, WATCH_SIMILARITY_THRESHOLD)
                         return
@@ -7931,7 +7953,31 @@ OCR文字：
         b = np.frombuffer(sig_b, dtype=np.uint8).astype(np.int16)
         return float(np.abs(a - b).mean())
 
-    def _get_vision_comment(self, image_b64, force=False):
+    def look_at_screen(self, focus=""):
+        """看一眼当前屏幕并按他的关注点说一句（工具入口，10/17 新增）。
+
+        由**模型自己判断**要不要调（工具描述里写了触发场景），不靠关键词/字数。
+        与陪看 analyze_and_comment 的区别：这里**同步把话交回去**，由她在那一轮回复里说，
+        不弹独立气泡、不写陪看历史。focus 是"他想让你看什么"，可选。
+        """
+        if self.sleep_mode:
+            return False, "我已经睡了，先叫醒我"
+        if not self.vision_api_key or not self.vision_model:
+            return False, "还没配置视觉模型（右键设置里填 API Key 和模型名）"
+        try:
+            image_b64 = self.capture_screen_base64()
+        except Exception as e:
+            return False, f"截图失败：{e}"
+        if not image_b64:
+            return False, "截图失败，没拿到画面"
+        line = self._get_vision_comment(image_b64, force=True, focus=focus)
+        line = (line or "").strip()
+        if not line:
+            return False, "看了一眼，没看清"
+        log.info("工具：看屏幕（focus=%s）→ %s", (focus or "")[:20], line[:40])
+        return True, line
+
+    def _get_vision_comment(self, image_b64, force=False, focus=""):
         """使用 OpenAI 兼容视觉模型分析截图"""
         if not self.vision_api_key:
             return "(worried) 请先设置视觉模型 API Key"
@@ -7963,9 +8009,15 @@ OCR文字：
         rest_line = ("" if time.time() < self._rest_cooldown_until else
                      "他要是连着玩了很久、或者节奏明显慢下来，可以顺口提一句让他歇会儿；不用每次都说。")
         force_line = "这一轮一定要说一句。" if force else ""
+        # 他明确点名要你看什么时（"看看我拿到了什么"），把关注点揉进提示词，别答非所问
+        focus_line = ""
+        if (focus or "").strip():
+            focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()[:40]
         watch_instructions = f"""你在陪"{user_name}"一起看屏幕——可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件。
 你是{self.pet_name}，用你自己的语气说话，不用把自己调成某个样子。
 就当自己坐在旁边一块儿看着：画面里正在发生什么，顺口说一句就行，不用写观后感，也别去猜他在想什么。
+画面上那只桌宠就是你自己，别把她认成别人、也别当成画面内容去评头论足。
+{focus_line}
 要说的就一句，别分两段。
 多数时候就是对画面的一句感慨；偶尔顺着话头问他一句就行，别每句都问。
 画面里是直播平台、弹幕或别人的操作 → 他在看；是他自己在操作 → 他在玩。记忆只能当闲聊的由头，不许盖过你现在看到的东西。
