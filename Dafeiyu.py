@@ -367,13 +367,16 @@ except ImportError:
         lazy_pinyin = None
         PINYIN_AVAILABLE = False
 
-# EasyOCR（读书伴侣）
+# OCR（读书伴侣）——10/19 从 EasyOCR 换成 RapidOCR（PP-OCR ONNX 模型）：
+# EasyOCR 自己会 `import torch`（torch_cpu.dll 294MB + 约 1GB 提交内存、成品多背几百 MB），
+# RapidOCR 用项目里本来就在跑的 onnxruntime，包约 15MB、识别也更准（实测 30→"30"、D:\CloudMusic 反斜杠正确）。
+# 这里只 find_spec 探一下装没装，真正要用 OCR 时才在后台线程里导入。
 try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-except ImportError:
-    easyocr = None
-    EASYOCR_AVAILABLE = False
+    import importlib.util as _ilu
+    RAPIDOCR_AVAILABLE = _ilu.find_spec("rapidocr") is not None
+except Exception:
+    RAPIDOCR_AVAILABLE = False
+rapidocr = None
 
 # 视觉模型统一走 OpenAI 兼容 HTTP 接口（不再依赖火山引擎 SDK）
 
@@ -979,11 +982,22 @@ WATCH_EVENT_MAX_LEN = 300  # 陪看事件最大字数：超限强制 AI 压缩�
 WATCH_ANTI_REPEAT = 5      # 陪玩反重复：把最近 N 条已说过的评论列给模型，并禁止复用其句式
 WATCH_MONOLOGUE_TURNS = 2  # 末尾连续这么多轮陪玩、且中间没有用户发言 → 视为独白（才断回喂）
 WATCH_SIG_SIZE = (64, 36)          # 画面指纹尺寸：缩成这么小的灰度图，用来判断两帧像不像
-WATCH_SIMILARITY_THRESHOLD = 0.08  # 平均像素差小于它就当"画面没变"、这一轮不调模型（0~255 尺度）
+WATCH_RING_EVERY = 8.0     # P2 环形缓冲：陪玩期间每 8 秒抓一张（0.125Hz，CPU 可忽略）
+WATCH_RING_KEEP = 8        # 留最近 8 张 ≈ 1 分钟
+WATCH_RING_SEND = 3        # 每次评论额外捎上几张更早的（1 分钟里均匀取 3 个时刻）
+# 10/19：原来是 2 张（最早+中间），配上 1.2 秒那对前后帧后时间轴是 56/32/1.2/0，
+# 中间空 24 秒、末段空 31 秒 ⇒ 不匀。改成 3 张后是 ~56/40/24/1.2/0（间隔 16/16/23/1），
+# 覆盖更匀，代价是每次多 1 张图（视觉成本约 +25%）。
+WATCH_SIMILARITY_THRESHOLD = 1.4   # 平均像素差小于它就当"画面没变"、这轮不调模型（0~255 尺度）
+# 10/19 实测（34 分钟真实陪玩、21 条评论）：静态推荐页只有 0.084 / 0.088 / 1.248，
+# 真实画面 26.4~94.9（全部 ≥26）⇒ 两堆隔 20 倍，原来 0.08 会把"页面没动"也当成有变化、
+# 连着劝人点推荐。取 1.4：卡在静态最高的 1.248 之上（只留 0.15 余量，偏灵敏），
+# 真实画面一条都不受影响。哪天发现"该说话她没说"，先看是不是慢镜头被这个余量漏掉了。
 # 标定（9/19 用真实 _frame_signature/_frame_diff 量的 1280x720 合成帧，64x36 指纹）：
 #   同一帧 0.000 / 时钟跳一位 0.001 / 光标移 200px 0.033 / 光标移 20px 0.044 → 都该跳过；
 #   NPC 移 40px 0.26 / 弹出面板(约 20% 面积) 4.84 / 换场景 33.6 → 都该调模型。
-# 0.08 卡在"只有光标/数字在动"和"画面里真有东西在动"之间：调大更省调用，调小更敏感。
+# 上面的 9/19 标定是在"理想合成帧"上做的；10/19 在真实陪玩里发现**真实内容的帧差远大于标定值**
+# （26~95），而静态页面只有 0.08~1.25 ⇒ 阈值按真实数据提到 2.0。想再省就往上调，想更敏感就往下调。
 if getattr(sys, 'frozen', False):
     MEMORY_EMBED_MODEL = resource_path("models/bge-small-zh-v1.5")
 else:
@@ -4588,16 +4602,51 @@ class DesktopPet:
             except Exception: pass
             self.layered = LayeredImageWindow(disp_w, disp_h)
             self.layered.show()
-            if self.watch_mode:
+            if getattr(self, "_click_through", False):
                 self.layered.set_bypass(True)
-        # 消费事件（含全局热键 Ctrl+Shift+G）
+        # 消费事件（含全局热键 Ctrl+Shift+G —— 10/19 起它是"点击穿透"开关，不再是陪玩开关）
         for ev in self.layered.poll_events():
             if ev[0] == 'hotkey':
-                self.toggle_watch_mode()
+                self.toggle_click_through()
             else:
                 self._handle_layered_event(*ev)
 
         self._spine_loop_job = self.root.after(16, self._spine_render_loop)
+
+    def toggle_click_through(self):
+        """切换"点击穿透"（全局热键 Ctrl+Shift+G）。
+
+        10/19 按用户要求改：这个热键原来开关陪玩，现在只管穿透；
+        陪玩也不再强制穿透（原来一开陪玩窗口就点不到了）。
+        开启后角色窗口对鼠标完全透明，控制面板不受影响，所以还能从菜单操作。
+        """
+        if self.layered is None:
+            self.show_bubble_text("(worried) 现在没有窗口，设不了穿透…", "worried", status=True)
+            return
+        new_state = not getattr(self, "_click_through", False)
+        try:
+            self.layered.set_bypass(new_state)
+        except Exception as e:
+            log.warning("切换点击穿透失败: %s", e)
+            self.show_bubble_text("(worried) 穿透没切成…", "worried", status=True)
+            return
+        self._click_through = new_state
+        # 10/19：穿透期间强制收起输入框（不写进配置）；关掉时恢复穿透前的状态
+        try:
+            if new_state:
+                self._input_visible_before_ct = getattr(self, "input_visible", True)
+                if getattr(self, "input_visible", False):
+                    self.toggle_input_frame(save=False)
+            else:
+                if getattr(self, "_input_visible_before_ct", True) and not getattr(self, "input_visible", False):
+                    self.toggle_input_frame(save=False)
+        except Exception as e:
+            log.debug("穿透时切换输入框失败: %s", e)
+        log.info("点击穿透: %s", "开启" if new_state else "关闭")
+        if new_state:
+            self.show_bubble_text("(relaxed) 好，鼠标先从我身上穿过去～", "relaxed", status=True)
+        else:
+            self.show_bubble_text("(happy) 又能点到我了", "happy", status=True)
 
     def _handle_layered_event(self, kind, sx, sy):
         try:
@@ -7000,15 +7049,67 @@ class DesktopPet:
         return "\n\n".join(out)
 
     def _load_memory_embedder(self):
-        """懒加载本地中文向量模型，失败时回退到旧排序"""
+        """懒加载本地中文向量模型（ONNX Runtime，不再依赖 torch），失败时回退到旧排序。
+
+        10/19 改：原来是 sentence_transformers(torch)，光 torch 的 DLL 就 294 MB、
+        还预占约 1 GB 提交内存。换成 ONNX 后数值等价（A/B 逐句余弦 1.00000000、
+        top-5 排序零变化），启动快、成品也小。
+        池化方式必须跟模型自带配置一致：**CLS 池化（取第 0 个 token）+ L2 归一化**
+        （models\bge-small-zh-v1.5\1_Pooling\config.json 里 pooling_mode_cls_token=true），
+        换成 mean 池化不会报错，但会让所有余弦系统性偏移、0.35 门槛失真。
+        """
         if getattr(self, '_memory_embed_failed', False):
             return None
         if getattr(self, '_memory_embedder', None) is not None:
             return self._memory_embedder
+
+        class _OnnxTextEmbedder:
+            """最小 ONNX 文本向量器：接口对齐 SentenceTransformer.encode"""
+
+            def __init__(self, model_dir):
+                import numpy as np_
+                import onnxruntime as ort_
+                from tokenizers import Tokenizer
+                self._np = np_
+                self._tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+                self._tok.enable_truncation(max_length=512)
+                self._tok.enable_padding(pad_id=0, pad_token="[PAD]")
+                so = ort_.SessionOptions()
+                so.intra_op_num_threads = 1                          # 别重蹈 VAD 线程池自旋
+                so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                self._sess = ort_.InferenceSession(
+                    os.path.join(model_dir, "model.onnx"), sess_options=so,
+                    providers=["CPUExecutionProvider"])
+
+            def encode(self, texts, normalize_embeddings=True, **kwargs):
+                np_ = self._np
+                single = isinstance(texts, str)
+                items = [texts] if single else list(texts)
+                if not items:
+                    return np_.zeros((0, 512), dtype=np_.float32)
+                encs = self._tok.encode_batch(items)
+                ids = np_.array([e.ids for e in encs], dtype=np_.int64)
+                mask = np_.array([e.attention_mask for e in encs], dtype=np_.int64)
+                types = np_.zeros_like(ids)
+                out = self._sess.run(["last_hidden_state"],
+                                     {"input_ids": ids, "attention_mask": mask,
+                                      "token_type_ids": types})[0]
+                vec = out[:, 0, :].astype(np_.float32)                  # CLS 池化
+                if normalize_embeddings:
+                    vec = vec / (np_.linalg.norm(vec, axis=1, keepdims=True) + 1e-12)
+                return vec[0] if single else vec
+
         try:
-            from sentence_transformers import SentenceTransformer
-            self._memory_embedder = SentenceTransformer(MEMORY_EMBED_MODEL)
-            log.info(f"记忆向量模型已加载: {MEMORY_EMBED_MODEL}")
+            # 打包版 MEMORY_EMBED_MODEL 是本地目录；源码版它是 HF 仓库名 ⇒ 退回随项目带的目录
+            model_dir = MEMORY_EMBED_MODEL
+            if not os.path.isdir(model_dir):
+                model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "models", "bge-small-zh-v1.5")
+            onnx_file = os.path.join(model_dir, "model.onnx")
+            if not os.path.isfile(onnx_file):
+                raise FileNotFoundError(f"缺少 {onnx_file}（需要 ONNX 版 bge-small）")
+            self._memory_embedder = _OnnxTextEmbedder(model_dir)
+            log.info(f"记忆向量模型已加载(ONNX): {model_dir}")
         except Exception as e:
             self._memory_embed_failed = True
             log.warning(f"记忆向量模型加载失败，将回退到旧记忆排序: {e}")
@@ -7273,7 +7374,7 @@ class DesktopPet:
 
     def build_context_messages(self, system_prompt, user_msg="", context_type="chat",
                                image_b64=None, extra_context="", memory_query=None,
-                               skip_sources=None):
+                               skip_sources=None, image_b64_prev=None, image_b64_earlier=None):
         """统一的AI上下文字消息构建器"""
         time_period = self.get_current_time_period()
         energy_mood = self.get_energy_mood()
@@ -7314,13 +7415,17 @@ class DesktopPet:
             messages.append({"role": turn[1]["role"], "content": turn[1]["content"]})
 
         if image_b64:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_msg},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
-                ]
-            })
+            _content = [{"type": "text", "text": user_msg}]
+            # 顺序很重要：更早的 → 约一秒前 → 现在。模型按时间顺序理解。
+            for _b in list(image_b64_earlier or []):
+                _content.append({"type": "image_url",
+                                 "image_url": {"url": f"data:image/jpeg;base64,{_b}"}})
+            if image_b64_prev:
+                _content.append({"type": "image_url",
+                                 "image_url": {"url": f"data:image/jpeg;base64,{image_b64_prev}"}})
+            _content.append({"type": "image_url",
+                             "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+            messages.append({"role": "user", "content": _content})
         elif user_msg:
             current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             time_aware_msg = f"[现在是{time_period}，时间 {current_time_str}] {user_msg}"
@@ -7617,6 +7722,7 @@ class DesktopPet:
     def toggle_watch_mode(self):
         if self.watch_mode:
             self.watch_mode = False
+            self._stop_watch_ring()
             self._summarize_watch_segment()
             self._finalize_watch_event()
             self._watch_session_anchors = []
@@ -7625,8 +7731,7 @@ class DesktopPet:
             if self.watch_job:
                 self.root.after_cancel(self.watch_job)
                 self.watch_job = None
-            if self.layered:
-                self.layered.set_bypass(False)
+            # 10/19：陪玩不再改点击穿透状态（穿透只由热键控制）
             if self.spine_enabled and self.spine:
                 self.spine.enqueue(('test_motion', 'Action', 1))
             self.root.after(800, lambda: self.set_emotion("normal"))
@@ -7645,8 +7750,8 @@ class DesktopPet:
                 messagebox.showwarning("未配置模型", "请先右键设置视觉模型名称（豆包填 endpoint id，其他填模型名）")
                 return
             self.watch_mode = True
-            if self.layered:
-                self.layered.set_bypass(True)
+            self._start_watch_ring()
+            # 10/19：陪玩不再强制穿透（原来一开陪玩角色就点不到了）
             self.watch_trigger_times.clear()
             self.last_watch_comment_time = 0
             self._watch_last_anchor = ""
@@ -7659,9 +7764,8 @@ class DesktopPet:
             self.last_screen_sig = None
             if self.spine_enabled and self.spine:
                 self.spine.enqueue(('test_motion', 'Action', 2))
-            if self.input_visible:
-                self.toggle_input_frame(save=False)   # 陪玩自动收起不算用户选择，不写进配置
-            self.show_bubble_text("(happy) 我会在后面安静陪着你的，按 Ctrl+Shift+G 可以退出", "happy", status=True)
+            # 10/19：陪玩不再自动收起输入框（收不收由用户自己用菜单决定）
+            self.show_bubble_text("(happy) 我会在后面安静陪着你的", "happy", status=True)
             log.info("陪玩模式已开启")
             self.start_watch_loop()
             self.root.after(500, lambda: self.analyze_and_comment(force=False))
@@ -7821,6 +7925,96 @@ class DesktopPet:
             poll_sec = max(5, min(self.watch_min_interval // 2, 60))
             self.watch_job = self.root.after(int(poll_sec * 1000), self.start_watch_loop)
 
+    def _start_watch_ring(self):
+        """陪玩开启时调用：起一个后台线程每 WATCH_RING_EVERY 秒抓一张，只留最近 KEEP 张。
+
+        目的：让她能说出"这一段的过程"（这辆车刚还在后面 / 查了一分钟还没线索），
+        而不是只有"此刻的一帧"。关陪玩时线程自己退。
+        """
+        if not hasattr(self, "_watch_ring"):
+            self._watch_ring = []
+        self._watch_ring.clear()
+        self._watch_ring_on = True
+
+        def loop():
+            while getattr(self, "_watch_ring_on", False) and self.watch_mode:
+                try:
+                    b64 = self.capture_screen_base64()
+                    if b64:
+                        self._watch_ring.append((time.time(), b64))
+                        if len(self._watch_ring) > WATCH_RING_KEEP:
+                            del self._watch_ring[:-WATCH_RING_KEEP]
+                except Exception as e:
+                    log.debug("陪看环形采集失败: %s", e)
+                # 分段睡，关陪玩时能立刻退出
+                for _ in range(int(WATCH_RING_EVERY * 10)):
+                    if not getattr(self, "_watch_ring_on", False) or not self.watch_mode:
+                        return
+                    time.sleep(0.1)
+
+        threading.Thread(target=loop, daemon=True).start()
+        log.info("陪看环形缓冲已启动（每 %.0f 秒一张，留 %d 张）", WATCH_RING_EVERY, WATCH_RING_KEEP)
+
+    def _stop_watch_ring(self):
+        self._watch_ring_on = False
+
+    def _watch_ring_pick(self, n=None):
+        """从环里挑 n 张更早的画面（最早 + 均匀分布），返回 b64 列表（旧→新）。"""
+        n = WATCH_RING_SEND if n is None else n
+        ring = list(getattr(self, "_watch_ring", []) or [])
+        if len(ring) < 2 or n <= 0:
+            return []
+        # 均匀取 n 个下标（跳过最新那张，它和"现在"太近）
+        ring = ring[:-1]
+        step = max(1, len(ring) // n)
+        return [ring[i][1] for i in range(0, len(ring), step)][:n]
+
+    def _record_watch_sample(self, comment, diff=None, force=False, elapsed=0.0,
+                             model_s=0.0, frames=1):
+        """P0 基线采集（10/19 起）：把每次陪看评论落成一条 JSONL。
+
+        为什么要它：陪看评论以前从不落盘（chat_buffer 只留 15 轮、日志只有调度行），
+        导致"多帧改造到底有没有用"没有对照组。从这里开始积累真实样本。
+        """
+        try:
+            text = (comment or "").strip()
+            rec = {
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts": round(time.time(), 1),
+                "comment": text,
+                "len": len(text),
+                "empty": not bool(text),
+                "summary": (getattr(self, "_watch_last_summary", "") or "").strip()[:120],
+                "gap_s": round(min(elapsed, 3600.0), 1),   # 首条 last=0 会算出 epoch，截断
+                "diff": None if diff is None else round(float(diff), 4),
+                "force": bool(force),
+                "frames": int(frames),
+                "model_s": round(model_s, 2),
+            }
+            with open(os.path.join(CONFIG_DIR, "watch_log.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.debug("陪看样本落盘失败: %s", e)
+
+    def _record_watch_skip(self, reason, elapsed=0.0, diff=None, frames=None):
+        """记录一次"没说话"：原因 + 距上次发言 + 画面变化。与 sample 同一份 JSONL。"""
+        try:
+            rec = {
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts": round(time.time(), 1),
+                "skip": reason,
+                "comment": "",
+                "len": 0,
+                "empty": True,
+                "gap_s": round(min(elapsed, 3600.0), 1),
+                "diff": None if diff is None else round(float(diff), 4),
+                "frames": None if frames is None else int(frames),   # 跳过发生在抓帧之前 ⇒ 帧数未知
+            }
+            with open(os.path.join(CONFIG_DIR, "watch_log.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.debug("陪看跳过记录失败: %s", e)
+
     def analyze_and_comment(self, force=False):
         if self.sleep_mode:
             return
@@ -7835,6 +8029,7 @@ class DesktopPet:
         if not force:
             if elapsed < self.watch_min_interval:
                 log.debug("陪看: 距上次发言 %.1fs < 最小间隔 %ds，跳过", elapsed, self.watch_min_interval)
+                self._record_watch_skip("interval", elapsed)
                 self.watch_lock.release()
                 return
             elif elapsed >= self.watch_max_silence:
@@ -7844,25 +8039,36 @@ class DesktopPet:
                 prob = max(0.05, (elapsed - self.watch_min_interval) / (self.watch_max_silence - self.watch_min_interval))
                 if random.random() > prob:
                     log.debug("陪看: 概率跳过 (elapsed=%.1fs, prob=%.2f)", elapsed, prob)
+                    self._record_watch_skip("prob", elapsed)
                     self.watch_lock.release()
                     return
 
         log.debug("陪看: 开始分析画面")
         def process():
             try:
-                image_b64 = self.capture_screen_base64()
+                _prev_b64, image_b64 = self.capture_screen_pair()     # 前后两帧（间隔约 1.2s）
+                _n_frames = 2 if _prev_b64 else 1
                 if not image_b64:
                     self._ui(lambda: self.show_bubble_text("(normal) 唔...我现在看不到画面呢。", "normal"), status=True)
                     return
                 sig = self._frame_signature(image_b64)
+                diff = self._frame_diff(self.last_screen_sig, sig)   # 不论 force 都算：采集要用
                 if not force:
-                    diff = self._frame_diff(self.last_screen_sig, sig)
                     if diff < WATCH_SIMILARITY_THRESHOLD and not force:   # 用户明确要看时不去重
                         log.debug("陪看: 画面与上次评论时几乎没变（平均像素差 %.2f < %.1f），跳过不调模型",
                                   diff, WATCH_SIMILARITY_THRESHOLD)
+                        self._record_watch_skip("same", elapsed, diff=diff, frames=_n_frames)
                         return
                     log.debug("陪看: 画面变化 平均像素差 %.2f", diff)
-                comment = self._get_vision_comment(image_b64, force=force)
+                _earlier = self._watch_ring_pick()          # P2：环里更早的画面（可能为空）
+                _v0 = time.time()
+                comment = self._get_vision_comment(image_b64, force=force,
+                                                   image_b64_prev=_prev_b64,
+                                                   image_b64_earlier=_earlier)
+                # P0 基线采集：每次（含空回）都记一条；frames=1 是旧单帧样本，2 为多帧样本，可直接对比
+                self._record_watch_sample(comment, locals().get("diff"), force, elapsed,
+                                          time.time() - _v0,
+                                          frames=_n_frames + len(locals().get("_earlier") or []))
                 if comment:
                     # 只有"真的说了一句"才重置发言间隔（空回不吃间隔：间隔＝实际发言的间隔）
                     self.last_watch_comment_time = time.time()
@@ -7901,6 +8107,22 @@ class DesktopPet:
         except Exception as e:
             log.error(f"截图失败: {e}")
             return ""
+
+    def capture_screen_pair(self, gap_s=1.2):
+        """抓前后两帧（间隔 gap_s 秒）用于陪看。
+
+        为什么不缓存上一轮：陪看触发间隔 30~120 秒，隔一分钟的两帧只能看出
+        "场景变了"，看不出"手在动"；隔一秒的两帧才能说出具体动作。
+        返回 (prev_b64, cur_b64)，任一帧失败则回退成单帧（prev 为 None）。
+        """
+        first = self.capture_screen_base64()
+        if not first:
+            return None, ""
+        time.sleep(max(0.2, gap_s))
+        second = self.capture_screen_base64()
+        if not second:
+            return None, first
+        return first, second
 
     def _try_create_reading_event(self, ocr_text):
         """尝试识别阅读内容并创建事件锚点（精确→概括两步降级）"""
@@ -7977,7 +8199,8 @@ OCR文字：
         log.info("工具：看屏幕（focus=%s）→ %s", (focus or "")[:20], line[:40])
         return True, line
 
-    def _get_vision_comment(self, image_b64, force=False, focus=""):
+    def _get_vision_comment(self, image_b64, force=False, focus="", image_b64_prev=None,
+                            image_b64_earlier=None):
         """使用 OpenAI 兼容视觉模型分析截图"""
         if not self.vision_api_key:
             return "(worried) 请先设置视觉模型 API Key"
@@ -8010,15 +8233,24 @@ OCR文字：
                      "他要是连着玩了很久、或者节奏明显慢下来，可以顺口提一句让他歇会儿；不用每次都说。")
         force_line = "这一轮一定要说一句。" if force else ""
         # 他明确点名要你看什么时（"看看我拿到了什么"），把关注点揉进提示词，别答非所问
+        pair_line = ""
+        _older = list(image_b64_earlier or [])
+        if _older and image_b64_prev:
+            pair_line = ("画面一共给了 %d 张：前面几张是过去一分钟里不同时刻的，"
+                         "最后两张是刚才一秒内的前后两帧。" % (len(_older) + 2))
+        elif image_b64_prev:
+            pair_line = "画面给了前后两帧（约一秒的间隔）：先一张、后一张。"
         focus_line = ""
         if (focus or "").strip():
             focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()[:40]
         watch_instructions = f"""你在陪"{user_name}"一起看屏幕——可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件。
 你是{self.pet_name}，用你自己的语气说话，不用把自己调成某个样子。
-就当自己坐在旁边一块儿看着：画面里正在发生什么，顺口说一句就行，不用写观后感，也别去猜他在想什么。
+就当自己坐在旁边一块儿看着：你不是解说员，画面里有什么他自己看得见、不用替他复述，说你自己的反应就行；也别去猜他在想什么。
 画面上那只桌宠就是你自己，别把她认成别人、也别当成画面内容去评头论足。
+{pair_line}
 {focus_line}
-要说的就一句，别分两段。
+要说的就一句，别分两段。画面是连着变化的：别一张一张地描述，也别把画面里的东西挨个念——
+顺着内容的变化往下说（进行到哪了、接下来会怎样），或者说这画面看着是什么感觉。
 多数时候就是对画面的一句感慨；偶尔顺着话头问他一句就行，别每句都问。
 画面里是直播平台、弹幕或别人的操作 → 他在看；是他自己在操作 → 他在玩。记忆只能当闲聊的由头，不许盖过你现在看到的东西。
 如果画面正好勾起了之前聊过的事，就自然提一句；没有就不用硬找。
@@ -8033,7 +8265,9 @@ OCR文字：
                                                context_type="watch", image_b64=image_b64,
                                                memory_query=self._build_watch_query(),
                                                extra_context=said_block,
-                                               skip_sources={"watch"} if monologue else None)
+                                               skip_sources={"watch"} if monologue else None,
+                                               image_b64_prev=image_b64_prev,
+                                               image_b64_earlier=_older)
         try:
             resp = self._call_vision_model(messages, temperature=1.1, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code != 200:
@@ -8045,6 +8279,14 @@ OCR文字：
                 return None
             content_text = ""
             comment = raw_reply
+            # 10/19：实测模型偶尔吐全角 （normal），下面的情绪解析只认半角 ⇒ 先归一化，
+            # 否则 UI 上会看到"（normal）镜头一转…"这种标签泄漏进正文。
+            try:
+                comment = re.sub(r"^\s*[（(]\s*([A-Za-z_]+)\s*[）)]",
+                                 lambda m: "(" + m.group(1).lower() + ")",
+                                 comment, count=1)
+            except Exception:
+                pass
 
             def _try_load_vision_json(text):
                 candidates = [text]
@@ -8070,6 +8312,14 @@ OCR文字：
             if data:
                 content_text = (data.get("content") or "").strip()
                 comment = (data.get("comment") or "").strip()
+                # 10/19：上面那次归一化作用在 raw_reply（整段 JSON）上，解析出的 comment 还得再来一次
+                # —— 实测 15:23 那条就是以"（surprised）诶，大石头…"开头的。
+                try:
+                    comment = re.sub(r"^\s*[（(]\s*([A-Za-z_]+)\s*[）)]",
+                                     lambda m: "(" + m.group(1).lower() + ")",
+                                     comment, count=1)
+                except Exception:
+                    pass
             else:
                 m = re.search(r'"comment"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_reply, re.DOTALL)
                 if m:
@@ -9135,7 +9385,7 @@ OCR文字：
                 del_btn.grid(row=0, column=1, rowspan=2, padx=10, sticky="e")
         refresh_display()
 
-# ------------------------------- 阅读伴侣（EasyOCR）---------------------------------
+# ------------------------------- 阅读伴侣（RapidOCR）--------------------------------
 class ReadingCompanion:
     RING_MAX = 2000
     MIN_CHARS = 30
@@ -9166,16 +9416,17 @@ class ReadingCompanion:
         self._reader_loading = False
 
     def _init_reader(self):
-        """后台线程加载 EasyOCR，避免阻塞主线程 UI（首次使用需联网下载模型）"""
-        if self.reader is not None or not EASYOCR_AVAILABLE or self._reader_loading:
+        """后台线程加载 RapidOCR（PP-OCR ONNX，模型随包自带、不用联网）"""
+        if self.reader is not None or not RAPIDOCR_AVAILABLE or self._reader_loading:
             return
         self._reader_loading = True
         def _load():
             try:
-                self.reader = easyocr.Reader(['ch_sim', 'en'], gpu=False, verbose=False)
-                log.info("EasyOCR 引擎初始化成功")
+                from rapidocr import RapidOCR as _RapidOCR   # 延迟到这里：见文件头那段的说明
+                self.reader = _RapidOCR()
+                log.info("RapidOCR 引擎初始化成功")
             except Exception as e:
-                log.error(f"EasyOCR 初始化失败: {e}")
+                log.error(f"RapidOCR 初始化失败: {e}")
                 self.reader = None
             finally:
                 self._reader_loading = False
@@ -9203,15 +9454,15 @@ class ReadingCompanion:
             self.start()
 
     def start(self):
-        if not EASYOCR_AVAILABLE:
-            messagebox.showwarning("缺少依赖", "请安装 EasyOCR：\npip install easyocr")
+        if not RAPIDOCR_AVAILABLE:
+            messagebox.showwarning("缺少依赖", "请安装 RapidOCR：\npip install rapidocr onnxruntime")
             return
         self._init_reader()
         if self.reader is None:
             if self._reader_loading:
-                messagebox.showwarning("OCR 加载中", "EasyOCR 引擎仍在加载（首次使用需联网下载模型），请稍后再试。")
+                messagebox.showwarning("OCR 加载中", "RapidOCR 引擎仍在加载，请稍后再试。")
             else:
-                messagebox.showwarning("OCR 初始化失败", "EasyOCR 引擎启动失败，请检查网络或重新安装。")
+                messagebox.showwarning("OCR 初始化失败", "RapidOCR 引擎启动失败，请检查依赖是否装好。")
             return
         self.load_config()
         self.text_ring = ""
@@ -9268,7 +9519,8 @@ class ReadingCompanion:
             if self.reader is None:
                 return
             img_np = np.array(pil_img)
-            results = self.reader.readtext(img_np, detail=0, paragraph=False)
+            _ocr_out = self.reader(img_np)          # RapidOCROutput：.txts / .boxes / .scores
+            results = list(getattr(_ocr_out, "txts", None) or [])
             text = ' '.join(results).strip()
             if not re.search(r'[一-鿿]', text):
                 return
