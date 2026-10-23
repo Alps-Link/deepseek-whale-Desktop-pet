@@ -228,6 +228,20 @@ def _cn_num_to_int(s):
     return _CN_DIGITS.get(s)
 
 
+_DSML_RE = re.compile(r"<[|｜]+\s*DSML\s*[|｜]+.*?(?:</[|｜]+\s*DSML\s*[|｜]+\s*calls\s*>|$)", re.S)
+
+
+def _strip_dsml(text):
+    """剥掉模型偶尔漏出来的原生工具调用语法（<｜｜DSML｜｜ ...>），别让她把它念出来。"""
+    if not text or "DSML" not in str(text):
+        return text
+    cleaned = _DSML_RE.sub("", str(text)).strip()
+    # 只剩标点/空白时当作没有内容
+    if cleaned and not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", cleaned):
+        return ""
+    return cleaned
+
+
 def _parse_pick_num(text):
     """解析 '第2首'/'第二首'/'2号'/'二号'/'3' 这类点歌编号；不是编号返回 None"""
     m = re.match(r"^第?([0-9一二三四五六七八九十两]+)\s*(首|号)?$", (text or "").strip())
@@ -247,6 +261,50 @@ def load_music_dir():
     except Exception:
         pass
     return MUSIC_REPO_DIR if os.path.isdir(MUSIC_REPO_DIR) else None
+
+
+def load_music_mode():
+    """音乐来源模式：local（本地曲库）/ web（网页版播放器）。默认 local"""
+    try:
+        m = (_get_section("tools").get("music_mode") or "local").strip().lower()
+        return "web" if m == "web" else "local"
+    except Exception:
+        return "local"
+
+
+def save_music_mode(mode):
+    """保存音乐来源模式（local/web）"""
+    try:
+        sec = _get_section("tools")
+        sec["music_mode"] = "web" if str(mode).lower() == "web" else "local"
+        _update_section("tools", sec)
+        return True
+    except Exception as e:
+        log.warning("保存音乐模式失败: %s", e)
+        return False
+
+
+def load_music_web_url():
+    """网页版播放器网址（config.json 的 tools 节 music_web_url）"""
+    try:
+        return (_get_section("tools").get("music_web_url") or "").strip()
+    except Exception:
+        return ""
+
+
+def save_music_web_url(url):
+    """保存/清除网页版播放器网址（传空值=清除）"""
+    try:
+        sec = _get_section("tools")
+        if url and url.strip():
+            sec["music_web_url"] = url.strip()
+        else:
+            sec.pop("music_web_url", None)
+        _update_section("tools", sec)
+        return True
+    except Exception as e:
+        log.warning("保存网页版网址失败: %s", e)
+        return False
 
 
 def save_music_dir_setting(path):
@@ -366,6 +424,20 @@ except ImportError:
     except ImportError:
         lazy_pinyin = None
         PINYIN_AVAILABLE = False
+
+# 浏览器媒体控制（网页版模式下"浏览器就是音乐播放器"）。可选层。
+try:
+    import browser_media as _browser
+except Exception as _e:
+    _browser = None
+    logging.getLogger(__name__).warning("浏览器媒体控制不可用: %s", _e)
+
+# TTS 压低外部声音（浏览器/音乐播放器）。可选层：装不上就整体关闭，宠物照常跑。
+try:
+    import media_duck as _duck
+except Exception as _e:
+    _duck = None
+    logging.getLogger(__name__).warning("外部声音压低不可用: %s", _e)
 
 # OCR（读书伴侣）——10/19 从 EasyOCR 换成 RapidOCR（PP-OCR ONNX 模型）：
 # EasyOCR 自己会 `import torch`（torch_cpu.dll 294MB + 约 1GB 提交内存、成品多背几百 MB），
@@ -3366,17 +3438,18 @@ class DesktopPet:
             "function": {
                 "name": "control_music",
                 "description": "控制本地音乐播放与音量（播放用户电脑曲库里的本地歌曲文件）。"
-                               "用户说“放首歌/来点音乐/播放某首歌/我想听xxx/把音乐停了/别放了”时调用；"
+                               "用户说“放首歌/来点音乐”时调用（**配了播放器时会优先打开播放器**，没配才用本地曲库）；"
+                               "“播放某首具体的歌/我想听xxx”走本地曲库搜；"
                                "用户想听某语言的歌（日语/英语/俄语/韩语/中文歌）或某歌手的歌时用 lang/artist 过滤；"
                                "用户不知道歌名时用 list_songs 弹出歌曲选择框，之后说“放第X首”用 play_index；"
-                               "用户说“声音小一点/太吵了/调大点/音量调到60”这类话时用 set_volume，"
-                               "给绝对数用 value，只说要大点小点用 delta（正数调大、负数调小）。",
+                               "音量就是本地曲库这一路（网页版的音量归浏览器自己调）。"
+                               "设置里选网页版模式时，“放首歌”会打开网页版播放器；本地模式走本地曲库，两种模式互斥。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string",
                                    "enum": ["play_random", "play_song", "play_index",
-                                            "list_songs", "stop", "set_volume"],
+                                            "list_songs", "stop", "set_volume", "open_player"],
                                    "description": "play_random=随机播放；play_song=按歌名播放；"
                                                   "play_index=按编号播放(配 index)；"
                                                   "list_songs=弹歌曲选择框(配 lang/artist)；stop=停止；"
@@ -3418,6 +3491,28 @@ class DesktopPet:
                     "required": [],
                 },
             },
+        }, {
+            "type": "function",
+            "function": {
+                "name": "control_browser",
+                "description": "控制**浏览器里正在放的东西**（网页版音乐/视频）。设置里选“网页版”时，"
+                               "浏览器就是音乐播放器 —— 他说“暂停/继续/下一首/现在放的什么/跳到一半”就调这个。"
+                               "只控浏览器，不碰桌面播放器和其他程序。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string",
+                                   "enum": ["status", "play", "pause", "toggle", "next", "prev", "seek", "volume"],
+                                   "description": "status=问现在放什么；seek=跳进度（配 seek_to）；"
+                                                  "volume=调浏览器音量（配 value 或 delta）"},
+                        "value": {"type": "integer", "description": "volume 时：0~100 的目标音量"},
+                        "delta": {"type": "integer", "description": "volume 时：相对调整（正数加大、负数减小）"},
+                        "seek_to": {"type": "number",
+                                    "description": "seek 时：0~1 比例（0.6=跳到 60%），大于 1 当秒数"},
+                    },
+                    "required": ["action"],
+                },
+            },
         }]
 
     # ---------- 本地音乐播放（control_music 工具）----------
@@ -3433,6 +3528,21 @@ class DesktopPet:
                     files.append(os.path.join(root, n))
         return d, sorted(files)
 
+    def _stop_local_music_now(self):
+        """直接停掉本地音乐（不走 control_music，避免网页版模式下的模式闸门拦它）。"""
+        self._music_pending = None
+        try:
+            self._music_stop_evt.set()
+        except Exception:
+            pass
+        self._music_running = False
+        self._music_duck = None
+        self._music_current = None
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+
     def control_music(self, action, song="", lang="", artist="", index=0,
                       value=None, delta=None):
         """本地音乐控制（工具入口）：
@@ -3441,40 +3551,19 @@ class DesktopPet:
         set_volume 用 value(0~100 绝对) 或 delta(±相对) 调音乐基础音量（10/16 新增）。
         播放采用“先说话后开播”：挂起歌单，等本轮 TTS 说完再真正开始。"""
         action = (action or "").strip().lower()
+        # 10/22 用户要求：网页版模式下**绝不**调用本地播放功能（音量除外）
+        if load_music_mode() == "web" and action not in ("play_random", "play", "", "set_volume", "volume"):
+            return False, "现在是网页版模式，本地曲库那套不用了（想用本地就说“切到本地音乐”）"
         log.info("本地音乐控制: action=%s song=%s lang=%s artist=%s index=%s value=%s delta=%s",
                  action, song, lang, artist, index, value, delta)
         if action in ("set_volume", "volume"):
-            # 用对话调音乐音量：先算目标值（不给就报当前），夹到 0~100，落盘并立刻生效
-            cur = int(round(self._music_volume * 100))
-            if value is None and delta is None:
-                return True, f"现在音乐音量是 {cur}%（说“大一点/小一点”或给个 0~100 的数都行）"
-            try:
-                if value is not None:
-                    new = int(round(float(value)))
-                else:
-                    new = cur + int(round(float(delta)))
-            except (TypeError, ValueError):
-                return False, "没听清要调到多少，给个 0~100 的数吧"
-            new = max(0, min(100, new))
-            self._music_volume = new / 100.0
-            save_music_volume_setting(new)
-            self._fade_gen += 1            # 取消进行中的淡变，免得旧的把新值盖掉
-            try:
-                pygame.mixer.music.set_volume(self._music_volume_now())
-            except Exception:
-                pass
-            log.info("音乐音量 %d%% → %d%%（对话设置）", cur, new)
-            return True, f"音乐音量调到 {new}% 了"
+            # 10/22 用户要求：和播放一样，"选哪个就只调那个" ——
+            # 网页版模式下调音量 = 调浏览器的音量；本地模式才是本地曲库那一路。
+            if load_music_mode() == "web":
+                return self.control_browser("volume", value=value, delta=delta)
+            return self._set_local_music_volume(value, delta)
         if action in ("stop",):
-            self._music_pending = None
-            self._music_stop_evt.set()
-            self._music_running = False
-            self._music_duck = None
-            self._music_current = None
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
+            self._stop_local_music_now()
             try:
                 self._ui(lambda: self.clear_song_picker())
             except Exception:
@@ -3509,6 +3598,9 @@ class DesktopPet:
                                         f"歌手{artist}" if artist else "") if x)
             return False, f"没找到{why}（仓库共 {len(files)} 首）"
         if action in ("play_random", "play", ""):
+            # 10/22：网页版模式 ⇒ 打开网页版播放器；本地模式 ⇒ 走本地曲库
+            if load_music_mode() == "web":
+                return self.open_music_web()
             playlist = list(cand)
             random.shuffle(playlist)
         elif action in ("play_song", "song"):
@@ -3877,6 +3969,18 @@ class DesktopPet:
         现在 TTS 有自己的声道，音乐不必让位 —— 背景音不断，也不会再出现"等她说完
         音乐才从断点跳回来"那一下。
         """
+        # 10/22 用户要求：TTS 时**也要压低浏览器/播放器的声音**（不只压我们自己的音乐）。
+        # 这个判断必须放在下面"本地音乐没在播就 return"之前，否则本地没播时永远不会压外部。
+        try:
+            if _duck is not None and _duck.AVAILABLE:
+                # 按"当前音量 × 比例"压，且记住是哪个进程（restore 要还回同一个）
+                _saved = _duck.duck(TTS_DUCK_RATIO, TTS_FADE_OUT_MS / 1000.0)
+                if _saved:
+                    self._ext_duck_saved = _saved
+                    log.info("压低外部声音: %s %d%% → %d%%", _saved[0], _saved[1],
+                             int(round(_saved[1] * TTS_DUCK_RATIO)))
+        except Exception as _e:
+            log.debug("压低外部声音失败: %s", _e)
         with self._audio_channel_lock:
             if not self._music_running or not self._music_current:
                 return False
@@ -3897,6 +4001,17 @@ class DesktopPet:
         self._music_duck = None
         if ducked:
             self._fade_music_to(self._music_volume, TTS_FADE_IN_MS)
+        # 10/22：把她压低的外部声音还原
+        try:
+            _saved = getattr(self, "_ext_duck_saved", None)
+            if _saved and _duck is not None:
+                _duck.restore(_saved, TTS_FADE_IN_MS / 1000.0)
+                log.info("恢复外部声音: %s → %d%%", _saved[0], int(_saved[1]))
+        except Exception as _e:
+            log.debug("恢复外部声音失败: %s", _e)
+        finally:
+            self._ext_duck_saved = None
+
 
     def show_greeting(self):
         greetings = [
@@ -4914,7 +5029,7 @@ class DesktopPet:
             tools = self._chat_tools_schema()
             system = self._effective_system_prompt()
             if tools:
-                system += ("\n\n【工具使用】你有一个工具：control_music，用于直接播放本地音乐文件"
+                system += ("\n\n【工具使用】你有几个工具。control_music 用于直接播放本地音乐文件"
                            "（用户说“放首歌/来点音乐/播放某首歌/我想听xxx/把音乐停了/别放了”时调用；"
                            "歌名不明确就随机播放；要听日语/英语/俄语/中文歌或某歌手的歌时按语言/歌手筛选；"
                            "用户不知道歌名时用 list_songs 弹出歌曲选择框，然后“放第X首/第二首”即可)。"
@@ -4951,7 +5066,7 @@ class DesktopPet:
             if resp.status_code == 200:
                 msg = resp.json()["choices"][0]["message"]
                 content = self._extract_message_content(msg)
-                for _round in range(2):
+                for _round in range(3):      # 10/21：允许"再调一次工具"（例如先 play_song 失败、再 list_songs）
                     calls = msg.get("tool_calls")
                     if not calls:
                         break
@@ -4975,6 +5090,10 @@ class DesktopPet:
                                 args.get("index") or 0,
                                 args.get("value"),
                                 args.get("delta"))
+                        elif fname == "control_browser":
+                            ok, note = self.control_browser(
+                                str(args.get("action", "") or ""), args.get("seek_to"),
+                                args.get("value"), args.get("delta"))
                         elif fname == "look_at_screen":
                             ok, note = self.look_at_screen(str(args.get("focus", "") or ""))
                         else:
@@ -4984,12 +5103,16 @@ class DesktopPet:
                     messages.append({"role": "assistant", "content": content, "tool_calls": calls})
                     for tid, res in tool_msgs:
                         messages.append({"role": "tool", "tool_call_id": tid, "content": res})
+                    # 10/21：这一轮也必须带 tools —— 不带的话模型想继续调工具时只能自己编
+                    # 原生语法（<｜｜DSML｜｜ invoke ...>），那段字会被当正文念出来
                     resp2 = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS,
-                                                  timeout=30)
+                                                  timeout=30, tools=tools, tool_choice="auto")
                     if resp2.status_code != 200:
                         break
                     msg = resp2.json()["choices"][0]["message"]
                     content = self._extract_message_content(msg)
+                if content:
+                    content = _strip_dsml(content)      # 兜底：残留的原生工具语法绝不念出来
                 if content:
                     return content
                 return "(happy) 好啦，已经帮你处理了！"
@@ -5078,10 +5201,38 @@ class DesktopPet:
             self._mouth_job = self.root.after(2000, lambda: self.spine.set_mouth(0) if self.spine else None)
         if self.hide_reply_bubble and not status:
             # 隐藏回复气泡：不碰气泡窗，但"说完了"这件事还得照常通知（免唤醒窗口靠它开）
+            # 10/23 修：收回表情原来挂在气泡淡出里 ⇒ 气泡不显示就永远收不回来，
+            # 表情会一直挂着直到点她或说下一句。这里按"气泡本该消失的时刻"自己收。
+            try:
+                if getattr(self, "_reply_expr_job", None):
+                    self.root.after_cancel(self._reply_expr_job)
+            except Exception:
+                pass
+            _hold_ms = max(4000, int(len(text or "") * 50) + 10000)
+            try:
+                self._reply_expr_job = self.root.after(
+                    _hold_ms, self._restore_expression_after_reply)
+            except Exception:
+                self._reply_expr_job = None
             if refresh_voice:
                 self._on_output_finished(True)
             return
+        # 显示气泡这条路由气泡淡出负责收表情；顺手取消隐藏模式下挂着的定时器，免得提前收脸
+        try:
+            if getattr(self, "_reply_expr_job", None):
+                self.root.after_cancel(self._reply_expr_job)
+                self._reply_expr_job = None
+        except Exception:
+            pass
         self.bubble_window.show_text(text, refresh_voice=refresh_voice)
+
+    def _restore_expression_after_reply(self):
+        """隐藏气泡模式下，回复显示一段时间后把表情收回中性。"""
+        self._reply_expr_job = None
+        try:
+            self.restore_expression()
+        except Exception:
+            pass
 
     def set_text_model_settings(self):
         """文本模型设置：API 地址 + 密钥 + 模型名（OpenAI 兼容）"""
@@ -8175,6 +8326,136 @@ OCR文字：
         b = np.frombuffer(sig_b, dtype=np.uint8).astype(np.int16)
         return float(np.abs(a - b).mean())
 
+    def open_music_web(self):
+        """网页版模式：打开网页版播放器，或让它开始播放。
+
+        10/22 用户报的问题：浏览器首次打开时不会自动播放（浏览器拦截自动播放），
+        他说"开始播放"时她又开了一遍网页（多开一个标签页）。
+        修法：**浏览器里已经有媒体会话 ⇒ 只发"播放"给它，不再开新页**；没有会话才打开网址。
+        """
+        if _browser is not None and _browser.AVAILABLE:
+            try:
+                _st = _browser.status()
+            except Exception:
+                _st = None
+            if _st:
+                if _st.get("status") == "playing":
+                    return True, "已经在放啦"
+                ok, err = _browser.control("play")
+                if ok:
+                    # 浏览器会拦"程序发起的播放"（自动播放策略）：接口回成功、实际没播。
+                    # 所以必须过一会儿回查真状态，别谎报"开始放了"。
+                    for _ in range(10):
+                        time.sleep(0.12)
+                        try:
+                            if ((_browser.status() or {}).get("status")) == "playing":
+                                return True, "开始放了"
+                        except Exception:
+                            break
+                    return False, ("浏览器拦了自动播放（它不让程序点播放）——"
+                                   "你点一下网页里的播放按钮，或者在浏览器里允许这个网站自动播放")
+                return False, "浏览器那边不让播（%s）——你点一下网页里的播放按钮" % (err or "没响应")
+        url = load_music_web_url()
+        if not url:
+            return False, "还没设置网页版播放器网址（右键 设置 → 音乐库设置 里填一个网址）"
+        # 没有媒体会话，但网页可能刚开过（播放页是"加载了但没注册会话"的状态）。
+        # 10/22 用户报："要求开始还是再开一个窗口" ⇒ 10 分钟内不再重开，直接说明白。
+        _last = getattr(self, "_web_player_opened_at", 0)
+        if time.time() - _last < 600:
+            return True, ("网页版还开着呢（浏览器不让程序自动播放），"
+                          "你在那边点一下播放按钮就行，不用再开一个窗口")
+        try:
+            import webbrowser
+            if webbrowser.open(url):
+                self._web_player_opened_at = time.time()
+                # 10/22 实测的硬限制：网页**第一次**播放之前，浏览器不会给这个页面注册媒体会话，
+                # 所以她那会儿根本"看不见"它，也没法让它开始放 —— 只能用户手动点一下。
+                # 播放过一次之后会话就一直在，之后暂停/继续/切歌/调音量都正常。
+                return True, "网页版播放器打开了（第一次请点一下播放，之后我就能接了）"
+            return False, "浏览器没能打开这个网址"
+        except Exception as e:
+            log.warning("打开网页版失败: %s", e)
+            return False, "网页打不开（%s）" % str(e)[:40]
+
+    def _set_local_music_volume(self, value=None, delta=None):
+        """调"我们曲库这一路音乐"的音量（落盘 + 立刻生效）。"""
+        cur = int(round(self._music_volume * 100))
+        if value is None and delta is None:
+            return True, f"现在音乐音量是 {cur}%（说“大一点/小一点”或给个 0~100 的数都行）"
+        try:
+            if value is not None:
+                new = int(round(float(value)))
+            else:
+                new = cur + int(round(float(delta)))
+        except (TypeError, ValueError):
+            return False, "没听清要调到多少，给个 0~100 的数吧"
+        new = max(0, min(100, new))
+        self._music_volume = new / 100.0
+        save_music_volume_setting(new)
+        self._fade_gen += 1            # 取消进行中的淡变，免得旧的把新值盖掉
+        try:
+            pygame.mixer.music.set_volume(self._music_volume_now())
+        except Exception:
+            pass
+        log.info("音乐音量 %d%% → %d%%（对话设置）", cur, new)
+        return True, f"音乐音量调到 {new}% 了"
+
+    def control_browser(self, action, seek_to=None, value=None, delta=None):
+        """控制浏览器里在放的东西（网页版模式下它就是音乐播放器）。"""
+        if _browser is None or not _browser.AVAILABLE:
+            return False, "这台机器读不到浏览器的媒体会话"
+        act = (action or "").strip().lower()
+        if act == "volume":
+            # 10/22：浏览器音量（走 pycaw 的按程序音量，和音量合成器里拖滑块是同一件事）
+            proc = None
+            try:
+                st0 = _browser.status() or {}
+                app = (st0.get("app") or "").lower()
+                for k in ("edge", "chrome", "firefox", "brave", "opera", "vivaldi"):
+                    if k in app:
+                        proc = ("msedge" if k == "edge" else k)
+                        break
+            except Exception:
+                proc = None
+            cur = _duck.get_volume(proc) if _duck is not None else None
+            if cur is None:
+                return False, "读不到浏览器音量（它现在没在出声？）"
+            if value is None and delta is None:
+                return True, "浏览器音量现在是 %d%%" % cur
+            new = int(value) if value is not None else cur + int(delta)
+            new = max(0, min(100, new))
+            if not _duck.set_volume(new, proc):
+                return False, "音量没调成"
+            return True, "浏览器音量调到 %d%% 了" % new
+        if act in ("status", "what", "info"):
+            st = _browser.status()
+            if not st:
+                return False, "浏览器里没有在放东西"
+            prog = ""
+            if st["position"] >= 0 and st["duration"] > 0:
+                def _mmss(x):
+                    x = int(max(0, x))
+                    return "%d:%02d" % (x // 60, x % 60)
+                prog = "（%s / %s）" % (_mmss(st["position"]), _mmss(st["duration"]))
+            if st["status"] == "paused":
+                prog += "，现在是暂停着"
+            who = ("——" + st["artist"]) if st["artist"] else ""
+            return True, "浏览器里在放《%s》%s%s" % (st["title"] or "?", who, prog)
+        ok, err = _browser.control(act, seek_to)
+        if not ok:
+            return False, err or "浏览器没响应"
+        if act in ("pause",):
+            return True, "暂停了"
+        if act in ("play",):
+            return True, "继续放了"
+        st = _browser.status() or {}
+        title = (st.get("title") or "").strip()
+        if act in ("next", "prev"):
+            return True, ("切到《%s》了" % title) if title else "切好了"
+        if act == "toggle":
+            return True, ("现在在放《%s》" % title) if st.get("status") == "playing" and title else "好"
+        return True, ("《%s》" % title) if title else "好"
+
     def look_at_screen(self, focus=""):
         """看一眼当前屏幕并按他的关注点说一句（工具入口，10/17 新增）。
 
@@ -9262,45 +9543,102 @@ OCR文字：
 
     # ---------- 音乐库设置 ----------
     def open_music_library_settings(self):
-        """音乐库设置：直接填写本地音乐文件夹路径（免迁移），或恢复内置曲库"""
-        win, frame = self._make_card_window("音乐库设置", 680, 400)
+        """音乐库设置：顶部切换"本地曲库 / 网页版"，两套设置分开显示。"""
+        win, frame = self._make_card_window("音乐库设置", 680, 560)
         s = self._dpi_scale
-        cfg_dir = ""
-        try:
-            cfg_dir = (_get_section("tools").get("music_dir") or "").strip()
-        except Exception:
-            pass
-        active = load_music_dir() or ""
-        src = f"自定义音乐库：{cfg_dir}" if cfg_dir else f"内置曲库：{MUSIC_REPO_DIR}"
-        tk.Label(frame, text=f"当前音乐来源：{src}", font=(self.font_family, 11, "bold"),
-                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w", pady=(10, 2), padx=16)
-        tk.Label(frame, text="填写你自己的音乐文件夹路径（支持子文件夹；mp3/flac/ogg/wav），\n"
-                             "保存后无需把歌复制进内置曲库，说“放首歌”即可播放：",
-                 font=(self.font_family, 10), fg=TEXT_SUB, bg=DIALOG_BG,
-                 justify="left").pack(anchor="w", padx=16)
-        entry = RoundedEntry(frame, width=int(580 * s), height=int(34 * s), radius=int(8 * s),
-                             font=(self.font_family, 10))
-        entry.pack(pady=6, padx=16)
-        entry.set(active or "")
-        tk.Label(frame, text="留空并点“保存”= 恢复内置曲库；填了不存在的路径会提示",
-                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG).pack(anchor="w", padx=16)
+        mode_var = tk.StringVar(value=load_music_mode())
+        # ── 顶部：模式切换 ──
+        tk.Label(frame, text="音乐来源", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w", padx=16, pady=(12, 6))
+        btn_row = tk.Frame(frame, bg=DIALOG_BG)
+        btn_row.pack(anchor="w", padx=16)
 
-        # 音乐基础音量（她说话时在此基础上再压低，不影响那个压低比例）
-        vol_row = tk.Frame(frame, bg=DIALOG_BG)
-        vol_row.pack(anchor="w", padx=16, pady=(12, 2))
+        def render_buttons():
+            for w in btn_row.winfo_children():
+                w.destroy()
+            for val, label in (("local", "本地曲库"), ("web", "网页版")):
+                _selected = (mode_var.get() == val)
+                RoundedButton(btn_row, text=label, command=lambda v=val: pick(v),
+                              variant=("primary" if _selected else "subtle"),
+                              width=int(140 * s), height=int(36 * s), radius=int(8 * s),
+                              font=(self.font_family, 11)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(frame, text="两种模式互斥：本地模式下不会去碰网页，网页模式下不会动本地曲库。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify="left").pack(anchor="w", padx=16, pady=(6, 0))
+
+
+        # 固定容器：本地/网页两块都在它里面切换，外层顺序永不变
+        # （踩过的坑：直接对 frame 里的块 pack_forget + pack，切一次就排到队尾，把下面的按钮顶到上面去）
+        mode_host = tk.Frame(frame, bg=DIALOG_BG)
+        mode_host.pack(anchor="w", fill="x")
+        tk.Label(frame, text=" ", font=(self.font_family, 6), bg=DIALOG_BG).pack()
+
+        # ── 本地曲库 ──
+        local_box = tk.Frame(mode_host, bg=DIALOG_BG)
+        tk.Label(local_box, text="音乐文件夹", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w")
+        tk.Label(local_box, text="支持子文件夹；mp3/flac/ogg/wav。留空并保存 = 用内置曲库。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify="left").pack(anchor="w", pady=(2, 4))
+        dir_entry = RoundedEntry(local_box, width=int(580 * s), height=int(34 * s),
+                                 radius=int(8 * s), font=(self.font_family, 10))
+        dir_entry.pack(anchor="w")
+        dir_entry.set(load_music_dir() or "")
+        vol_row = tk.Frame(local_box, bg=DIALOG_BG)
+        vol_row.pack(anchor="w", pady=(10, 0))
         tk.Label(vol_row, text="音量", width=4, anchor="w", font=(self.font_family, 11, "bold"),
                  fg=TEXT_MAIN, bg=DIALOG_BG).pack(side=tk.LEFT)
         vol_entry = RoundedEntry(vol_row, width=int(80 * s), height=int(34 * s),
                                  radius=int(8 * s), font=(self.font_family, 10))
         vol_entry.pack(side=tk.LEFT, padx=(4, 4))
         vol_entry.set(str(int(round(self._music_volume * 100))))
-        tk.Label(vol_row, text="%（0~100）", font=(self.font_family, 10),
+        tk.Label(vol_row, text="%（0~100，只作用于本地曲库）", font=(self.font_family, 10),
                  fg=TEXT_SUB, bg=DIALOG_BG).pack(side=tk.LEFT)
 
+
+        # ── 网页版 ──
+        web_box = tk.Frame(mode_host, bg=DIALOG_BG)
+        tk.Label(web_box, text="播放器网址", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w")
+        tk.Label(web_box, text="填网页版音乐站的地址，例如 https://music.163.com/ 。"
+                               "说“放首歌”时她会用浏览器打开它，之后能暂停/切歌/调进度。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify="left").pack(anchor="w", pady=(2, 4))
+        url_entry = RoundedEntry(web_box, width=int(580 * s), height=int(34 * s),
+                                 radius=int(8 * s), font=(self.font_family, 10))
+        url_entry.pack(anchor="w")
+        url_entry.set(load_music_web_url())
+
+        def render_mode():
+            """按当前模式显示对应那一块，并重画两个切换按钮（选中=实心，另一个=白底）"""
+            for w in (local_box, web_box):
+                w.pack_forget()
+            if mode_var.get() == "web":
+                web_box.pack(anchor="w", fill="x", padx=16)
+            else:
+                local_box.pack(anchor="w", fill="x", padx=16)
+            render_buttons()
+
+        def pick(mode):
+            mode_var.set(mode)
+            if mode == "web":
+                # 10/22 修：本地放着歌时切到网页版，本地音乐还在响、而网页版模式又把所有本地控制
+                # 都拒了 ⇒ 停不下来。切过去时先把本地直接停掉。
+                try:
+                    if getattr(self, "_music_running", False) or getattr(self, "_music_current", None):
+                        self._stop_local_music_now()
+                        log.info("切到网页版：已停止本地音乐")
+                except Exception as _e:
+                    log.debug("切模式停本地音乐失败: %s", _e)
+            render_mode()
+
+        render_mode()
+
+        # ── 底部按钮 ──
         def do_save(reset=False):
-            path = "" if reset else entry.get().strip()
+            path = "" if reset else str(dir_entry.get()).strip()
             if path and not os.path.isdir(path):
-                messagebox.showwarning("路径无效", f"文件夹不存在：\n{path}")
+                messagebox.showwarning("路径无效", f"文件夹不存在：{path}")
                 return
             raw_vol = str(vol_entry.get()).strip()
             try:
@@ -9311,10 +9649,28 @@ OCR文字：
             if not (0 <= vol <= 100):
                 messagebox.showwarning("音量无效", "音量请填 0~100 之间的整数")
                 return
-            ok_dir = save_music_dir_setting(path)
-            ok_vol = save_music_volume_setting(vol)
-            if ok_dir or ok_vol:
-                # 换库后清掉旧的轮转/浏览/挂起/卡片状态
+            url = str(url_entry.get()).strip()
+            if url and not re.match(r"^https?://", url, re.I):
+                messagebox.showwarning("网址无效", f"要填 http/https 开头的网址：{url}")
+                return
+            ok_any = False
+            try:
+                ok_any = save_music_dir_setting(path) or ok_any
+            except Exception:
+                pass
+            try:
+                ok_any = save_music_volume_setting(vol) or ok_any
+            except Exception:
+                pass
+            try:
+                ok_any = save_music_web_url(url) or ok_any
+            except Exception:
+                pass
+            try:
+                ok_any = save_music_mode(mode_var.get()) or ok_any
+            except Exception:
+                pass
+            if ok_any:
                 self._music_list_state.clear()
                 self._music_browse = []
                 self._music_pending = None
@@ -9322,15 +9678,13 @@ OCR文字：
                     self.clear_song_picker()
                 except Exception:
                     pass
-                # 音量立刻生效：取消正在进行的淡变，按"此刻是否在说话"设一次
                 self._music_volume = vol / 100.0
                 self._fade_gen += 1
                 try:
                     pygame.mixer.music.set_volume(self._music_volume_now())
                 except Exception:
                     pass
-                msg = "已恢复内置曲库" if reset else "音乐库已更新"
-                messagebox.showinfo("成功", f"{msg}，说“放首歌”试试吧")
+                messagebox.showinfo("成功", "已恢复内置曲库" if reset else "音乐库设置已保存")
                 win.destroy()
 
         btns = tk.Frame(frame, bg=DIALOG_BG)
@@ -9340,7 +9694,7 @@ OCR文字：
                       font=(self.font_family, 11)).pack(side=tk.LEFT, padx=8)
         RoundedButton(btns, text="恢复内置曲库", command=lambda: do_save(reset=True),
                       variant="subtle", width=int(160 * s), height=int(34 * s),
-                      radius=int(8 * s), font=(self.font_family, 11)).pack(side=tk.LEFT, padx=8)
+                      radius=int(8 * s), font=(self.font_family, 10)).pack(side=tk.LEFT)
 
     # ---------- 历史记录面板 ----------
     def show_chat_history_panel(self):
