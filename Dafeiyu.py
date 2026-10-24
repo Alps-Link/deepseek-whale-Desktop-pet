@@ -1006,6 +1006,30 @@ def _strip_inline_markers(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+_META_COMMENT_PAT = re.compile(
+    r"已按|按规则|按提示|按你的要求|生成评论|事件标签|输出\s*JSON|JSON\s*格式|"
+    r"我(?:已|会|将|来)(?:生成|输出|给出|完成|按)|作为(?:一个)?(?:AI|助手)|"
+    r"这是(?:一条|我的|生成的)|^(?:好的|收到|明白)[，,。]?$", re.I)
+
+
+def _strip_meta_comment(text):
+    """清掉"我做了什么"式的元话语，返回真正该说的那句（没有就返回空串）。
+
+    10/24 实测：陪看时模型吐过"已按规则生成评论与事件标签"——这句话被气泡念出来、
+    还写进了记忆。这是**输出契约**错误（把任务回执当台词），不是风格问题。
+    只拦明显的回执/模板前缀，正常台词一律不动。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"^(?:【[^】]{1,8}】\s*)+", "", t).strip()      # 【陪玩】/【陪看】
+    t = re.sub(r"^(?:我|她)\s*[：:]\s*", "", t).strip()        # 我：/她：
+    body = re.sub(r"^\((\w+)\)\s*", "", t).strip()          # 去掉情绪括号再看内容
+    if _META_COMMENT_PAT.search(body):
+        return ""
+    return t
+
+
 DEFAULT_USER_PROFILE = {
     "nickname": "你",
     "birthday": "未知",
@@ -1052,6 +1076,7 @@ WATCH_SESSION_MAX = 5
 WATCH_SEGMENT_SECONDS = 300
 WATCH_EVENT_MAX_LEN = 300  # 陪看事件最大字数：超限强制 AI 压缩并硬截断
 WATCH_ANTI_REPEAT = 5      # 陪玩反重复：把最近 N 条已说过的评论列给模型，并禁止复用其句式
+WATCH_TEMPERATURE = 0.98   # 陪看评论的温度（10/23 用户指定 0.98；过低会平、过高会飘）
 WATCH_MONOLOGUE_TURNS = 2  # 末尾连续这么多轮陪玩、且中间没有用户发言 → 视为独白（才断回喂）
 WATCH_SIG_SIZE = (64, 36)          # 画面指纹尺寸：缩成这么小的灰度图，用来判断两帧像不像
 WATCH_RING_EVERY = 8.0     # P2 环形缓冲：陪玩期间每 8 秒抓一张（0.125Hz，CPU 可忽略）
@@ -5072,6 +5097,8 @@ class DesktopPet:
                         break
                     # 执行工具并把结果回填给模型，让它用人设口吻总结
                     tool_msgs = []
+                    look_reply = None      # 看屏幕的回答模式下，视觉模型那句话直接当回复
+                    other_tool = False     # 这一轮还调了别的工具（那就不走直出）
                     for tc in calls:
                         tid = tc.get("id") or ""
                         fn = tc.get("function") or {}
@@ -5081,6 +5108,8 @@ class DesktopPet:
                         except Exception:
                             args = {}
                         log.info("工具调用: %s args=%s", fname, json.dumps(args, ensure_ascii=False))
+                        if fname != "look_at_screen":
+                            other_tool = True
                         if fname == "control_music":
                             ok, note = self.control_music(
                                 str(args.get("action", "")),
@@ -5096,6 +5125,8 @@ class DesktopPet:
                                 args.get("value"), args.get("delta"))
                         elif fname == "look_at_screen":
                             ok, note = self.look_at_screen(str(args.get("focus", "") or ""))
+                            if ok:
+                                look_reply = note
                         else:
                             tool_msgs.append((tid, f"ERROR 未知工具: {fname}"))
                             continue
@@ -5103,6 +5134,13 @@ class DesktopPet:
                     messages.append({"role": "assistant", "content": content, "tool_calls": calls})
                     for tid, res in tool_msgs:
                         messages.append({"role": "tool", "tool_call_id": tid, "content": res})
+                    # 10/23：看屏幕的"回答模式"已经把完整回答产出了（它拿的是同一套上下文），
+                    # 再让文本模型改写一遍只会让"看到的"和"说出来的"不一致，还多一次调用 ⇒ 直出。
+                    # 只有这一轮全是看屏幕才这样；还调了别的工具就照常回填总结（要念执行结果）。
+                    if look_reply and not other_tool:
+                        log.info("看屏幕：直接采用视觉模型的回答（不再二次改写）")
+                        content = look_reply
+                        break
                     # 10/21：这一轮也必须带 tools —— 不带的话模型想继续调工具时只能自己编
                     # 原生语法（<｜｜DSML｜｜ invoke ...>），那段字会被当正文念出来
                     resp2 = self._call_text_model(messages, temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS,
@@ -8110,7 +8148,12 @@ class DesktopPet:
         self._watch_ring_on = False
 
     def _watch_ring_pick(self, n=None):
-        """从环里挑 n 张更早的画面（最早 + 均匀分布），返回 b64 列表（旧→新）。"""
+        """从环里挑 n 张更早的画面（最早 + 均匀分布），返回 b64 列表（旧→新）。
+
+        10/24 试过"按画面变化最大的时刻挑"，被用户否掉（"保持时间先后连贯更重要"）：
+        变化大的时刻会挤在一起，时间轴断了，她就说不出"这一段的过程"，只会抓着一下猛说。
+        ⇒ 恢复按时间均匀取。要治"重复帧"应另做发图层面的去重，别动取样策略。
+        """
         n = WATCH_RING_SEND if n is None else n
         ring = list(getattr(self, "_watch_ring", []) or [])
         if len(ring) < 2 or n <= 0:
@@ -8473,15 +8516,15 @@ OCR文字：
             return False, f"截图失败：{e}"
         if not image_b64:
             return False, "截图失败，没拿到画面"
-        line = self._get_vision_comment(image_b64, force=True, focus=focus)
+        line = self._get_vision_comment(image_b64, force=True, focus=focus, look=True)
         line = (line or "").strip()
         if not line:
             return False, "看了一眼，没看清"
-        log.info("工具：看屏幕（focus=%s）→ %s", (focus or "")[:20], line[:40])
+        log.info("工具：看屏幕（focus=%s）→ %s", (focus or "")[:20], line[:80])
         return True, line
 
     def _get_vision_comment(self, image_b64, force=False, focus="", image_b64_prev=None,
-                            image_b64_earlier=None):
+                            image_b64_earlier=None, look=False):
         """使用 OpenAI 兼容视觉模型分析截图"""
         if not self.vision_api_key:
             return "(worried) 请先设置视觉模型 API Key"
@@ -8523,40 +8566,60 @@ OCR文字：
             pair_line = "画面给了前后两帧（约一秒的间隔）：先一张、后一张。"
         focus_line = ""
         if (focus or "").strip():
-            focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()[:40]
-        watch_instructions = f"""你在陪"{user_name}"一起看屏幕——可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件。
-你是{self.pet_name}，用你自己的语气说话，不用把自己调成某个样子。
-就当自己坐在旁边一块儿看着：你不是解说员，画面里有什么他自己看得见、不用替他复述，说你自己的反应就行；也别去猜他在想什么。
-画面上那只桌宠就是你自己，别把她认成别人、也别当成画面内容去评头论足。
+            focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()
+        # 10/23：回答模式（look_at_screen）。他要的是"回答"，不是"陪看感慨"。
+        # 只有这一条路直接把视觉模型的输出当最终回复（不再过文本模型，省一次调用）。
+        _look_q = (focus or "").strip()
+        if look and not _look_q:
+            with self._memory_lock:
+                for _t in reversed(list(self.chat_buffer)):
+                    if _t[0].get("source") != "watch":
+                        _look_q = (_t[1].get("content") or "").strip()[:80]
+                        break
+        look_instructions = f"""你看的是"{user_name}"的屏幕，他指着画面上的东西问你一件事：「{_look_q}」
+你要**直接回答他**，不要只给一句感慨，也不要反问他"你想让我看什么"。
+怎么答：第一句说你在这张画面上看到的**依据**（哪句话、什么数字、什么状态），第二句给你的判断（真的假的／可信可疑／这是什么东西）。总共不超过 70 字。
+语气用你自己的，开头一个情绪括号。别复述整个画面，别把画面里的东西挨个念。
+画面上那只桌宠就是你自己，别把她认成别人。
+如果画面里根本看不出他在问什么，就直说看不出，别编。
+请严格输出 JSON，不要 markdown 代码块：{{"comment": "开头一个情绪括号 + 你要说的那一句话"}}"""
+        watch_instructions = f"""你在陪"{user_name}"一起看屏幕（可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件）。
+你是{self.pet_name}，用你自己的语气说话。
 {pair_line}
 {focus_line}
-要说的就一句，别分两段。画面是连着变化的：别一张一张地描述，也别把画面里的东西挨个念——
-顺着内容的变化往下说（进行到哪了、接下来会怎样），或者说这画面看着是什么感觉。
-多数时候就是对画面的一句感慨；偶尔顺着话头问他一句就行，别每句都问。
-画面里是直播平台、弹幕或别人的操作 → 他在看；是他自己在操作 → 他在玩。记忆只能当闲聊的由头，不许盖过你现在看到的东西。
-如果画面正好勾起了之前聊过的事，就自然提一句；没有就不用硬找。
+不要只描述画面内容——画面里有什么他自己看得见。说你自己的反应、想法，或者想到的事。
 {rest_line}
-这一轮如果你没什么想说的，comment 就留空，不用硬凑。{force_line}
+没什么想说的，comment 就留空，不用硬凑。{force_line}
 {said_block}
-请严格输出JSON，不要markdown代码块。**先写 comment（你要说的那句），再补 content（记录用）**：
-{{"comment": "开头一个情绪括号 + 一句话；没什么想说的就留空字符串", "content": "一句话事件标签：在玩/在看什么 + 当前阶段，20~40字；不要罗列画面细节，不要写数字/倒计时/坐标/UI数值"}}
+请严格输出JSON，不要markdown代码块：
+{{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "content": "一句话事件标签：在玩/在看什么 + 当前阶段，20~40字；不要罗列画面细节，不要写数字/倒计时/坐标/UI数值"}}
 """
 
-        messages = self.build_context_messages(self._effective_system_prompt(), watch_instructions,
-                                               context_type="watch", image_b64=image_b64,
-                                               memory_query=self._build_watch_query(),
-                                               extra_context=said_block,
-                                               skip_sources={"watch"} if monologue else None,
-                                               image_b64_prev=image_b64_prev,
-                                               image_b64_earlier=_older)
+        messages = self.build_context_messages(
+            self._effective_system_prompt(),
+            look_instructions if look else watch_instructions,
+            context_type=("look" if look else "watch"), image_b64=image_b64,
+            memory_query=(_look_q if look else self._build_watch_query()),
+            extra_context=("" if look else said_block),
+            skip_sources={"watch"} if (monologue and not look) else None,
+            image_b64_prev=image_b64_prev,
+            image_b64_earlier=_older)
         try:
-            resp = self._call_vision_model(messages, temperature=1.1, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
+            # 陪看走 WATCH_TEMPERATURE（0.98）；看屏幕的回答模式用 0.7 更稳
+            resp = self._call_vision_model(messages, temperature=(0.7 if look else WATCH_TEMPERATURE),
+                                           max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code != 200:
                 log.error(f"视觉模型 API 返回非200: {resp.status_code} {resp.text[:200]}")
                 return None
 
             raw_reply = self._extract_message_content(resp.json()["choices"][0]["message"]).strip()
             if not raw_reply:
+                return None
+            # 10/24：输出被截断时宁可不说，也别把半句念出去（实测 13:34 那条
+            # "…一眼就瞅见我自" 就是 JSON 没写完，正则兜底抠出了半句话）。
+            _r = raw_reply.rstrip()
+            if _r.startswith("{") and not _r.endswith("}"):
+                log.warning("视觉输出疑似被截断（JSON 没闭合），丢弃本次评论: %s", _r[-40:])
                 return None
             content_text = ""
             comment = raw_reply
@@ -8609,10 +8672,16 @@ OCR文字：
                 if m2:
                     content_text = m2.group(1).replace('\\"', '"').replace("\\n", "\n").strip()
 
+            if look:
+                content_text = ""        # 回答模式不写陪看摘要/锚点，免得影响下一轮陪看
             self._watch_last_summary = content_text or ""   # 本次（可能为空）：空则不复用上次摘要
             if content_text:
                 self._watch_last_anchor = content_text
                 self._update_watch_session(content_text)
+            # 10/24：模型偶尔会吐"元话语"——输出的是"我做了什么"而不是"要说的话"
+            # （实测 13:29 那条："已按规则生成评论与事件标签"，还进了 TTS 和记忆）。
+            # 这属于输出契约错误，不是风格问题 ⇒ 在这里直接当空回丢掉，不写记忆不出声。
+            comment = _strip_meta_comment(comment)
             if not comment:
                 return None
             if not re.match(r'\(\w+\)', comment.strip()):
