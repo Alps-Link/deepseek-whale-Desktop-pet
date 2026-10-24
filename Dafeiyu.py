@@ -1002,6 +1002,10 @@ def _strip_inline_markers(text):
         return m.group(0)              # 非情绪词（动作/描述括号）保留原文
     text = re.sub(r'((?:^[ \t]*)|(?:[，。！？、；：\n][ \t]*))([（(]\s*([A-Za-z]+)\s*[）)])([ \t]*)',
                   _repl, text, flags=re.M)
+    # 10/24：模型偶尔把"思考备注"当情绪标签写出来——"(thinking前先不给情绪) 唔，那我房间就当…"。
+    # 真动作括号是中文开头（（挠头）），规则：**括号内容以英文字母开头的，一律当元标注剥掉**。
+    text = re.sub(r'((?:^[ \t]*)|(?:[，。！？、；：\n][ \t]*))[（(]\s*[A-Za-z][^）)]{0,60}[）)][ \t]*',
+                  lambda m: m.group(1), text, flags=re.M)
     # 压缩连续空行
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
