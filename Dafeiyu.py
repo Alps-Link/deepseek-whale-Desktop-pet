@@ -1151,12 +1151,15 @@ TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊
 最近已经聊过的话题（不要重复它们，也不要聊同类题材，更不要用相同句式）：
 {recent_topics}
 
+{material_block}
+
 要求：
 - 情景描述不要超过25字，选项不要超过8个字。
 - 保持大肥鱼的语气：可爱、口语、直率——想到什么就说什么，不端着。
-- 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、想被摸头、今天的小得意、今天犯的小傻、困了或者饿了。
+- 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、今天的小得意、今天犯的小傻、困了或者饿了。
 - 不要连着用同一种开头（比如不要总说"今天看到……"），分享、提问、关心要交替出现。
-- 不要强势提问，多用分享和闲聊的语气，偶尔撒个娇。
+- 不要强势提问，多用分享和闲聊的语气。
+- **上面那些真实发生过的事优先**：能从里面挑一件说起就挑，比凭空编一件小事自然得多；都不合适再自己找话题。
 - 可以参考以下风格示例（从你的话题库里随机抽的，仅作风格参考，不要照抄）：
 {topic_examples}
 
@@ -1707,6 +1710,106 @@ def save_topic_history(history):
     if len(history) > 50:
         history = history[-50:]
     save_json_file(TOPIC_HISTORY_FILE, history)
+
+TOPIC_MATERIAL_FILE = os.path.join(CONFIG_DIR, "topic_material.jsonl")
+TOPIC_MATERIAL_MAX = 200          # 最多留多少条素材
+TOPIC_MATERIAL_HOURS = 24         # 只取最近多少小时内的事
+_TOPIC_MATERIAL_LOCK = threading.Lock()
+
+
+def _read_topic_materials():
+    """读素材文件（JSONL，坏行跳过）。返回 list[dict]。"""
+    out = []
+    try:
+        if not os.path.exists(TOPIC_MATERIAL_FILE):
+            return out
+        with open(TOPIC_MATERIAL_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("text"):
+                    out.append(d)
+    except Exception as e:
+        log.warning("读取话题素材失败: %s", e)
+    return out
+
+
+def _write_topic_materials(items):
+    try:
+        tmp = TOPIC_MATERIAL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            for d in items[-TOPIC_MATERIAL_MAX:]:
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
+        os.replace(tmp, TOPIC_MATERIAL_FILE)
+    except Exception as e:
+        log.warning("写入话题素材失败: %s", e)
+
+
+def add_topic_material(text, source="event"):
+    """把一件**真实发生过的事**攒进素材池，供话题生成取材（10/25 治话题生硬）。"""
+    try:
+        t = " ".join((text or "").split())
+        if len(t) < 6:
+            return
+        t = t[:120]
+        with _TOPIC_MATERIAL_LOCK:
+            items = _read_topic_materials()
+            for old in items[-40:]:
+                o = old.get("text", "")
+                if not o:
+                    continue
+                if o == t:
+                    return
+                try:
+                    import difflib
+                    if difflib.SequenceMatcher(None, o, t).ratio() >= 0.9:
+                        return
+                except Exception:
+                    pass
+            items.append({"t": time.time(), "src": source, "text": t, "used": 0})
+            _write_topic_materials(items)
+    except Exception as e:
+        log.warning("话题素材写入失败: %s", e)
+
+
+def load_topic_materials(limit=5, hours=None):
+    """取最近未用过的事（默认 24 小时内、最多 5 条），新的在前。"""
+    try:
+        hours = TOPIC_MATERIAL_HOURS if hours is None else hours
+        cutoff = time.time() - hours * 3600
+        with _TOPIC_MATERIAL_LOCK:
+            items = _read_topic_materials()
+        fresh = [x for x in items
+                 if float(x.get("t") or 0) >= cutoff and not x.get("used")]
+        fresh.sort(key=lambda x: float(x.get("t") or 0), reverse=True)
+        return fresh[:limit]
+    except Exception as e:
+        log.warning("读取话题素材失败: %s", e)
+        return []
+
+
+def mark_topic_materials_used(texts):
+    """标记这些素材已经被拿去生成过话题，别反复用。"""
+    try:
+        wanted = set(texts or [])
+        if not wanted:
+            return
+        with _TOPIC_MATERIAL_LOCK:
+            items = _read_topic_materials()
+            now = time.time()
+            for d in items:
+                if d.get("text") in wanted and not d.get("used"):
+                    d["used"] = now
+            _write_topic_materials(items)
+    except Exception as e:
+        log.warning("标记话题素材失败: %s", e)
+
+
 
 def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=None):
     """由角色姓名 + 人设 + 回复规则拼系统提示词（"你是{名字}，"与情绪括号格式由代码内置）。
@@ -6716,6 +6819,7 @@ class DesktopPet:
         content = content.strip()
         if len(content) < 2:
             return
+        add_topic_material(content, "event")   # 真事攒进素材池，给话题取材
         with self._memory_lock:
             events = self.memory_data.setdefault("events", [])
             if not force_new:
@@ -7687,6 +7791,14 @@ class DesktopPet:
                 except Exception:
                     probe_hint = ""
 
+            # 10/25：取材——把今天真实发生过的事塞进提示词（治“话题生硬”）
+            _materials = load_topic_materials(limit=5)
+            if _materials:
+                _mat_lines = ["- " + str(m["text"]) for m in _materials]
+                material_block = "今天真实发生过的事（挑一件说起最自然）：" + chr(10) + chr(10).join(_mat_lines)
+            else:
+                material_block = "（今天还没发生什么特别的事，按你自己的想法找话题）"
+
             _start_all = time.time()
             for attempt in range(2):
                 _t0 = time.time()
@@ -7708,7 +7820,8 @@ class DesktopPet:
                     topic_examples = ""
                 prompt = TOPIC_PROMPT.format(pet_name=self.pet_name, user_name=user_name,
                                              recent_topics=recent_txt,
-                                             topic_examples=topic_examples)
+                                             topic_examples=topic_examples,
+                                             material_block=material_block)
                 if seen_rejected:
                     prompt += ("\n注意：你刚才生成的内容与最近话题重复了（" +
                                "；".join(seen_rejected[-2:]) +
@@ -7732,6 +7845,7 @@ class DesktopPet:
                                 save_topic_history(self.topic_history)
                                 log.info(f"话题生成 第{attempt+1}次 成功，耗时 {time.time()-_t0:.1f}s")
                                 self._ui(lambda: self.show_event_bubble(context, opt1, opt2))
+                                mark_topic_materials_used([m["text"] for m in _materials])
                                 return
                             else:
                                 seen_rejected.append(context)
@@ -8269,6 +8383,7 @@ class DesktopPet:
                                           frames=_n_frames + len(locals().get("_earlier") or []))
                 if comment:
                     # 只有"真的说了一句"才重置发言间隔（空回不吃间隔：间隔＝实际发言的间隔）
+                    add_topic_material(comment, "watch")   # 她看到的画面事实也给话题取材
                     self.last_watch_comment_time = time.time()
                     self.last_screen_sig = sig
                     if any(w in comment for w in ('休息', '歇', '累', '睡', '眼睛')):
