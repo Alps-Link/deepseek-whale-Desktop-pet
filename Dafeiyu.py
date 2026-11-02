@@ -465,13 +465,34 @@ TTS_API_KEY_FILE = os.path.join(CONFIG_DIR, "tts_api_key.json")
 TTS_SPEAKER_ID_FILE = os.path.join(CONFIG_DIR, "tts_speaker_id.json")
 
 def _atomic_write_text(filepath, text, encoding="utf-8"):
-    """原子写入文本文件：先写临时文件，再替换正式文件"""
-    tmp_path = filepath + ".tmp"
-    with open(tmp_path, "w", encoding=encoding) as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, filepath)
+    """原子写入文本文件：先写临时文件，再替换正式文件。
+
+    10/28 两个并发修正：
+    ①tmp 名带进程/线程标识 —— 固定名会让两条线程互相截断，写出来的文件少一半；
+    ②Windows 上 `os.replace` 撞到"目标正被别的线程打开"会抛 WinError 5（拒绝访问），
+      短暂退避后重试即可；失败必须把 tmp 清掉，别在目录里堆垃圾。
+    """
+    tmp_path = "%s.%d.%d.tmp" % (filepath, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp_path, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        last_err = None
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, filepath)
+                return
+            except PermissionError as e:      # 目标被占用：等一会儿再来
+                last_err = e
+                time.sleep(0.008 * (attempt + 1))
+        raise last_err
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 # ------------------------- 统一配置文件 config.json -------------------------
 # 设置/密钥/开关以前每种一个文件（llm_config / tts_config / tts_api_key / topic_config /
@@ -744,6 +765,49 @@ def save_tts_config(enabled=None, mode=None, japanese=None,
     sec["japanese"] = (sec.get("volc_lang") == "ja")  # 旧键跟着走，别的版本读它也不会错
     _update_section("tts", sec)
 
+# 11/01：主动话题的频率内置（用户拍板"不再手动调节、保持开启、按时段加权"）。
+# 令牌桶模型：每小时按「时段权重」回填额度，攒够 1 个才可能开口；桶最多存 2 个。
+TOPIC_PROACTIVE_PER_DAY = 12      # 日均主动话题条数（总量由它定，形态由权重定）
+TOPIC_HOUR_WEIGHTS = ((0, 0.005), (8, 1.0), (12, 0.25), (14, 1.0), (21, 0.5), (24, 0.005))
+TOPIC_WEIGHT_RAMP_H = 0.5        # 每个边界前后各用半小时线性过渡（11/01：阶梯改成曲线，避免 12:00/14:00 硬跳）
+TOPIC_MAX_SILENCE_H = 6          # 超过这么久没主动说过就强制一句（只在 8:00–24:00 生效）
+TOPIC_MIN_GAP_MIN = 25            # 两次主动话题之间至少隔这么久（防扎堆）
+TOPIC_TICK_SECONDS = 300          # 每 5 分钟结算一次
+TOPIC_RATE_BOOST = 1.5            # 补偿"最小间隔"挡掉的那部分，让实际日均落在 12 次左右
+
+
+def topic_hour_weight(hour, minute=0):
+    """连续时段权重：平台段保持、边界前后半小时线性过渡。"""
+    t = float(hour) + float(minute) / 60.0
+    prev_val = TOPIC_HOUR_WEIGHTS[0][1]
+    for h, v in TOPIC_HOUR_WEIGHTS[1:]:
+        start = h - TOPIC_WEIGHT_RAMP_H
+        if t < start:
+            return prev_val
+        if t < h:
+            return prev_val + (v - prev_val) * (t - start) / TOPIC_WEIGHT_RAMP_H
+        prev_val = v
+    return prev_val
+
+
+def topic_weight_total():
+    """全天权重的积分（按 5 分钟采样求和，够准）"""
+    total = 0.0
+    for m in range(0, 24 * 60, 5):
+        total += topic_hour_weight(m // 60, m % 60) * (5.0 / 60.0)
+    return total
+
+
+def topic_refill_per_hour():
+    """基准速率（次/小时）；实际还要再乘当时段的权重。
+
+    × TOPIC_RATE_BOOST 是补偿"最小间隔"挡掉的那部分——被挡掉的抽签直接作废，
+    实测会把日均从 12 压到 ~10，所以先按 1.35 倍发。
+    """
+    total = topic_weight_total()
+    return (TOPIC_PROACTIVE_PER_DAY * TOPIC_RATE_BOOST / total) if total > 0 else 0.0
+
+
 def load_topic_config():
     """加载话题定时器状态（开关/间隔模式：fixed=固定分钟，random=随机区间分钟）"""
     data = _get_section("topic")
@@ -954,12 +1018,20 @@ MAX_OUTPUT_TOKENS = 32768         # 截断后自动加倍的天花板
 
 # 说话方式 / 禁修辞：默认这份"反八股"规则；设置里可改，清空＝完全不注入这一段
 DEFAULT_STYLE_RULES = """像真人当面聊天，不是写文章：
-- 禁用书面连接词与套路词：首先、其次、然后、总之、综上、值得注意的是、不得不说、说到底、换句话说、某种意义上、这让我想到。
-- 禁用对举与排比：不要“不是…而是…”“既…又…”“与其…不如…”，不要连续三句同结构。
-- 不要在结尾总结、升华或抒情；说完要说的事就停，允许一句话就结束。
-- 不必回应对方说的每一点，挑一个点说；允许只应一声。
-- 允许口语与停顿：诶、欸、嘛、啊、嗯、哈、喔、省略号、半截话。
-- 比喻少用，一句里最多一个意象，别堆。"""
+- 用平时张嘴就会说的词，不用写作文的词：视线、脚步、动静、除此之外、不由得这类。
+- 不用书面连接词和套路词：首先、其次、然后、总之、值得注意的是、不得不说、说到底、换句话说。
+- 不用对举和排比：不要“不是…而是…”“既…又…”“与其…不如…”，也别连续三句一个结构。
+- 想到哪说到哪：一句话能说完的就一口气说完，别切成一截一截；长一点短一点都行。
+- 不用每次都劝他做事，也不用每次都说自己在替他盯着。
+- 说完要说的事就停：不总结、不升华、不抒情；比喻少用，一句一个意象就够。
+
+【语言举例】（语气参照，不是照抄的模板）
+- 被夸：「真的假的，我还有这本事？」／「嘿嘿，那你要不要多夸我两句。」
+- 看到你翻车：「噗，这也行啊。」／「我就说嘛，那箱子底下不能有好东西，你还不信我。」
+- 你连着坐太久：「你从坐下就没挪过窝，嗓子都干了吧，去倒杯水。」
+- 她自己犯傻：「等等，不对啊，我刚才说啥来着。」／「如果我说我不会，你不会笑话我吧。」
+- 单纯感叹（很短）：「喔，这地方我来过。」
+- 要劝你但把话说完（长句示范）：「你要真想省钱，就先把柜子里那堆用不上的东西收拾出来，反正放着也是落灰，别一边说没地方一边又往家买。」"""
 
 # 合法情绪词（半角括号内唯一允许的标注词）
 EMOTION_WORDS = {"relaxed", "happy", "hurried", "normal", "shy", "surprised", "worried",
@@ -1059,15 +1131,48 @@ MAX_EVENTS = 40
 ARCHIVE_TTL_DAYS = 5        # 归档（冷存）记忆的保留天数：超过就彻底遗忘删除
 ARCHIVE_PROTECT_DAYS = 2    # 新记忆保护期：创建不满这么多天的条目不参与淘汰（让刚记下的先有机会被想起）
 # 性格画像固定清单：写死 8 只一致，AI 只能往这些条目里填内容，无权自创/增删条目
+# 10/28：去掉「其他」——它是兜底垃圾筐，什么都能塞进去，等于不分类。
+# 归不进这 11 类的观察改走 profile.user_notes（自由句）。
 TRAIT_LIST = ["作息习惯", "饮食习惯", "游戏偏好", "内容偏好", "音乐偏好",
               "兴趣爱好", "性格特质", "工作学业", "健康与情绪", "社交与人际",
-              "对我的态度", "其他"]
+              "对我的态度"]
 MAX_TRAIT_EVIDENCE = 5      # 每个画像条目最多保留的观察证据条数（满则丢最旧）
+# 10/28：自我认知层 —— self / about_user / lesson 这三类不进经历池，单独存进 profile["notes"]，
+# 每轮注入、永不淘汰（否则"她是什么样的人"会跟"昨天看了什么"抢名额）。
+PROFILE_NOTES_MAX = 15
+
+# 11/01：归纳 —— 把多条经历压成"关于他 / 关于我"的稳定认知（写进 user_notes / notes）。
+# 提取只负责记下经历；这一步才负责"从经历里看出这个人是什么样"。
+INDUCE_MIN_NEW = 6              # 新增这么多条经历后归纳一次
+INDUCE_MIN_GAP_MIN = 30         # 两次归纳至少隔这么久（防重复调用）
+INDUCE_RECENT_N = 12            # 归纳时看最近多少条经历
+
+PROACTIVE_GLANCE_RATIO = 0.5    # 每次主动开口里「瞟一眼屏幕说一句」占一半（其余是找话题）
+TOPIC_OPTION_TTL_MIN = 10          # 话题的两个选项最多留多久（分钟）；超时自动收掉，别让旧选项一直挂着
+PROFILE_NOTE_CHARS = 60      # 单条上限
+PROFILE_NOTE_DUP_COS = 0.85  # 自我认知判重阈值（向量余弦；"我只认他一个人管" vs "…老大…" 约 0.95）
 CONTEXT_TRAITS = 8          # 注入上下文时最多携带的画像条数（按最近更新排序）
 CONTEXT_TRAIT_EVIDENCE = 1  # 注入上下文时每条画像附带的最新证据条数
 TOPIC_PROBE_CHANCE = 0.4    # 话题轮次中带画像采集方向的概率（其余轮次纯闲聊，防连问）
+# 10/28：注入按"一个池"算预算（不再 5 话题 + 5 经历分开给名额）
+MEMORY_INJECT_MAX = 8
+MEMORY_INJECT_CHARS = 600
 CONTEXT_TOPICS = 5
 CONTEXT_EVENTS = 5
+# 10/28：importance 不再由模型打分（实测 topics 全 0.5、events 挤在 0.4~0.8，无区分度），
+# 改成提取时先分类、再按常数表映射。howto 不写记忆。
+KIND_SCORES = {
+    "self": 0.9,        # 她的立场/自我认知 → 不走经历池（进画像），分数仅作兜底
+    "about_user": 0.9,  # 他的属性/习惯/忌讳 → 进 traits
+    "lesson": 0.9,      # 被纠正过的事
+    "experience": 0.6,  # 共同经历
+    "observe": 0.3,     # 陪看流水账（最先淘汰）
+    "howto": 0.0,       # 操作流程：不写
+}
+# 10/28：淘汰半衰期按 kind 定 —— observe 7 天、experience 30 天、其余不衰减。
+# 与"注入次数"彻底解耦：只看 重要性 / 真被用过或提过 / 证据数 / 收藏。
+KIND_HALF_LIFE_DAYS = {"observe": 7.0, "experience": 30.0}
+OBSERVE_PENALTY = 0.6
 MEMORY_RELEVANCE_THRESHOLD = 0.35  # 语义召回注入门槛：低于此相关度，本轮不注入旧记忆（原 0.45；调低让"触景生情"更容易被弱相关触发）
 EXTRACTION_TRIGGER = 10
 MEMORY_DECAY_DAYS = 7
@@ -1076,20 +1181,57 @@ MEMORY_EVENT_DUP_THRESHOLD = 0.92
 MEMORY_CANDIDATE_TOPIC_THRESHOLD = 0.60
 MEMORY_CANDIDATE_EVENT_THRESHOLD = 0.70
 MEMORY_CANDIDATE_MAX = 3
+WATCH_QUERY_ANCHORS = 3      # 拼记忆召回 query 时最多用最近几条陪看评论
 WATCH_SESSION_MAX = 5
 WATCH_SEGMENT_SECONDS = 300
 WATCH_EVENT_MAX_LEN = 300  # 陪看事件最大字数：超限强制 AI 压缩并硬截断
+WATCH_EVENT_MIN_COMMENTS = 3   # 10/28：一场陪玩评论数不超过这么多，就不留事件（省得流水账占记忆）
 WATCH_ANTI_REPEAT = 5      # 陪玩反重复：把最近 N 条已说过的评论列给模型，并禁止复用其句式
+WATCH_RECALL_LINK_MIN = 0.65       # "想起旧事"要弹气泡的召回相关度下限（10/30：0.55→0.65，抬高质量）
+WATCH_RECALL_PER_COMMENTS = 4   # 10/31 用户：每 4 条评论才攒 1 次"想起旧事"额度
+WATCH_RECALL_LINK_MAX = None       # 保留旧名（None=不再用它做硬上限）
+WATCH_RECALL_LINK_COOLDOWN = 1800  # 同一条记忆这么多秒内不再提
+WATCH_RECALL_LINK_GAP = 1.2        # 等她这一轮 TTS 念完后，固定停顿多少秒再补这句
 WATCH_TEMPERATURE = 0.98   # 陪看评论的温度（10/23 用户指定 0.98；过低会平、过高会飘）
 WATCH_MONOLOGUE_TURNS = 2  # 末尾连续这么多轮陪玩、且中间没有用户发言 → 视为独白（才断回喂）
-WATCH_SIG_SIZE = (64, 36)          # 画面指纹尺寸：缩成这么小的灰度图，用来判断两帧像不像
-WATCH_RING_EVERY = 8.0     # P2 环形缓冲：陪玩期间每 8 秒抓一张（0.125Hz，CPU 可忽略）
-WATCH_RING_KEEP = 8        # 留最近 8 张 ≈ 1 分钟
-WATCH_RING_SEND = 3        # 每次评论额外捎上几张更早的（1 分钟里均匀取 3 个时刻）
+WATCH_SIG_SIZE = (64, 36)
+WATCH_COLOR_SIZE = (160, 90)   # 11/01 色彩指纹：缩到这个尺寸算 HSV 直方图（只统计分布、不看位置）          # 画面指纹尺寸：缩成这么小的灰度图，用来判断两帧像不像
+# 10/30：时间轴改成多分辨率 —— 缓冲区覆盖 ring_seconds 秒，采样分两级：
+#   近层 4 帧（最近几秒，格 960 宽，看得清字幕）+ 远层 8 帧（更早，格 640 宽，只看动势）
+WATCH_RING_EVERY = 1.5     # 抓帧间隔（留多长由 ring_seconds 决定）
+WATCH_RING_SECONDS = 20    # 环形缓冲覆盖时长（20 秒 ≈ 14 张，内存 1.8 MB；直播换场景快，60 秒太远）
+WATCH_RING_KEEP = 14       # = ceil(ring_seconds / every) + 1，启动时按配置重算
+WATCH_RING_SEND = 3        # 兼容旧路径：逐张单发时捎几张更早的
+WATCH_RECENT_FRAMES = 4    # 近层：最近 ~6 秒取 4 帧，格 960 宽
+WATCH_OLDER_FRAMES = 4     # 远层：更早那段取 4 帧，格 640 宽（2×2，约 0.9MP）
+# 用户 10/30 的定义：「关心」特指倒水/喝水/休息/眯一会这类内容，不是把话头引到用户身上
+# 只认"劝他去做"的完整说法：单字「睡/累/眼睛」会把「它睡着了」「眼睛发花」这类描述误判成关心
+WATCH_CARE_WORDS = ('倒水', '倒杯', '杯水', '喝水', '喝点水', '歇会', '歇一', '休息',
+                    '眯一会', '眯一下', '睡一会', '睡会儿', '早点睡', '去躺', '躺一会',
+                    '缓一缓', '打盹')
+WATCH_CARE_MAX = 2     # 一场陪玩最多给几次「让他歇会儿」的许可（超出就不再给）
 # 10/19：原来是 2 张（最早+中间），配上 1.2 秒那对前后帧后时间轴是 56/32/1.2/0，
 # 中间空 24 秒、末段空 31 秒 ⇒ 不匀。改成 3 张后是 ~56/40/24/1.2/0（间隔 16/16/23/1），
 # 覆盖更匀，代价是每次多 1 张图（视觉成本约 +25%）。
-WATCH_SIMILARITY_THRESHOLD = 1.4   # 平均像素差小于它就当"画面没变"、这轮不调模型（0~255 尺度）
+# 10/28：判据从“与上次开口那帧比”改成“本轮要发的那几张图互相比”——
+# motion = 相邻两张（旧→新）的平均像素差的最大值；窗口内都在动才算“有变化”。
+WATCH_MOTION_THRESHOLD = 1.4       # 十秒窗口内相邻帧差都小于它 ⇒ 画面没动，跳过
+WATCH_CHANGE_BIG = 12.0            # 与“上次开口那帧”的差大到这个量级（换场景/换游戏）⇒ 静止也放行
+# 10/30：触发时机的两个新参数 —— 决策粒度从 15 秒细化到 2 秒；动作最猛时先等它落定再开口
+# 11/01：时间轴整体后移 —— 模型 + TTS 落地约 4 秒，所以"锚点帧"取 4 秒前那张（说的自然是"刚才"）。
+WATCH_ANCHOR_AGE = 4.0           # 锚点帧距现在多少秒（= 她开口时的实际延迟）
+WATCH_NEAR_FROM = 5.5            # 近层时间窗起点（锚点 4 秒 + 一格 1.5 秒，避免和锚点同图）
+WATCH_NEAR_TO = 11.0             # 近层时间窗终点
+WATCH_FAR_FROM = 11.0            # 远层时间窗起点
+WATCH_POLL_DIV = 10.0       # 判断间隔 = 最短沉默 / 10（原来是 /2；仍是你的设置派生，只是更细）
+WATCH_POLL_MIN = 2.0        # 判断间隔下限（秒）
+WATCH_POLL_MAX = 6.0        # 判断间隔上限（秒）
+WATCH_SETTLE_MOTION = 20.0    # 10/30 实测：相邻帧差 p50=14.1/p90=30.8 ⇒ 6.0 会让 96.6% 都等，提到 p75 附近
+WATCH_SETTLE_SEC = 1.5        # 落定等待时长（等完再截当前帧，评论说的是结果而不是半空中）
+# 10/29：历史帧拼成一张网格图，把 5 张图的 token 预算压成「拼图(≤1000) + 当前帧(578)」
+WATCH_GRID_CELL_W = 960        # 每格宽（960 宽时文字识别率约 95%；640 宽只有 37%）
+WATCH_GRID_CELL_H = 540        # 每格高（含底部标签栏）
+WATCH_GRID_LABEL_H = 28        # 每格底部黑底标签栏高度，写「-10.5s」
 # 10/19 实测（34 分钟真实陪玩、21 条评论）：静态推荐页只有 0.084 / 0.088 / 1.248，
 # 真实画面 26.4~94.9（全部 ≥26）⇒ 两堆隔 20 倍，原来 0.08 会把"页面没动"也当成有变化、
 # 连着劝人点推荐。取 1.4：卡在静态最高的 1.248 之上（只留 0.15 余量，偏灵敏），
@@ -1145,7 +1287,7 @@ EXTRACTION_STATE_FILE = os.path.join(CONFIG_DIR, "extraction_state.json")  # 待
 
 # 日常话题生成提示词（宠物专属风格，{pet_name}/{user_name} 为占位符）
 TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊天话题。
-请生成一个简短的情景描述（你的提问或分享）和两个选项（用户可能的简短回答）。
+请生成一个情景描述（你的提问或分享）和两个选项（用户可能的简短回答）。
 格式必须严格如下，用竖线分隔三部分：情景描述|选项A|选项B
 
 最近已经聊过的话题（不要重复它们，也不要聊同类题材，更不要用相同句式）：
@@ -1154,8 +1296,7 @@ TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊
 {material_block}
 
 要求：
-- 情景描述不要超过25字，选项不要超过8个字。
-- 保持大肥鱼的语气：可爱、口语、直率——想到什么就说什么，不端着。
+- 选项不要超过8个字。
 - 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、今天的小得意、今天犯的小傻、困了或者饿了。
 - 不要连着用同一种开头（比如不要总说"今天看到……"），分享、提问、关心要交替出现。
 - 不要强势提问，多用分享和闲聊的语气。
@@ -1195,10 +1336,21 @@ LOCAL_TOPICS = [
 
 # ------------------------------- 工具函数 ---------------------------------
 def load_json_file(filepath, default):
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return default
+    # 10/28：另一条线程正在 os.replace 换文件时，这里可能撞上 PermissionError（Windows）。
+    # 短暂退避重试；重试完仍失败就抛出去 —— **不能静默返回 default**，否则上层会拿空数据覆盖真记忆。
+    if not os.path.exists(filepath):
+        return default
+    last_err = None
+    for attempt in range(6):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (PermissionError, FileNotFoundError) as e:
+            last_err = e
+            time.sleep(0.008 * (attempt + 1))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            raise
+    raise last_err
 
 def save_json_file(filepath, data):
     _atomic_write_text(filepath, json.dumps(data, ensure_ascii=False, indent=2))
@@ -1324,12 +1476,21 @@ def save_banned_words(text):
     _update_section("character", sec)
 
 def load_watch_config():
-    default = {"min_interval": 15, "max_silence": 120}
+    # 10/30：新增时间轴三项 —— 环形缓冲时长 / 近层帧数 / 远层帧数（缺省即默认）
+    default = {"min_interval": 15, "max_silence": 120, "ring_seconds": 20,
+               "recent_frames": 4, "older_frames": 4}
     data = _get_section("watch", default)
-    if "min_interval" not in data:
-        data["min_interval"] = 15
-    if "max_silence" not in data:
-        data["max_silence"] = 120
+    for _k, _v in (("min_interval", 15), ("max_silence", 120), ("ring_seconds", 20),
+                   ("recent_frames", 4), ("older_frames", 4)):
+        if _k not in data:
+            data[_k] = _v
+    # 夹取到安全范围：别让手滑的配置把内存或请求撑爆
+    try:
+        data["ring_seconds"] = max(6, min(300, int(data["ring_seconds"])))
+        data["recent_frames"] = max(2, min(4, int(data["recent_frames"])))
+        data["older_frames"] = max(0, min(8, int(data["older_frames"])))   # 上限 8 留给实验
+    except Exception:
+        data["ring_seconds"], data["recent_frames"], data["older_frames"] = 20, 4, 4
     # 兼容旧配置格式（迁移后写回，避免每次启动重复清理）
     _changed = False
     for _old_key in ("polling_interval", "min_count", "max_count"):
@@ -1556,6 +1717,28 @@ def save_voice_config(cfg):
 def save_chats(chats):
     save_json_file(CHATS_LOG_FILE, chats)
 
+def _mem_mentions(query, content, min_hits=3, min_ratio=0.05):
+    """他这句话是不是"字面提到了"这条记忆（10/28）。
+
+    为什么不用向量：实测「你还记得暗区突围那次撤离失败吗」这类问句，5 句里只召回 1 句
+    —— 问句里的"你还记得…吗"是噪声，把相似度拉平了。中文字面按二元组比对是确定性的：
+    真数据上目标命中 h=4/8/7、占比 8~15%，噪声句 h=0/0/2、占比 ≤1%，阈值 3 / 5% 分得开。
+    """
+    try:
+        q = "".join((query or "").split())
+        c = "".join((content or "").split())
+        if len(q) < 4 or len(c) < 4:
+            return False
+        cg = {c[i:i + 2] for i in range(len(c) - 1)}
+        qg = {q[i:i + 2] for i in range(len(q) - 1)}
+        if not cg:
+            return False
+        hit = len(cg & qg)
+        return hit >= min_hits and hit / len(cg) >= min_ratio
+    except Exception:
+        return False
+
+
 def load_memories():
     try:
         if _memory_db.has_data():
@@ -1585,7 +1768,12 @@ def load_memories():
     return data
 
 def save_memories(memories):
-    save_json_file(MEMORY_FILE, memories)
+    # 10/28：落盘失败（Windows 上目标被别的线程短暂打开）不应炸掉调用它的后台线程 ——
+    # 数据还在内存里，下一次保存会补上；这里只记一行 warning。
+    try:
+        save_json_file(MEMORY_FILE, memories)
+    except Exception as e:
+        log.warning(f"记忆 JSON 保存失败（下次会重试）: {e}")
     try:
         _memory_db.replace_all(memories)
     except Exception as e:
@@ -1713,7 +1901,9 @@ def save_topic_history(history):
 
 TOPIC_MATERIAL_FILE = os.path.join(CONFIG_DIR, "topic_material.jsonl")
 TOPIC_MATERIAL_MAX = 200          # 最多留多少条素材
-TOPIC_MATERIAL_HOURS = 24         # 只取最近多少小时内的事
+TOPIC_MATERIAL_HOURS = 12         # 只取最近多少小时内的事（11/01 24→12）
+TOPIC_MATERIAL_KEEP_HOURS = 12    # 超过这么久还没被用掉的素材直接删掉（11/01 48→12）
+TOPIC_MATERIAL_DUP_RATIO = 0.97   # 相似度到这个程度才算同一件事（0.9 会把模板化的句子误判成重复）
 _TOPIC_MATERIAL_LOCK = threading.Lock()
 
 
@@ -1741,6 +1931,9 @@ def _read_topic_materials():
 
 def _write_topic_materials(items):
     try:
+        # 11/01：写盘时剪掉过期没用掉的（否则 200 条上限会被老料永久占住）
+        _cut = time.time() - TOPIC_MATERIAL_KEEP_HOURS * 3600
+        items = [x for x in items if float(x.get("t") or 0) >= _cut]
         tmp = TOPIC_MATERIAL_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="") as f:
             for d in items[-TOPIC_MATERIAL_MAX:]:
@@ -1767,7 +1960,7 @@ def add_topic_material(text, source="event"):
                     return
                 try:
                     import difflib
-                    if difflib.SequenceMatcher(None, o, t).ratio() >= 0.9:
+                    if difflib.SequenceMatcher(None, o, t).ratio() >= TOPIC_MATERIAL_DUP_RATIO:
                         return
                 except Exception:
                     pass
@@ -1786,7 +1979,9 @@ def load_topic_materials(limit=5, hours=None):
             items = _read_topic_materials()
         fresh = [x for x in items
                  if float(x.get("t") or 0) >= cutoff and not x.get("used")]
-        fresh.sort(key=lambda x: float(x.get("t") or 0), reverse=True)
+        # 11/01：优先用"真事"（event 等），她自己的陪看评论只当兜底——
+        # 否则 187/200 条都是她说过的话，取材等于让她自我模仿。
+        fresh.sort(key=lambda x: (x.get("src") == "watch", -float(x.get("t") or 0)))
         return fresh[:limit]
     except Exception as e:
         log.warning("读取话题素材失败: %s", e)
@@ -1847,6 +2042,9 @@ INPUT_BG       = "#ffffff"
 
 # 对话框通用（Win11 卡片风格后为纯白）
 DIALOG_BG      = "#ffffff"
+STAR_ROW_BG    = "#e7ebff"     # 收藏行：比白底深的淡紫底
+ARCHIVE_ROW_BG = "#f1f2f4"     # 归档行：浅灰底
+ARCHIVE_ROW_FG = "#8b8f98"     # 归档行：灰字
 
 # 按钮
 BTN_PRIMARY    = "#8b5cf6"
@@ -3329,7 +3527,12 @@ class DesktopPet:
 
         # 记忆锚点（新格式：topics + events + profile）
         self._watch_last_anchor = ""
-        self._watch_last_summary = ""   # 本次陪玩评论对应的画面摘要（写历史用，别沿用上次的）
+        self._watch_last_spot = ""      # 本轮画面的极短定位标签（只用于历史 user 侧）
+        self._watch_comment_count = 0          # 本次陪玩已经说了几条（不满 3 条不留事件）
+        self._watch_care_count = 0             # 本场已经"关心"（倒水/休息/眯一会）几次，用来给许可限次
+        self._last_recall = []          # 本轮实际注入的记忆明细（id/内容/相关度）
+        self._recall_link_cool = {}     # 记忆 id → 上次"想起旧事"的时间
+        self._recall_link_count = 0     # 本次陪玩已弹几条
         self._watch_session_anchors = []
         self._watch_segment_buffer = []
         self._watch_segment_start_time = time.time()
@@ -3350,7 +3553,7 @@ class DesktopPet:
         self._costume_buttons = {}     # {(槽位, 装扮名): 按钮}，用于刷新选中高亮
         topic_cfg = load_topic_config()
         self.topic_interval_minutes = topic_cfg["interval_minutes"]
-        self.topic_enabled = topic_cfg["enabled"]
+        self.topic_enabled = True      # 11/01：主动话题固定开启，配置里的 enabled 不再生效
         self.topic_mode = topic_cfg["mode"]          # "fixed" 固定 / "random" 随机区间
         self.topic_random_min = topic_cfg["random_min"]
         self.topic_random_max = topic_cfg["random_max"]
@@ -3365,6 +3568,14 @@ class DesktopPet:
         wat_cfg = load_watch_config()
         self.watch_min_interval = wat_cfg["min_interval"]
         self.watch_max_silence = wat_cfg["max_silence"]
+        # 10/30：时间轴可配 —— 缓冲覆盖 ring_seconds 秒，采样分近/远两级
+        try:
+            self.watch_ring_seconds = int(wat_cfg.get("ring_seconds", 20))
+            self.watch_recent_frames = int(wat_cfg.get("recent_frames", 4))
+            self.watch_older_frames = int(wat_cfg.get("older_frames", 4))
+        except Exception:
+            self.watch_ring_seconds, self.watch_recent_frames, self.watch_older_frames = 20, 4, 4
+        self.watch_ring_keep = max(4, int(round(self.watch_ring_seconds / WATCH_RING_EVERY)) + 1)
         self.last_watch_comment_time = 0
         self._rest_cooldown_until = 0   # 后勤员视角冷却结束时间戳
 
@@ -5107,6 +5318,8 @@ class DesktopPet:
         self.last_interaction_time = time.time()
         self.consume_energy()
         self.input_entry.delete(0, tk.END)
+        if getattr(self, "event_frame", None):
+            self.clear_event_buttons()      # 11/02：自己打字回应了，旧选项就别挂着
         # 如果有活跃的话题事件，将输入作为话题回应
         if self.current_event_context:
             self.on_event_text(msg)
@@ -5792,6 +6005,14 @@ class DesktopPet:
         self.root.after(500, self.create_event_buttons, opt1, opt2)
 
     def clear_event_buttons(self):
+        # 11/02：清按钮的同时把"自动收掉"的定时器取消，免得下一轮被旧定时器误清
+        _job = getattr(self, "_event_ttl_job", None)
+        if _job:
+            try:
+                self.root.after_cancel(_job)
+            except Exception:
+                pass
+            self._event_ttl_job = None
         if hasattr(self, 'event_frame') and self.event_frame:
             self.event_frame.destroy()
             self.event_frame = None
@@ -5833,6 +6054,16 @@ class DesktopPet:
             self.event_buttons.append(btn)
         tk.Frame(self.event_frame, bg=TRANS_MASK).pack(side=tk.LEFT, expand=True)
         self.update_window_size()
+        # 11/02：选项挂一会儿自动收掉（用户："过了很长时间选项依然存在，有些出戏"）
+        self._event_ttl_job = self.root.after(int(TOPIC_OPTION_TTL_MIN * 60 * 1000),
+                                             self._expire_event_buttons)
+
+    def _expire_event_buttons(self):
+        """话题选项过期：安静收掉，不提示、不进历史。"""
+        self._event_ttl_job = None
+        if getattr(self, "event_frame", None):
+            log.info("话题选项超过 %d 分钟，自动收掉", TOPIC_OPTION_TTL_MIN)
+            self.clear_event_buttons()
 
     def _respond_to_topic(self, selected, context):
         """话题回应的共享逻辑：发送 prompt → AI 回复 → 显示/记录/TTS"""
@@ -6437,7 +6668,7 @@ class DesktopPet:
         # 打开管理器时重新载入磁盘上的记忆（提取可能在后台已更新文件，内存快照会过期）
         with self._memory_lock:
             self.memory_data = _migrate_old_memories(load_memories())
-        win, frame = self._make_card_window("记忆锚点管理", 620, 700)
+        win, frame = self._make_card_window("记忆锚点管理", 660, 820)
         s = self._dpi_scale
         # 关闭按钮先 pack 固定底部，内容再多也不会被裁剪
         RoundedButton(frame, text="关闭", command=win.destroy, width=int(110 * s), height=int(36 * s),
@@ -6476,9 +6707,6 @@ class DesktopPet:
         # 显示顺序：收藏的排在最前并锁定在上层（新记忆只加在收藏块下面）；其余保持原有先后顺序。
         # 只改"显示顺序"，不动 items 本身 —— 提取提示词用 topics[-10:] 代表"最近 10 条"，挪数组会破坏语义。
         view = []                    # 列表下标 → 记忆条目
-        STAR_ROW_BG = "#e7ebff"      # 收藏行：比白底深的淡紫底
-        ARCHIVE_ROW_BG = "#f1f2f4"   # 已归档行：浅灰底
-        ARCHIVE_ROW_FG = "#8b8f98"   # 已归档行：灰字
 
         detail_frame = tk.Frame(parent, bg=DIALOG_BG)
         detail_frame.pack(fill=tk.BOTH, expand=False, padx=5, pady=(0, 5))
@@ -6547,9 +6775,8 @@ class DesktopPet:
             render(select_id)
 
         def sync_star_btn():
-            sel = listbox.curselection()
-            starred = bool(sel) and 0 <= sel[0] < len(view) and view[sel[0]].get("starred", False)
-            star_btn.set_text("取消收藏" if starred else "收藏选中")
+            # 10/31：按钮已删，收藏/取消收藏的文案改由右键菜单在弹出时动态改（见 _popup）
+            return
 
         def on_select(event=None):
             sync_star_btn()
@@ -6592,27 +6819,41 @@ class DesktopPet:
                      (item.get("content") or "")[:24])
             refresh(select_id=item.get("id"))
 
-        btn_frame = tk.Frame(parent, bg=DIALOG_BG)
-        btn_frame.pack(pady=5)
-        s = self._dpi_scale
-        star_btn = RoundedButton(btn_frame, text="收藏选中", command=toggle_star, variant="primary",
-                                 width=int(100 * s), height=int(32 * s), radius=int(6 * s),
-                                 font=(self.font_family, 9))
-        star_btn.pack(side=tk.LEFT, padx=3)
-        RoundedButton(btn_frame, text="删除选中", command=delete_selected, variant="danger",
-                      width=int(100 * s), height=int(32 * s), radius=int(6 * s),
-                      font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
-        RoundedButton(btn_frame, text="清空所有", command=clear_all, variant="subtle",
-                      width=int(100 * s), height=int(32 * s), radius=int(6 * s),
-                      font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
+        # 10/31：底部按钮行整块删掉，改成右键菜单 + Delete 键（把高度让给详情面板）
+        _menu = tk.Menu(listbox, tearoff=0)
+        _menu.add_command(label="收藏", command=toggle_star)
+        _menu.add_command(label="删除选中", command=delete_selected)
+        _menu.add_separator()
+        _menu.add_command(label="清空所有", command=clear_all)
+
+        def _popup(e):
+            try:
+                idx = listbox.nearest(e.y)
+                if idx >= 0:
+                    listbox.selection_clear(0, tk.END)
+                    listbox.selection_set(idx)
+            except Exception:
+                pass
+            try:
+                cur = listbox.curselection()
+                _star = bool(cur and 0 <= cur[0] < len(view) and view[cur[0]].get("starred"))
+                _menu.entryconfigure(0, label="取消收藏" if _star else "收藏")
+            except Exception:
+                pass
+            try:
+                _menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                _menu.grab_release()
+
+        listbox.bind("<Button-3>", _popup)
+        listbox.bind("<Delete>", lambda e: (delete_selected(), "break")[1])
+        listbox.bind("<BackSpace>", lambda e: (delete_selected(), "break")[1])
 
         refresh()
 
     def _build_profile_tab(self, parent):
         s = self._dpi_scale
-        # 底部按钮行先 pack 固定底部（内容再多也不会被裁剪）
-        btn_frame = tk.Frame(parent, bg=DIALOG_BG)
-        btn_frame.pack(side=tk.BOTTOM, pady=5, fill=tk.X)
+        # 10/31：不再有底部按钮行（全部改成右键菜单），空间留给详情面板
 
         # 关系形象（独立栏目）：宠物当前对用户关系认知的单槽总结
         # 用描边卡片框住，与下方"认知条目"表格在视觉上分开
@@ -6649,6 +6890,194 @@ class DesktopPet:
                 detail_text.config(state=tk.DISABLED)
 
         refresh_rel_view()
+
+        # 10/28：自我认知（self/lesson）+ 关于他（about_user）—— 两张卡合成一张，上下两区。
+        # 10/28 用户："界面还是臃肿" ⇒ 去掉说明文案那一行、去掉删除按钮（改 Delete 键）。
+        note_box = tk.Frame(parent, bg=INPUT_BG, highlightthickness=max(1, int(1.5 * s)),
+                            highlightbackground=CARD_BORDER_STRONG, highlightcolor=CARD_BORDER_STRONG)
+        note_box.pack(fill=tk.X, padx=5, pady=(0, 6))
+        note_inner = tk.Frame(note_box, bg=INPUT_BG)
+        note_inner.pack(fill=tk.X, padx=int(10 * s), pady=int(7 * s))
+        tk.Label(note_inner, text="自我认知", font=(self.font_family, 10, "bold"),
+                 fg=TEXT_MAIN, bg=INPUT_BG).pack(anchor="w")
+        note_wrap = tk.Frame(note_inner, bg=INPUT_BG)
+        note_wrap.pack(fill=tk.X, pady=(int(3 * s), int(6 * s)))
+        note_scroll = ttk.Scrollbar(note_wrap, orient="vertical")
+        note_list = tk.Listbox(note_wrap, height=3, font=(self.font_family, 9), bg="#ffffff",
+                               fg=TEXT_MAIN, relief=tk.FLAT, highlightthickness=1,
+                               highlightbackground=INPUT_BORDER2, activestyle="none",
+                               selectbackground=BTN_PRIMARY, selectforeground="#ffffff",
+                               yscrollcommand=note_scroll.set)
+        note_scroll.config(command=note_list.yview)
+        note_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(note_inner, text="他的习惯（补充）", font=(self.font_family, 10, "bold"),
+                 fg=TEXT_MAIN, bg=INPUT_BG).pack(anchor="w")
+        ub_wrap = tk.Frame(note_inner, bg=INPUT_BG)
+        ub_wrap.pack(fill=tk.X, pady=(int(3 * s), 0))
+        ub_scroll = ttk.Scrollbar(ub_wrap, orient="vertical")
+        ub_list = tk.Listbox(ub_wrap, height=2, font=(self.font_family, 9), bg="#ffffff",
+                             fg=TEXT_MAIN, relief=tk.FLAT, highlightthickness=1,
+                             highlightbackground=INPUT_BORDER2, activestyle="none",
+                             selectbackground=BTN_PRIMARY, selectforeground="#ffffff",
+                             yscrollcommand=ub_scroll.set)
+        ub_scroll.config(command=ub_list.yview)
+        ub_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def _fit(listbox, scrollbar, count, min_rows, max_rows):
+            """按条数自动决定列表高度；超出可视行数时才挂出滚动条（10/28）。"""
+            rows = max(min_rows, min(max_rows, count))
+            try:
+                listbox.config(height=rows)
+            except Exception:
+                pass
+            if count > rows:
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                scrollbar.pack_forget()
+
+        def _list_menu(listbox, on_delete, on_clear, clear_label="清空全部",
+                       on_star=None, is_starred=None):
+            """右键菜单：收藏 / 删除选中 / 清空全部（10/31 用户报"没有删除和清空方式"）。"""
+            m = tk.Menu(listbox, tearoff=0)
+            if on_star is not None:
+                m.add_command(label="收藏", command=on_star)
+            m.add_command(label="删除选中", command=on_delete)
+            m.add_separator()
+            m.add_command(label=clear_label, command=on_clear)
+
+            def popup(e):
+                try:
+                    idx = listbox.nearest(e.y)
+                    if idx >= 0:
+                        listbox.selection_clear(0, tk.END)
+                        listbox.selection_set(idx)
+                except Exception:
+                    pass
+                if on_star is not None:
+                    try:
+                        m.entryconfigure(0, label="取消收藏" if (is_starred and is_starred()) else "收藏")
+                    except Exception:
+                        pass
+                try:
+                    m.tk_popup(e.x_root, e.y_root)
+                finally:
+                    m.grab_release()
+            listbox.bind("<Button-3>", popup)
+            return m
+
+        def refresh_note_view():
+            note_list.delete(0, tk.END)
+            notes = (self.memory_data.get("profile", {}) or {}).get("notes") or []
+            if not notes:
+                note_list.insert(tk.END, "（还没有——聊到她的立场感受、或需要记住的教训时，会写在这里）")
+                return
+            for i, n in enumerate(notes):
+                ev = int(n.get("evidence_count", 1) or 1)
+                tag = "教训" if n.get("kind") == "lesson" else "认定"
+                note_list.insert(tk.END, "%s· [%s] %s%s" % (
+                    "★ " if n.get("starred") else "", tag, str(n.get("content") or ""),
+                    ("（%d 次）" % ev) if ev > 1 else ""))
+                if n.get("starred"):
+                    note_list.itemconfig(i, background=STAR_ROW_BG)
+            _fit(note_list, note_scroll, len(notes), 3, 6)
+
+        def delete_note(event=None):
+            sel = note_list.curselection()
+            notes = (self.memory_data.get("profile", {}) or {}).get("notes") or []
+            if not sel or not notes or sel[0] >= len(notes):
+                return
+            if not messagebox.askyesno("确认", "删除这条自我认知？\n\n%s" % str(notes[sel[0]].get("content") or "")[:60]):
+                return
+            notes.pop(sel[0])
+            save_memories(self.memory_data)
+            refresh_note_view()
+
+        def clear_notes():
+            notes = (self.memory_data.get("profile", {}) or {}).get("notes") or []
+            if not notes:
+                return
+            if not messagebox.askyesno("确认", "清空全部自我认知？共 %d 条，不能撤销。" % len(notes)):
+                return
+            notes.clear()
+            save_memories(self.memory_data)
+            refresh_note_view()
+
+        def toggle_note_star():
+            sel = note_list.curselection()
+            notes = (self.memory_data.get("profile", {}) or {}).get("notes") or []
+            if not sel or not notes or sel[0] >= len(notes):
+                return
+            n = notes[sel[0]]
+            n["starred"] = not n.get("starred", False)
+            n["starred_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if n["starred"] else None
+            save_memories(self.memory_data)
+            log.info("自我认知%s：%s", "已收藏" if n["starred"] else "已取消收藏",
+                     str(n.get("content") or "")[:24])
+            refresh_note_view()
+            try:
+                note_list.selection_set(sel[0])
+            except Exception:
+                pass
+
+        def _note_sel_starred():
+            sel = note_list.curselection()
+            notes = (self.memory_data.get("profile", {}) or {}).get("notes") or []
+            return bool(sel and notes and sel[0] < len(notes) and notes[sel[0]].get("starred"))
+
+        note_list.bind("<Delete>", lambda e: (delete_note(), "break")[1])
+        note_list.bind("<BackSpace>", lambda e: (delete_note(), "break")[1])
+        _list_menu(note_list, delete_note, clear_notes,
+                   on_star=toggle_note_star, is_starred=_note_sel_starred)
+        refresh_note_view()
+
+        def refresh_user_notes():
+            ub_list.delete(0, tk.END)
+            items = (self.memory_data.get("profile", {}) or {}).get("user_notes") or []
+            if not items:
+                ub_list.insert(tk.END, "（还没有——聊到你的习惯、偏好或忌讳时，会写在这里）")
+                return
+            for n in items:
+                ev = int(n.get("evidence_count", 1) or 1)
+                ub_list.insert(tk.END, "· %s%s" % (
+                    str(n.get("content") or ""), ("（%d 次）" % ev) if ev > 1 else ""))
+            _fit(ub_list, ub_scroll, len(items), 2, 4)
+
+        def delete_user_note(event=None):
+            sel = ub_list.curselection()
+            items = (self.memory_data.get("profile", {}) or {}).get("user_notes") or []
+            if not sel or not items or sel[0] >= len(items):
+                return
+            if not messagebox.askyesno("确认", "删除这条？\n\n%s" % str(items[sel[0]].get("content") or "")[:60]):
+                return
+            items.pop(sel[0])
+            save_memories(self.memory_data)
+            refresh_user_notes()
+
+        def clear_user_notes():
+            items = (self.memory_data.get("profile", {}) or {}).get("user_notes") or []
+            if not items:
+                return
+            if not messagebox.askyesno("确认", "清空全部「他的习惯」？共 %d 条，不能撤销。" % len(items)):
+                return
+            items.clear()
+            save_memories(self.memory_data)
+            refresh_user_notes()
+
+        ub_list.bind("<Delete>", lambda e: (delete_user_note(), "break")[1])
+        ub_list.bind("<BackSpace>", lambda e: (delete_user_note(), "break")[1])
+        _list_menu(ub_list, delete_user_note, clear_user_notes)
+        refresh_user_notes()
+
+        # 详情显示框：**必须在会 expand 的表格之前 pack**，否则表格涨大时它会被挤掉。
+        # （10/28 用户问「列表长高会不会挤走详情框」—— 现在有结构性保证，不是碰巧够用）
+        detail_frame = tk.Frame(parent, bg=DIALOG_BG)
+        detail_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+        detail_text = scrolledtext.ScrolledText(
+            detail_frame, wrap="word", font=(self.font_family, 10),
+            bg="#ffffff", fg=TEXT_MAIN, height=5, width=1, relief=tk.FLAT, bd=0,
+            highlightthickness=1, highlightbackground=INPUT_BORDER2
+        )
+        detail_text.pack(fill=tk.BOTH, expand=True)
 
         frame = tk.Frame(parent, bg=DIALOG_BG)
         frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -6690,15 +7119,6 @@ class DesktopPet:
                                 values=(name, clip(desc, 60), ev_txt))
             show_detail()
 
-        # 详情显示框（选中即展示完整信息；固定于按钮行上方，不被内容挤走）
-        detail_frame = tk.Frame(parent, bg=DIALOG_BG)
-        detail_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
-        detail_text = scrolledtext.ScrolledText(
-            detail_frame, wrap="word", font=(self.font_family, 10),
-            bg="#ffffff", fg=TEXT_MAIN, height=5, relief=tk.FLAT, bd=0,
-            highlightthickness=1, highlightbackground=INPUT_BORDER2
-        )
-        detail_text.pack(fill=tk.BOTH, expand=True)
 
         def show_detail(event=None):
             detail_text.config(state=tk.NORMAL)
@@ -6708,24 +7128,22 @@ class DesktopPet:
                 name = sel[0][len("trait_"):]
                 t = next((x for x in traits if x.get("trait") == name), None)
                 if t is None or (not (t.get("description") or "").strip() and not t.get("evidence")):
-                    detail = f"条目：{name}\n\n（还没有观察到任何内容）"
+                    detail = f"{name}\n（还没有观察到任何内容）"
                 else:
                     desc = (t.get("description") or "").strip() or "（暂无概括，仅积累观察）"
                     evs = [str(e).strip() for e in (t.get("evidence") or []) if str(e).strip()]
-                    lines = [f"条目：{name}", "", f"描述：{desc}", "",
-                             f"观察证据（{len(evs)}条）："]
-                    for j, ev in enumerate(evs, 1):
-                        lines.append(f"{j}. {ev}")
-                    lines.append("")
-                    lines.append(f"创建：{str(t.get('created_at', ''))[:19]}")
-                    lines.append(f"最近更新：{str(t.get('updated_at', ''))[:19]}")
+                    # 10/28：详情框只有 3 行，**不留空行**（用户："内容之间为什么要空行，显示区域本来就窄"）
+                    lines = [f"{name}｜{desc}",
+                             f"证据 {len(evs)} 条：" + ("；".join(f"{j}.{ev}" for j, ev in enumerate(evs, 1)) or "（无）"),
+                             f"更新 {str(t.get('updated_at', ''))[5:16]}"]
                     detail = "\n".join(lines)
                 detail_text.insert("1.0", detail)
             else:
-                detail_text.insert("1.0", "点击上方任意条目查看完整描述与证据；\n点击上方的「关系形象」描述可查看其确信度与更新记录。")
+                detail_text.insert("1.0", "点击任意条目看详情；点「关系形象」看更新时间。")
             detail_text.config(state=tk.DISABLED)
 
         tree.bind("<<TreeviewSelect>>", show_detail)
+
 
         def show_relation(event=None):
             """点击顶部关系描述：日期/确信度/证据数等详细数据只在详情栏展示"""
@@ -6736,13 +7154,13 @@ class DesktopPet:
             rel = (self.memory_data.get("profile", {}) or {}).get("relation") or {}
             content = (rel.get("content") or "").strip()
             if content:
+                # 10/28：与条目详情同一格式 —— 不留空行，3 行装下
                 detail_text.insert("1.0", "\n".join([
-                    "关系形象", "",
-                    f"内容：{content}", "",
-                    f"最近更新：{str(rel.get('updated_at', ''))[:19]}",
-                    f"累计观察：{rel.get('evidence_count', 1)} 次"]))
+                    f"关系形象｜{content}",
+                    f"累计观察 {rel.get('evidence_count', 1)} 次",
+                    f"更新 {str(rel.get('updated_at', ''))[5:16]}"]))
             else:
-                detail_text.insert("1.0", "关系形象\n\n（暂无——多聊几次，她会慢慢形成对你的关系认知）")
+                detail_text.insert("1.0", "关系形象\n（暂无——多聊几次，她会慢慢形成对你的关系认知）")
             detail_text.config(state=tk.DISABLED)
 
         # 整块「关系形象」卡片都可点击（标题、描述、内边距、边框），不是只有文字
@@ -6770,27 +7188,61 @@ class DesktopPet:
                 save_memories(self.memory_data)
                 refresh_rows()
 
-        RoundedButton(btn_frame, text="清空此条内容", command=clear_selected, variant="subtle",
-                      width=int(110 * s), height=int(32 * s), radius=int(6 * s),
-                      font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
-        RoundedButton(btn_frame, text="清空所有画像", command=clear_all, variant="danger",
-                      width=int(120 * s), height=int(32 * s), radius=int(6 * s),
-                      font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
-        RoundedButton(btn_frame, text="清除关系形象", command=clear_relation, variant="subtle",
-                      width=int(120 * s), height=int(32 * s), radius=int(6 * s),
-                      font=(self.font_family, 9)).pack(side=tk.LEFT, padx=3)
+        # 10/31：三个按钮改成右键菜单 —— 条目表上右键清空条目/清空所有，关系形象卡上右键清除
+        _tree_menu = tk.Menu(tree, tearoff=0)
+        _tree_menu.add_command(label="清空此条内容", command=clear_selected)
+        _tree_menu.add_command(label="清空所有画像", command=clear_all)
+
+        def _tree_popup(e):
+            try:
+                iid = tree.identify_row(e.y)
+                if iid:
+                    tree.selection_set(iid)
+            except Exception:
+                pass
+            try:
+                _tree_menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                _tree_menu.grab_release()
+
+        tree.bind("<Button-3>", _tree_popup)
+
+        _rel_menu = tk.Menu(parent, tearoff=0)
+        _rel_menu.add_command(label="清除关系形象", command=clear_relation)
+
+        def _rel_popup(e):
+            try:
+                _rel_menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                _rel_menu.grab_release()
+
+        for _w in (rel_box, rel_inner, rel_title, rel_label):
+            _w.bind("<Button-3>", _rel_popup)
 
         refresh_rows()
 
     # ---------- 记忆提取核心方法 ----------
-    def _add_topic_memory(self, content, importance=0.5, force_new=False):
+    def _add_topic_memory(self, content, importance=0.5, force_new=False, kind=None):
         """添加话题记忆，简单去重后写入"""
         content = content.strip()
         if len(content) < 2:
             return
+        add_topic_material(content, "topic")   # 11/01：话题记忆和事件记忆平行进素材池
         with self._memory_lock:
             topics = self.memory_data.setdefault("topics", [])
             if not force_new:
+                # 10/28：两个池当一个池查重 —— 同一件事不能一边存 topics 一边存 events
+                dup = self._find_similar_memory(
+                    content, list(self.memory_data.get("events", [])),
+                    MEMORY_TOPIC_MERGE_THRESHOLD)
+                if dup is not None:
+                    dup["archived"] = False
+                    dup["evidence_count"] = dup.get("evidence_count", 1) + 1
+                    dup["importance"] = min(1.0, float(dup.get("importance") or 0.5) + 0.05)
+                    dup["last_accessed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    save_memories(self.memory_data)
+                    log.info("跨池去重（并入 event）：%s", content[:30])
+                    return
                 dup = self._find_similar_memory(content, topics, MEMORY_TOPIC_MERGE_THRESHOLD)
                 if dup is not None:
                     dup["archived"] = False
@@ -6807,6 +7259,7 @@ class DesktopPet:
                 "created_at": now,
                 "last_accessed_at": now,
                 "importance": importance,
+                "kind": kind or "experience",
                 "access_count": 0,
                 "evidence_count": 1,
                 "archived": False
@@ -6814,7 +7267,7 @@ class DesktopPet:
             self._prune_memories("topics")
             save_memories(self.memory_data)
 
-    def _add_event_memory(self, content, importance=0.7, source="chat", force_new=False):
+    def _add_event_memory(self, content, importance=0.7, source="chat", force_new=False, kind=None):
         """添加事件记忆"""
         content = content.strip()
         if len(content) < 2:
@@ -6823,6 +7276,18 @@ class DesktopPet:
         with self._memory_lock:
             events = self.memory_data.setdefault("events", [])
             if not force_new:
+                # 10/28：两个池当一个池查重（同上）
+                dup = self._find_similar_memory(
+                    content, list(self.memory_data.get("topics", [])),
+                    MEMORY_TOPIC_MERGE_THRESHOLD)
+                if dup is not None:
+                    dup["archived"] = False
+                    dup["evidence_count"] = dup.get("evidence_count", 1) + 1
+                    dup["importance"] = min(1.0, float(dup.get("importance") or 0.5) + 0.05)
+                    dup["last_accessed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    save_memories(self.memory_data)
+                    log.info("跨池去重（并入 topic）：%s", content[:30])
+                    return
                 dup = self._find_similar_memory(content, events, MEMORY_EVENT_DUP_THRESHOLD)
                 if dup is not None:
                     dup["archived"] = False
@@ -6840,12 +7305,76 @@ class DesktopPet:
                 "last_accessed_at": now,
                 "importance": importance,
                 "source": source,
+                "kind": kind or "experience",
                 "access_count": 0,
                 "evidence_count": 1,
                 "archived": False
             })
             self._prune_memories("events")
             save_memories(self.memory_data)
+
+    def _apply_profile_note(self, content, kind):
+        """把 self / about_user / lesson 类记忆写进自我认知层（profile["notes"]）。
+
+        10/28：这三类描述的是"她/他是什么样的人"，不是"发生了什么事"，所以不进经历池、
+        不参与淘汰。同一件事反复出现只累加 evidence_count，不新增条目。
+        """
+        content = (content or "").strip()[:PROFILE_NOTE_CHARS]
+        if len(content) < 4:
+            return
+        profile = self.memory_data.setdefault("profile", {})
+        # 10/28 修正：**自我认知只放 self/lesson**；about_user 是"关于他"的事，归到 user_notes，
+        # 界面上归性格画像那一侧（用户原话："【他】的描述不应该是写在性格画像里吗"）。
+        _key = "user_notes" if kind == "about_user" else "notes"
+        notes = profile.setdefault(_key, [])
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 判重先用向量（能认"他" vs "老大"这种换称呼），向量不可用时退回二元组
+        _vec = None
+        try:
+            _vec = self._get_text_embedding(content)
+        except Exception:
+            _vec = None
+        cg = {content[i:i + 2] for i in range(len(content) - 1)}
+        for n in notes:
+            old = str(n.get("content") or "")
+            _dup = False
+            if _vec is not None:
+                try:
+                    _ov = self._get_text_embedding(old)
+                    if _ov is not None and float(np.dot(_vec, _ov)) >= PROFILE_NOTE_DUP_COS:
+                        _dup = True
+                except Exception:
+                    _dup = False
+            if not _dup:
+                og = {old[i:i + 2] for i in range(len(old) - 1)}
+                _dup = bool(og and cg and len(cg & og) / max(1, len(cg | og)) >= 0.6)
+            if _dup:
+                n["evidence_count"] = int(n.get("evidence_count", 1)) + 1
+                n["updated_at"] = now
+                save_memories(self.memory_data)
+                log.info("自我认知合并（%d 次）：%s", n["evidence_count"], old[:30])
+                return
+        _new = {"id": str(uuid.uuid4())[:8], "content": content, "kind": kind,
+                "created_at": now, "updated_at": now, "evidence_count": 1}
+        notes.append(_new)
+        # 10/28：溢出淘汰 —— **新来的必须留**（否则池子填满后新东西永远进不来），
+        # 从"原有的"里面挑最该走的：只被印证过一次、且最久没更新。反复出现过的（evidence 高）最稳。
+        if len(notes) > PROFILE_NOTES_MAX:
+            # 排序键 = (被印证次数, 在列表里的位置)。位置当"新旧"用 —— 时间戳只到秒，
+            # 同一秒内分不出先后，稳定排序会退化成"先来先留"，把刚写进来的又挤掉（实测踩到）。
+            # 10/31：**收藏的不参与淘汰**（用户要求，和话题/事件同一口径）；收藏多到超容量也全留。
+            _starred = [n for n in notes if n is not _new and n.get("starred")]
+            _old = [(i, n) for i, n in enumerate(notes) if n is not _new and not n.get("starred")]
+            _old.sort(key=lambda t: (int(t[1].get("evidence_count", 1) or 1), t[0]), reverse=True)
+            _room = max(0, PROFILE_NOTES_MAX - 1 - len(_starred))
+            _keep = _starred + [n for _, n in _old[:_room]]
+            _dropped = [n for _, n in _old[_room:]]
+            _keep_ids = {id(n) for n in _keep}
+            notes[:] = [n for n in notes if n is _new or id(n) in _keep_ids]
+            log.info("自我认知溢出，丢弃 %d 条（收藏 %d 条不参与）：%s", len(_dropped), len(_starred),
+                     "；".join(str(d.get("content") or "")[:20] for d in _dropped))
+        save_memories(self.memory_data)
+        log.info("自我认知新增（%s）：%s", kind, content[:30])
 
     def _find_trait(self, trait_name):
         """按名称查找固定清单画像条目"""
@@ -7057,7 +7586,7 @@ class DesktopPet:
     {{"content": "话题描述（40-60字以内）"}}
   ],
   "events": [
-    {{"content": "事件描述（50字以内）", "importance": 0.7, "source": "chat"}}
+    {{"content": "事件描述（50字以内）", "kind": "experience", "source": "chat"}}
   ],
   "profile_updates": [
     {{"trait": "固定清单条目名", "description": "该条目的一句话概括，无变化填 null", "evidence": "本次观察到的一句具体证据（10字以上）"}}
@@ -7072,7 +7601,16 @@ class DesktopPet:
 - profile_updates: 把本次对话观察到的用户信息填入固定画像条目。trait 必须一字不差取自固定清单：{TRAIT_STR}，绝不能自创条目名；某条目本次没有新观察就整个不输出。description 是该条目整合新旧观察的一句话概括，认知没有实质变化就填 null（只更新 evidence）；evidence 是本次新观察到的一句具体证据（原话或具体场景，10字以上），同一句证据不要重复提交；没有合适条目的重要观察归入「其他」。
 - relation_summary: 站在“我”（{self.pet_name}）的视角总结当前与{call_name}的关系认知（25字以内）——比如“我们是互相认定的人”“他是我要守护的人”。必须用{self.pet_name}自己的语气和用词习惯（人设概要：{persona_hint}……）来写，像她自己会说的话；结合已有内容与本次对话，有关系进展或认知变化才更新，没有则填 null。
 - 没有值得记录的内容时返回空数组。
-- importance 只给 events 评分：日常小事0.4-0.6，重要或难忘的事0.7-0.9；陪玩/读书事件0.3-0.5（来自单向评论，置信度较低）。topics 一律不要输出 importance 字段。
+- kind 必填，只能取这五个值之一（不要打分、不要自创）：
+  self=我自己的立场或感受（例如“我不介意有犯傻的部分，那是他管我的由头”）；
+  about_user={call_name}的稳定属性/习惯/忌讳（例如“他习惯边吃边刷视频”）——
+    **能归进下面固定类目的，一律写进 profile_updates，不要写成 about_user**；
+    只有确实归不进去的（比如“别提他丢包那件事”这种忌讳）才用 about_user；
+  lesson=被纠正过、以后要避免的事；
+  experience=一起经历过的一件事（一次性、具体的）；
+  observe=陪看/陪读时看到的画面内容（流水账，最不值钱）；
+  howto=操作步骤（例如“点播放键才能切歌”）——这类不要写进记忆。
+  topics 也要输出 kind（通常 experience）。
 - 标记为 [陪玩] 或 [读书] 的对话行：只提取话题记忆，不提取事件、性格画像和关系形象（这些内容不是真正的对话互动）。"""
 
     def _parse_extraction_result(self, json_str):
@@ -7148,23 +7686,38 @@ class DesktopPet:
                 content = (t.get("content") or "").strip()
                 if len(content) < 2:
                     continue
-                imp = 0.5  # 话题不再由 AI 评分（importance 不参与话题排序与显示），统一占位值
+                _k = str(t.get("kind") or "experience").strip().lower()
+                if _k not in KIND_SCORES:
+                    _k = "experience"
+                if _k in ("self", "about_user", "lesson"):
+                    self._apply_profile_note(content, _k)   # 10/28：进自我认知层，不占经历池
+                    continue
+                imp = KIND_SCORES[_k]
                 candidates = self._find_memory_candidates(content, topics, MEMORY_CANDIDATE_TOPIC_THRESHOLD)
                 if candidates:
                     pending_judge.append({
                         "type": "topic",
                         "content": content,
                         "importance": imp,
+                        "kind": _k,
                         "candidates": candidates
                     })
                 else:
-                    topic_plain.append((content, imp))
+                    topic_plain.append((content, imp, _k))
 
             for e in new_events:
                 content = (e.get("content") or "").strip()
                 if len(content) < 2:
                     continue
-                imp = float(e.get("importance", 0.7))
+                _k = str(e.get("kind") or "experience").strip().lower()
+                if _k not in KIND_SCORES:
+                    _k = "experience"
+                if _k == "howto":
+                    continue          # 操作流程属于系统知识，不写进记忆
+                if _k in ("self", "about_user", "lesson"):
+                    self._apply_profile_note(content, _k)   # 10/28：进自我认知层，不占经历池
+                    continue
+                imp = KIND_SCORES[_k]
                 src = e.get("source", "chat")
                 candidates = self._find_memory_candidates(content, events, MEMORY_CANDIDATE_EVENT_THRESHOLD)
                 if candidates:
@@ -7172,33 +7725,34 @@ class DesktopPet:
                         "type": "event",
                         "content": content,
                         "importance": imp,
+                        "kind": _k,
                         "source": src,
                         "candidates": candidates
                     })
                 else:
-                    event_plain.append((content, imp, src))
+                    event_plain.append((content, imp, src, _k))
 
             decisions = self._judge_memory_merge_with_ai(pending_judge) if pending_judge else {}
 
             if decisions is None:
                 # AI 判断失败，回退到普通写入
-                for content, imp in topic_plain:
-                    self._add_topic_memory(content, imp)
-                for content, imp, src in event_plain:
-                    self._add_event_memory(content, imp, src)
+                for content, imp, _kd in topic_plain:
+                    self._add_topic_memory(content, imp, kind=_kd)
+                for content, imp, src, _kd in event_plain:
+                    self._add_event_memory(content, imp, src, kind=_kd)
                 for item in pending_judge:
                     if item["type"] == "topic":
-                        self._add_topic_memory(item["content"], item["importance"])
+                        self._add_topic_memory(item["content"], item["importance"], kind=item.get("kind"))
                     else:
-                        self._add_event_memory(item["content"], item["importance"], item["source"])
+                        self._add_event_memory(item["content"], item["importance"], item["source"], kind=item.get("kind"))
             else:
                 for idx, item in enumerate(pending_judge):
                     decision = decisions.get(idx)
                     if decision is None:
                         if item["type"] == "topic":
-                            self._add_topic_memory(item["content"], item["importance"])
+                            self._add_topic_memory(item["content"], item["importance"], kind=item.get("kind"))
                         else:
-                            self._add_event_memory(item["content"], item["importance"], item["source"])
+                            self._add_event_memory(item["content"], item["importance"], item["source"], kind=item.get("kind"))
                         continue
                     action = decision.get("action")
                     if action == "merge":
@@ -7218,14 +7772,14 @@ class DesktopPet:
                             save_memories(self.memory_data)
                         else:
                             if item["type"] == "topic":
-                                self._add_topic_memory(item["content"], item["importance"])
+                                self._add_topic_memory(item["content"], item["importance"], kind=item.get("kind"))
                             else:
-                                self._add_event_memory(item["content"], item["importance"], item["source"])
+                                self._add_event_memory(item["content"], item["importance"], item["source"], kind=item.get("kind"))
                     elif action == "new":
                         if item["type"] == "topic":
-                            self._add_topic_memory(item["content"], item["importance"], force_new=True)
+                            self._add_topic_memory(item["content"], item["importance"], force_new=True, kind=item.get("kind"))
                         else:
-                            self._add_event_memory(item["content"], item["importance"], item["source"], force_new=True)
+                            self._add_event_memory(item["content"], item["importance"], item["source"], force_new=True, kind=item.get("kind"))
                     elif action == "ignore":
                         pass
                     else:
@@ -7234,10 +7788,10 @@ class DesktopPet:
                         else:
                             self._add_event_memory(item["content"], item["importance"], item["source"])
 
-                for content, imp in topic_plain:
-                    self._add_topic_memory(content, imp)
-                for content, imp, src in event_plain:
-                    self._add_event_memory(content, imp, src)
+                for content, imp, _kd in topic_plain:
+                    self._add_topic_memory(content, imp, kind=_kd)
+                for content, imp, src, _kd in event_plain:
+                    self._add_event_memory(content, imp, src, kind=_kd)
 
             for p in profile_updates:
                 self._apply_profile_update(p)
@@ -7269,50 +7823,153 @@ class DesktopPet:
             self._extraction_fail_count = 0
             count = len(new_topics) + len(new_events) + len(profile_updates)
             log.info(f"记忆提取完成: {count} 条新记忆 (话题{len(new_topics)} 事件{len(new_events)} 画像{len(profile_updates)})")
+            self._maybe_induce()      # 11/01：经历攒够了就归纳成认知（后台，不挡）
         except Exception as e:
             log.error(f"记忆提取异常: {e}")
             self._extraction_fail_count += 1
             self._pending_extraction_weight = 0.0
             self._persist_extraction_state()
 
+    # ---------- 归纳：经历 → 认知（11/01）----------
+    def _induce_state_path(self):
+        return os.path.join(CONFIG_DIR, "induction_state.json")
+
+    def _load_induce_state(self):
+        st = {"last_total": 0, "last_run": 0.0}
+        try:
+            raw = json.load(open(self._induce_state_path(), encoding="utf-8"))
+            if isinstance(raw, dict):
+                st["last_total"] = int(raw.get("last_total") or 0)
+                st["last_run"] = float(raw.get("last_run") or 0.0)
+        except Exception:
+            pass
+        return st
+
+    def _save_induce_state(self, st):
+        try:
+            with open(self._induce_state_path(), "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False)
+        except Exception as e:
+            log.debug("归纳状态存盘失败: %s", e)
+
+    def _maybe_induce(self):
+        """提取刚做完时看一眼：经历攒够了就在后台归纳一次，绝不挡主流程。"""
+        try:
+            st = self._load_induce_state()
+            total = len(self.memory_data.get("topics") or []) + len(self.memory_data.get("events") or [])
+            if total - int(st.get("last_total") or 0) < INDUCE_MIN_NEW:
+                return
+            if time.time() - float(st.get("last_run") or 0.0) < INDUCE_MIN_GAP_MIN * 60:
+                return
+            threading.Thread(target=self._induce_once, daemon=True).start()
+        except Exception as e:
+            log.debug("归纳检查失败: %s", e)
+
+    def _induce_once(self):
+        """把最近这些经历归纳成 1~2 条"关于他"、至多 1 条"关于我"的稳定认知。"""
+        try:
+            items = []
+            for mem in (self.memory_data.get("events") or []) + (self.memory_data.get("topics") or []):
+                c = str(mem.get("content") or "").strip()
+                if c:
+                    items.append((str(mem.get("created_at") or ""), c))
+            if len(items) < 3:
+                return
+            items.sort(reverse=True)
+            recent = items[:INDUCE_RECENT_N]
+            prof = self.memory_data.get("profile") or {}
+            known_traits = [str(t.get("description") or "") for t in (prof.get("traits") or []) if t.get("description")]
+            known_user = [str(n.get("content") or "") for n in (prof.get("user_notes") or [])]
+            known_self = [str(n.get("content") or "") for n in (prof.get("notes") or [])]
+            _name = self.user_profile.get("call_name", "他")
+            _induce_prompt = chr(10).join([
+                '你在整理对"%s"的长期认识。下面是最近发生过的一些事。' % _name,
+                '请归纳出**稳定的认知**（不是复述事件），只输出 JSON：',
+                '{"user_notes": ["关于他的稳定习惯/偏好/忌讳，一条一句，最多 2 条"], "self_notes": ["你自己形成的立场或教训，一条一句，最多 1 条"]}',
+                '要求：',
+                '- 已经在下面对应列表里说过的、或者没有新东西的，就不要重复输出，给空数组。',
+                '- 一句话说清，要有具体内容，别写"他总是"这种空话。',
+                '- self_notes 用第一人称"我"写；提到他时用"%s"。' % _name,
+                '',
+                '已有【关于他】：' + ('；'.join(known_user[-8:]) or '（空）'),
+                '已有【我自己】：' + ('；'.join(known_self[-8:]) or '（空）'),
+                '已知画像条目：' + ('；'.join(known_traits[-8:]) or '（空）'),
+                '',
+                '最近的经历：',
+                chr(10).join('%d. %s' % (i + 1, c) for i, (_, c) in enumerate(recent)),
+            ])
+            self._induce_running = True
+            resp = self._call_text_model([{"role": "user", "content": _induce_prompt}],
+                                         temperature=0.4, max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
+            if resp.status_code != 200:
+                log.warning("归纳调用失败: HTTP %s", resp.status_code)
+                return
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            m = re.search(r"\{.*\}", raw, re.S)
+            data = json.loads(m.group(0) if m else raw)
+            n_user = n_self = 0
+            for c in (data.get("user_notes") or [])[:2]:
+                c = str(c or "").strip()
+                if len(c) >= 4:
+                    self._apply_profile_note(c, "about_user")
+                    n_user += 1
+            for c in (data.get("self_notes") or [])[:1]:
+                c = str(c or "").strip()
+                if len(c) >= 4:
+                    self._apply_profile_note(c, "self")
+                    n_self += 1
+            st = self._load_induce_state()
+            st["last_total"] = len(self.memory_data.get("topics") or []) + len(self.memory_data.get("events") or [])
+            st["last_run"] = time.time()
+            self._save_induce_state(st)
+            log.info("归纳完成：关于他 %d 条 / 关于我 %d 条（看了 %d 条经历）", n_user, n_self, len(recent))
+        except Exception as e:
+            log.warning("归纳失败: %s", e)
+        finally:
+            self._induce_running = False
+
     # ---------- 上下文构建器 ----------
-    def _score_topic_memory(self, mem):
-        """话题分数：不使用 importance，只看活跃度"""
-        access_count = mem.get("access_count", 0) or 0
-        access_boost = min(1.0, access_count / 10.0)
+    def _retention_score(self, mem):
+        """长期价值分（10/28）：决定淘汰顺序，也用作召回排序里的基础分。
 
-        last_accessed = mem.get("last_accessed_at", "")
-        last_used_recency = 0.0
-        if last_accessed:
+        = 0.45*importance + 0.30*usage(按 kind 半衰期衰减)
+          + 0.20*conf(证据数) + 0.10*starred，observe 再乘 0.6
+
+        与"被注入过"完全无关 —— 旧公式用的是 access_count，而那个值每次注入都 +1，
+        等于模型给自己刷热度（实测中位 24、10 条里 9 条饱和）。
+        """
+        kind = str(mem.get("kind") or "experience")
+        imp = float(mem.get("importance") or 0.5)
+        ev = int(mem.get("evidence_count") or 1)
+        conf = min(1.0, 0.6 + 0.2 * (ev - 1))
+        used = int(mem.get("used_count") or 0)
+        hits = int(mem.get("user_hits") or 0)
+        # 使用量：**建条目本身算一次**（否则没用过的条目时间对它完全不起作用），
+        # 她说过 +1、他提过 +1.5，累计封顶
+        usage_raw = min(1.0, (1 + used + 1.5 * hits) / 4.0)
+        ref = (mem.get("last_used_at") or mem.get("last_user_hit_at")
+               or mem.get("created_at") or "")
+        half = KIND_HALF_LIFE_DAYS.get(kind)
+        decay = 1.0
+        if half and ref:
             try:
-                last_dt = datetime.strptime(last_accessed, "%Y-%m-%d %H:%M:%S")
-                days = max(0, (datetime.now() - last_dt).days)
-                last_used_recency = max(0.0, 1.0 - days / MEMORY_DECAY_DAYS)
+                days = max(0, (datetime.now() - datetime.strptime(ref, "%Y-%m-%d %H:%M:%S")).days)
+                decay = 0.5 ** (days / half)
             except (ValueError, TypeError):
-                last_used_recency = 0.0
+                decay = 1.0
+        score = (0.45 * imp + 0.30 * usage_raw * decay
+                 + 0.20 * conf + 0.10 * (1.0 if mem.get("starred") else 0.0))
+        if kind == "observe":
+            score *= OBSERVE_PENALTY
+        return score
 
-        activity = 0.5 * access_boost + 0.5 * last_used_recency
-        return activity
+    def _score_topic_memory(self, mem):
+        """话题分数 = 长期价值分（10/28 起与事件统一）"""
+        return self._retention_score(mem)
 
     def _score_event_memory(self, mem):
-        """事件分数：重要性 + 活跃度"""
-        importance = mem.get("importance", 0.5)
-
-        access_count = mem.get("access_count", 0) or 0
-        access_boost = min(1.0, access_count / 10.0)
-
-        last_accessed = mem.get("last_accessed_at", "")
-        last_used_recency = 0.0
-        if last_accessed:
-            try:
-                last_dt = datetime.strptime(last_accessed, "%Y-%m-%d %H:%M:%S")
-                days = max(0, (datetime.now() - last_dt).days)
-                last_used_recency = max(0.0, 1.0 - days / MEMORY_DECAY_DAYS)
-            except (ValueError, TypeError):
-                last_used_recency = 0.0
-
-        activity = 0.5 * access_boost + 0.5 * last_used_recency
-        return 0.6 * importance + 0.4 * activity
+        """事件分数 = 长期价值分（10/28 起与话题统一）"""
+        return self._retention_score(mem)
 
     def _format_profile_for_context(self):
         """格式化性格画像为提示词文本：固定清单中已有内容的条目，按最近更新最多取 CONTEXT_TRAITS 条"""
@@ -7343,6 +8000,15 @@ class DesktopPet:
             lines.append(f"- {name}：{desc}")
         if lines:
             out.append("【你对用户的了解】\n" + "\n".join(lines))
+        # 10/28：自我认知层（self / about_user / lesson）—— 每轮都在，永不淘汰
+        _self = [n for n in (profile.get("notes") or []) if (n.get("content") or "").strip()]
+        _abt = [n for n in (profile.get("user_notes") or []) if (n.get("content") or "").strip()]
+        if _self:
+            out.append("【你自己认定的事】\n" + "\n".join(
+                "- " + str(n.get("content")).strip() for n in _self[:PROFILE_NOTES_MAX]))
+        if _abt:
+            out.append("【关于他，你知道的】\n" + "\n".join(
+                "- " + str(n.get("content")).strip() for n in _abt[:PROFILE_NOTES_MAX]))
         return "\n\n".join(out)
 
     def _load_memory_embedder(self):
@@ -7601,13 +8267,14 @@ class DesktopPet:
             return None
 
 
-    def _select_and_format_memories(self, query="", dry_run=False):
+    def _select_and_format_memories(self, query="", dry_run=False, count_mention=False):
         """选择并格式化要注入的记忆；支持按 query 语义召回，失败时回退旧排序"""
         with self._memory_lock:
             topics = [t for t in self.memory_data.get("topics", []) if not t.get("archived", False)]
             events = [e for e in self.memory_data.get("events", []) if not e.get("archived", False)]
 
             query = (query or "").strip()
+            self._last_recall = []
             query_vec = self._get_text_embedding(query) if query else None
 
             if query_vec is not None:
@@ -7625,34 +8292,104 @@ class DesktopPet:
                             if relevance > best_rel:
                                 best_rel = relevance
                         final_score = 0.85 * relevance + 0.15 * base_score
-                        scored.append((final_score, mem))
+                        scored.append((final_score, relevance, mem))
                     scored.sort(key=lambda x: x[0], reverse=True)
-                    return [mem for _, mem in scored]
+                    return scored
 
-                scored_topics = _rank(topics, self._score_topic_memory)
-                scored_events = _rank(events, self._score_event_memory)
+                ranked_topics = _rank(topics, self._score_topic_memory)
+                ranked_events = _rank(events, self._score_event_memory)
                 # 相关性门槛：本轮话题与所有旧记忆都不够相关 → 不注入旧记忆
                 if best_rel < MEMORY_RELEVANCE_THRESHOLD:
                     return ""
             else:
-                scored_topics = sorted(topics, key=self._score_topic_memory, reverse=True)
-                scored_events = sorted(events, key=self._score_event_memory, reverse=True)
+                ranked_topics = [(0.0, 0.0, m) for m in
+                                 sorted(topics, key=self._score_topic_memory, reverse=True)]
+                ranked_events = [(0.0, 0.0, m) for m in
+                                 sorted(events, key=self._score_event_memory, reverse=True)]
             # 排序完成
 
-            selected_topics = scored_topics[:CONTEXT_TOPICS]
-            selected_events = scored_events[:CONTEXT_EVENTS]
+            # 10/28：两个池按一个池选 —— 合起来排序，条数与字数双预算，不再各给 5 个名额
+            _pool = ([(sc, rel, m, "话题") for sc, rel, m in ranked_topics]
+                     + [(sc, rel, m, "经历") for sc, rel, m in ranked_events])
+            _pool.sort(key=lambda x: x[0], reverse=True)
+            _picked = []
+            _chars = 0
+            for _sc, _rel, _m, _kd in _pool:
+                if len(_picked) >= MEMORY_INJECT_MAX:
+                    break
+                # 10/28：逐条地板 —— 低于门槛的不进（以前只看 best_rel，一条擦线就能带一串无关的进来）
+                if query_vec is not None and _rel < MEMORY_RELEVANCE_THRESHOLD:
+                    continue
+                _n = len(str(_m.get("content") or ""))
+                if _picked and _chars + _n > MEMORY_INJECT_CHARS:
+                    break
+                _picked.append((_m, _kd, _rel))
+                _chars += _n
+            selected_topics = [m for m, kd, _ in _picked if kd == "话题"]
+            selected_events = [m for m, kd, _ in _picked if kd == "经历"]
+            self._last_recall = [
+                {"id": str(m.get("id") or ""), "content": str(m.get("content") or ""),
+                 "rel": float(rel), "kind": kd,
+                 "created_at": str(m.get("created_at") or "")[:10]}
+                for m, kd, rel in _picked
+            ]
+
+            # 10/28：**他主动提及**用字面命中判定（向量对短线索不可靠），命中就强制注入 +
+            # user_hits+1；仅仅"被注入"不再加热度（旧 access_count 已饱和，只留 last_injected_at 供诊断）。
+            _mentioned = []
+            if count_mention and query:
+                for _m in list(topics) + list(events):
+                    if _mem_mentions(query, _m.get("content", "")):
+                        _mentioned.append(_m)
+                _mentioned = _mentioned[:3]
 
             if not dry_run:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 for t in selected_topics:
-                    t["last_accessed_at"] = now
-                    t["access_count"] = t.get("access_count", 0) + 1
+                    t["last_injected_at"] = now
                 for e in selected_events:
-                    e["last_accessed_at"] = now
-                    e["access_count"] = e.get("access_count", 0) + 1
-
-                if selected_topics or selected_events:
+                    e["last_injected_at"] = now
+                for _m in _mentioned:
+                    _m["user_hits"] = _m.get("user_hits", 0) + 1
+                    _m["last_user_hit_at"] = now
+                    _m["last_injected_at"] = now
+                if selected_topics or selected_events or _mentioned:
                     save_memories(self.memory_data)
+
+            if _mentioned:
+                # 他提起的事必须出现在上下文里（"我明明说了你还不知道"是最难接受的失败）
+                _mt = [m for m in _mentioned if m in topics and m not in selected_topics]
+                _me = [m for m in _mentioned if m in events and m not in selected_events]
+                selected_topics = _mt + selected_topics
+                selected_events = _me + selected_events
+                # 超出条数上限时从尾部砍（被提及的排在最前，天然保留）
+                # 提及进来的条目也要算字数；超预算就从尾部砍（被提及的排在最前，天然保留）
+                def _total_chars():
+                    return sum(len(str(x.get("content") or ""))
+                               for x in (selected_topics + selected_events))
+                while (len(selected_topics) + len(selected_events) > MEMORY_INJECT_MAX + 3
+                       or _total_chars() > MEMORY_INJECT_CHARS):
+                    if selected_events and selected_events[-1] not in _me:
+                        selected_events.pop()
+                    elif selected_topics and selected_topics[-1] not in _mt:
+                        selected_topics.pop()
+                    else:
+                        break
+                _have = {str(r.get("id") or "") for r in self._last_recall}
+                for _m in reversed(_mentioned):
+                    _mid = str(_m.get("id") or "")
+                    if _mid in _have:
+                        # 已经通过正常排序进来了，别再插一条（否则诊断里同一条算两次）
+                        for _r in self._last_recall:
+                            if str(_r.get("id") or "") == _mid:
+                                _r["rel"] = max(float(_r.get("rel") or 0), 0.99)
+                                _r["kind"] = _r.get("kind") or ("话题" if _m in topics else "经历")
+                        continue
+                    self._last_recall.insert(0, {
+                        "id": _mid, "content": str(_m.get("content") or ""),
+                        "rel": 1.0, "kind": "话题" if _m in topics else "经历",
+                        "created_at": str(_m.get("created_at") or "")[:10]})
+                    _have.add(_mid)
 
             if not selected_topics and not selected_events:
                 return ""
@@ -7692,7 +8429,8 @@ class DesktopPet:
 
         if memory_query is None:
             memory_query = user_msg if context_type == "chat" else ""
-        memory_text = self._select_and_format_memories(query=memory_query)
+        memory_text = self._select_and_format_memories(query=memory_query,
+                                                       count_mention=(context_type == "chat"))
         if memory_text:
             system_content += f"\n\n{memory_text}"
 
@@ -7831,7 +8569,8 @@ class DesktopPet:
                 with self.api_lock:
                     self.api_busy = True
                 try:
-                    resp = self._call_text_model([{"role":"user","content":prompt}], temperature=temp, max_tokens=DEFAULT_MAX_TOKENS, timeout=12)
+                    _sys_topic = "你是%s，%s" % (self.pet_name, self.character_config["persona"])
+                    resp = self._call_text_model([{"role":"system","content":_sys_topic}, {"role":"user","content":prompt}], temperature=temp, max_tokens=DEFAULT_MAX_TOKENS, timeout=12)
                     if resp.status_code == 200:
                         reply = resp.json()["choices"][0]["message"]["content"].strip()
                         parts = reply.split("|")
@@ -8002,28 +8741,110 @@ class DesktopPet:
         self._refresh_costume_buttons()
 
     def start_topic_timer(self):
+        """11/01：主动话题不再按"固定/随机间隔"，改成令牌桶 + 时段权重（频率内置，不可调）。"""
         if self.topic_timer_job:
             self.root.after_cancel(self.topic_timer_job)
+        self._topic_load_state()
         self._schedule_topic()
 
     def _schedule_topic(self):
-        """安排下一次自动话题：fixed=固定分钟；random=在区间内随机抽一次间隔"""
-        if self.topic_enabled and not self.sleep_mode:
-            if self.topic_mode == "random":
-                lo = max(1, min(240, self.topic_random_min))
-                hi = max(lo, min(240, self.topic_random_max))
-                minutes = random.randint(lo, hi)
-            else:
-                minutes = self.topic_interval_minutes
-            interval_ms = int(minutes * 60 * 1000)
-            self.topic_timer_job = self.root.after(interval_ms, self._topic_timer_trigger)
+        self.topic_timer_job = self.root.after(int(TOPIC_TICK_SECONDS * 1000), self._topic_timer_trigger)
 
     def _topic_timer_trigger(self):
-        if self.sleep_mode or self.api_busy:
-            self._schedule_topic()
-            return
-        self.generate_topic_manual()
+        try:
+            self._topic_bucket_tick()
+        except Exception as e:
+            log.warning("话题额度结算失败: %s", e)
         self._schedule_topic()
+
+    # ---------- 主动话题的额度（令牌桶）----------
+    def _topic_state_path(self):
+        return os.path.join(CONFIG_DIR, "topic_bucket.json")
+
+    def _topic_load_state(self):
+        """读回最近 24 小时的开口时间：{emits: [ts...], last_tick}。
+
+        11/01：上限从"自然日"改成**滑动 24 小时**——否则 23:50 说一句、00:10 又说一句，
+        跨零点直接连发。
+        """
+        st = {"emits": [], "last_tick": time.time()}
+        try:
+            raw = json.load(open(self._topic_state_path(), encoding="utf-8"))
+            if isinstance(raw, dict):
+                if isinstance(raw.get("emits"), list):
+                    st["emits"] = [float(x) for x in raw["emits"] if isinstance(x, (int, float))]
+                elif raw.get("count"):
+                    # 旧版只有 count，没有时间戳 —— 补成一串"刚刚"之前的时间，近似保留配额
+                    n = int(raw.get("count") or 0)
+                    st["emits"] = [time.time() - 60 * (i + 1) for i in range(max(0, n))]
+                if isinstance(raw.get("last_tick"), (int, float)):
+                    st["last_tick"] = float(raw["last_tick"])
+        except Exception:
+            pass
+        cutoff = time.time() - 24 * 3600
+        st["emits"] = [t for t in st["emits"] if t >= cutoff]
+        self._topic_state = st
+        return st
+
+    def _topic_save_state(self):
+        try:
+            with open(self._topic_state_path(), "w", encoding="utf-8") as f:
+                json.dump(self._topic_state, f, ensure_ascii=False)
+        except Exception as e:
+            log.debug("话题额度状态存盘失败: %s", e)
+
+    def _topic_bucket_tick(self, now=None):
+        """结算一次"这会儿要不要主动开口"。
+
+        到达概率模型：λ = 基准速率 × 当时段权重，本次概率 p = 1 - e^(-λ·dt)；
+        三条约束：**滑动 24 小时不超过 PER_DAY**、两次至少隔 MIN_GAP、超过 6 小时没说过则强制一句
+        （强制只在 8:00–24:00 生效，避免凌晨把人吵醒）。
+        now 可传（测试用）。
+        """
+        import math
+        st = getattr(self, "_topic_state", None) or self._topic_load_state()
+        now = time.time() if now is None else float(now)
+        # 滑动 24 小时：只保留最近一天的开口记录
+        st["emits"] = [float(t) for t in (st.get("emits") or []) if now - float(t) < 24 * 3600]
+        used = len(st["emits"])
+        # 距上次结算的时长（上限 1 小时，避免停机很久回来概率接近 1）
+        _gap_from_tick = now - float(st.get("last_tick") or now)
+        fresh_start = _gap_from_tick > 7200          # 进程刚起（>2 小时没 tick）时不要立刻兜底
+        dt_h = min(1.0, max(0.0, _gap_from_tick / 3600.0))
+        st["last_tick"] = now
+        _now_dt = datetime.fromtimestamp(now)
+        lam = topic_refill_per_hour() * topic_hour_weight(_now_dt.hour, _now_dt.minute)
+        p_now = 1.0 - math.exp(-lam * dt_h)
+        last_emit = max(st["emits"]) if st["emits"] else 0.0
+        gap_h = (now - last_emit) / 3600.0 if last_emit else 999.0
+        gap_min = gap_h * 60.0
+        rc = getattr(self, "reading_companion", None)
+        reading = bool(getattr(rc, "active", False) or getattr(rc, "running", False))
+        can = (used < TOPIC_PROACTIVE_PER_DAY
+               and gap_min >= TOPIC_MIN_GAP_MIN
+               and not self.sleep_mode
+               and not getattr(self, "api_busy", False)
+               and not getattr(self, "watch_mode", False)
+               and not reading)
+        force_floor = (gap_h >= TOPIC_MAX_SILENCE_H and 8 <= _now_dt.hour < 24
+                       and not fresh_start)
+        if can and (force_floor or random.random() < p_now):
+            st["emits"].append(now)
+            self._topic_save_state()
+            _kind = "瞟一眼" if random.random() < PROACTIVE_GLANCE_RATIO else "找话题"
+            log.info("主动开口：近 24 小时第 %d/%d 次（%s，%s，本次概率 %.3f，距上次 %.0f 分钟）",
+                     used + 1, TOPIC_PROACTIVE_PER_DAY, _kind,
+                     "超时兜底" if force_floor else "概率触发", p_now, gap_min)
+            _did = None
+            if _kind == "瞟一眼":
+                _did = self._auto_glance()
+            if not _did:
+                self.generate_topic_manual()      # 瞟失败（睡觉/陪看中/没图/空回）就退回找话题
+        else:
+            self._topic_save_state()
+            log.debug("主动话题未触发：p=%.3f 近24h %d/%d 距上次 %.0f 分钟",
+                      p_now, used, TOPIC_PROACTIVE_PER_DAY, gap_min)
+        return st
 
     # ---------- 陪看模式（使用 OpenAI 兼容视觉 API）----------
     def toggle_watch_mode(self):
@@ -8057,6 +8878,10 @@ class DesktopPet:
                 messagebox.showwarning("未配置模型", "请先右键设置视觉模型名称（豆包填 endpoint id，其他填模型名）")
                 return
             self.watch_mode = True
+            self._recall_link_count = 0
+            self._watch_comment_count = 0
+            self._watch_care_count = 0
+            self._watch_segment_start_time = time.time()
             self._start_watch_ring()
             # 10/19：陪玩不再强制穿透（原来一开陪玩角色就点不到了）
             self.watch_trigger_times.clear()
@@ -8087,11 +8912,124 @@ class DesktopPet:
 
 
 
+    def _maybe_recall_link(self, comment, recall=None):
+        """陪看评论说完后，若本轮真的召回了与画面相关的旧记忆，**强制补一条气泡**说关联。
+
+        用户 10/27："触景生情完全不起效果，一次没见过" —— 根因是提示词精简后没有任何一句
+        要求她把召回的记忆说出来（模型有上下文但不会主动提）⇒ 改成事后再补一条，
+        条件：召回相关度 ≥ WATCH_RECALL_LINK_MIN、同一条记忆 30 分钟内没提过、
+        每 7 条评论才攒 1 次额度、同一条记忆 30 分钟内没提过。模型可输出 null 表示其实没关系。
+        """
+        try:
+            recall = self._last_recall if recall is None else recall
+            if not recall or not self.watch_mode:
+                return
+            # 10/31：额度按评论数攒 —— 每 WATCH_RECALL_PER_COMMENTS 条评论才允许一次
+            _quota = int(getattr(self, "_watch_comment_count", 0)) // max(1, WATCH_RECALL_PER_COMMENTS)
+            if WATCH_RECALL_LINK_MAX and self._recall_link_count >= WATCH_RECALL_LINK_MAX:
+                return
+            if self._recall_link_count >= _quota:
+                log.debug("陪看·想起旧事：额度用完了（已弹 %d 条 / 评论 %d 条 ⇒ 额度 %d）",
+                          self._recall_link_count, self._watch_comment_count, _quota)
+                return
+            now = time.time()
+            cand = None
+            for m in recall:
+                if not m.get("content"):
+                    continue
+                if float(m.get("rel") or 0) < WATCH_RECALL_LINK_MIN:
+                    continue
+                mid = m.get("id") or ""
+                last = self._recall_link_cool.get(mid, 0)
+                if now - last < WATCH_RECALL_LINK_COOLDOWN:
+                    continue
+                if cand is None or float(m.get("rel") or 0) > float(cand.get("rel") or 0):
+                    cand = m
+            if not cand:
+                return
+            who = self.user_profile.get("call_name", "你")
+            _spot = (getattr(self, "_watch_last_spot", "") or "").strip()
+            _scene = ("现在的画面：" + _spot + chr(10)) if _spot else ""
+            prompt = "".join([
+                f"你刚才陪{who}看屏幕，随口说了这句：「{comment}」", chr(10),
+                _scene,
+                f'这个画面让你想起以前的一件事：「({cand.get("created_at")}) {cand.get("content")}」', chr(10),
+                "如果这两件事真的有关联，就像在**回忆**一样说出来：",
+                "用「我记得之前…」「之前那次…」「上次…」这类开头（情绪括号放最前面），",
+                "后面接你**现在的想法或评价**（感慨、吐槽、嘱咐都行）。", chr(10),
+                "要求：不超过40字；不要只复述那件旧事，要说你的看法；",
+                "不要写“我们都是…”“都是被…带跑”“总之…”这种概括总结，那等于什么都没说。", chr(10),
+                "开头一个括号里只能放一个情绪词，允许的值：" + emotion_word_list() + "；",
+                "如果其实没什么关系、或者你只能说空话，就只输出 null。只输出那一句话，不要解释。",
+            ])
+            resp = self._call_text_model([{"role": "user", "content": prompt}],
+                                         temperature=0.8, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
+            if resp.status_code != 200:
+                return
+            raw = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            if not raw or raw.lower() in ("null", "none", "（null）"):
+                log.info("陪看·想起旧事：模型判断没关系（rel=%.2f），跳过", float(cand.get("rel") or 0))
+                return
+            emotion, text = self.parse_emotion_from_reply(raw)
+            text = _strip_meta_comment(text)
+            if not text:
+                return
+            self._recall_link_cool[cand.get("id") or ""] = now
+            self._recall_link_count += 1
+            # 10/28：这才是"她真的用了这条记忆"的信号（注入不算）
+            try:
+                _mid = str(cand.get("id") or "")
+                for _m in list(self.memory_data.get("topics", [])) + list(self.memory_data.get("events", [])):
+                    if str(_m.get("id") or "") == _mid:
+                        _m["used_count"] = _m.get("used_count", 0) + 1
+                        _m["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        with self._memory_lock:
+                            save_memories(self.memory_data)
+                        break
+            except Exception as _e:
+                log.debug("used_count 更新失败: %s", _e)
+            # 10/27：先等她这一轮评论**念完**再补这句 —— 不然语音会撞 _tts_lock 被跳过（实测「TTS 播放被跳过」），
+            # 气泡也会把还没念完的评论顶掉。判据是 0 号声道播完 + TTS 线程放手（不是"开始输出"就计时）；
+            # 上限 30 秒够 70 字上限的最慢读法，超时也照弹；念完后再固定停顿 GAP 秒，不再弹性估时长。
+            _dl = time.time() + 30
+            while time.time() < _dl:
+                try:
+                    _busy = bool(self._tts_channel is not None and self._tts_channel.get_busy())
+                except Exception:
+                    _busy = False
+                if not _busy and not self._tts_lock.locked():
+                    break
+                time.sleep(0.2)
+            if not self.watch_mode:
+                return
+            time.sleep(WATCH_RECALL_LINK_GAP)
+            log.info("陪看·想起旧事（rel=%.2f, %s）: %s", float(cand.get("rel") or 0), cand.get("kind"), text)
+            self._ui(lambda: self.show_bubble_text(text, emotion))
+            self._ui(lambda: threading.Thread(target=self._tts_play, args=(text,), daemon=True).start())
+            self._ui(lambda: self._add_chat_buffer_turn(
+                f"[陪玩中，{datetime.now().strftime('%H:%M')}，想起以前的事]", text, source="watch"))
+        except Exception as e:
+            log.warning("陪看·想起旧事失败: %s", e)
+
+    def _watch_side_text(self):
+        """历史里陪看那一轮的 user 侧文本：时分 + 画面定位标签（没有标签就只写占位）。
+
+        固定字符串连发会让模型以为"情况没变"（同一占位符连着的强信号），所以带上时间；
+        spot 只写"在哪/在干嘛"，不复述画面。
+        """
+        who = self.user_profile.get('call_name', '你')
+        ts = datetime.now().strftime('%H:%M')
+        spot = (getattr(self, "_watch_last_spot", "") or "").strip()
+        return f"[陪玩中，{ts}，画面：{spot}]" if spot else f"[陪玩中，{ts}，{who}在看的画面]"
+
     def _build_watch_query(self):
-        """合并最近多个陪看锚点作为记忆召回 query"""
+        """合并最近几条陪看评论作为记忆召回 query（去掉情绪括号，只取最近 3 条）"""
+        def _clean(t):
+            return re.sub(r"[（(][^）)]*[）)]", "", t or "").strip()
         if not self._watch_session_anchors:
-            return self._watch_last_anchor or ""
-        return "；".join(self._watch_session_anchors[-WATCH_SESSION_MAX:])
+            return _clean(self._watch_last_anchor)
+        picked = [_clean(a) for a in self._watch_session_anchors[-WATCH_QUERY_ANCHORS:]]
+        return "；".join([x for x in picked if x])
 
     def _update_watch_session(self, content_text):
         """更新陪看会话锚点，并累积当前片段"""
@@ -8133,104 +9071,172 @@ class DesktopPet:
     def _summarize_watch_segment(self):
         if not self._watch_segment_buffer:
             return
+        # 10/28：一场陪玩评论数 <= 3 就不留事件 —— 看几分钟、没说几句话的场次
+        # 只会产生流水账，直接丢弃（buffer 本来就只在内存里，不落库）
+        if self._watch_comment_count <= WATCH_EVENT_MIN_COMMENTS:
+            log.info("陪玩评论 %d 条（<=%d），本次不记录事件",
+                     self._watch_comment_count, WATCH_EVENT_MIN_COMMENTS)
+            self._watch_segment_buffer = []
+            return
         segment = list(self._watch_segment_buffer)
         self._watch_segment_buffer = []
         self._watch_segment_start_time = time.time()
-        if len(segment) == 1:
-            summary = segment[0]
-        else:
-            prompt = f"""请将以下陪看过程中的片段总结成一条完整的事件记忆，要包含观看内容、观看状态、关键阶段和氛围，100-200字。
+        # 11/01：单条评论也走模型总结（不再把原始评论直接当正文），
+        # 并且送模型前剥掉情绪括号 —— "(worried) 这句" 里的标签不该进事件正文。
+        _seg_lines = []
+        for _s in segment:
+            _t = re.sub(r"^[（(][^)）]*[)）]\s*", "", str(_s or "").strip())
+            if _t:
+                _seg_lines.append(_t)
+        summary = None
+        if _seg_lines:
+            prompt = f"""以下是你在陪看时说的几句话（按时间顺序）。请把它们压成一条事件记忆：你们在做什么、你注意到了什么、你当时的反应，100-200字，用第一人称。
 片段：
-{chr(10).join(segment)}
+{chr(10).join(_seg_lines)}
 直接输出事件描述，不要解释。"""
-            summary = None
             try:
                 resp = self._call_text_model([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
                 if resp.status_code == 200:
                     summary = resp.json()["choices"][0]["message"]["content"].strip()
             except Exception as e:
                 log.warning(f"陪看片段总结失败: {e}")
-            if not summary:
-                summary = "；".join(segment)
+            # 11/01：失败就保持 None —— 不再用「把评论拼起来」兜底，那会把事件越滚越长
 
-        events = self.memory_data.setdefault("events", [])
-        if self._current_watch_event_id is not None:
-            for ev in events:
-                if ev.get("id") == self._current_watch_event_id:
-                    old_content = ev.get("content", "")
-                    merged = summary
-                    if old_content and old_content != summary:
-                        merge_prompt = f"""请将下面两条关于同一次陪看过程的事件描述合并成一条完整事件，不要丢失关键信息，200-300字。
+        # 10/28：读改写整体进锁；**模型调用留在锁外**（20 秒超时若塞进锁里会把聊天线程堵死）
+        target_id = self._current_watch_event_id
+        old_content = ""
+        if target_id is not None:
+            with self._memory_lock:
+                for ev in self.memory_data.get("events", []):
+                    if ev.get("id") == target_id:
+                        old_content = str(ev.get("content") or "")
+                        break
+
+        # 11/01：默认"正文不动"（old_content 优先）；只有合并成功才换成 merged_text
+        merged = old_content or summary
+        if target_id is not None and old_content and summary and old_content.strip() != summary.strip():
+            merged = old_content          # 模型失败时保持旧正文，不拼接
+            merge_prompt = f"""请将下面两条关于同一次陪看过程的事件描述合并成一条完整事件，不要丢失关键信息，200-300字。
 旧事件：{old_content}
 新片段总结：{summary}
 直接输出合并后的事件描述，不要解释。"""
-                        try:
-                            resp = self._call_text_model([{"role": "user", "content": merge_prompt}], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
-                            if resp.status_code == 200:
-                                merged_text = resp.json()["choices"][0]["message"]["content"].strip()
-                                if merged_text:
-                                    merged = merged_text
-                        except Exception as e:
-                            log.warning(f"陪看事件合并失败: {e}")
-                            merged = old_content + "；" + summary
-                    ev["content"] = merged
-                    ev["last_accessed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ev["importance"] = max(ev.get("importance", 0.5), 0.7)
-                    ev["evidence_count"] = ev.get("evidence_count", 1) + 1
-                    save_memories(self.memory_data)
-                    return
-            self._current_watch_event_id = None
+            try:
+                resp = self._call_text_model([{"role": "user", "content": merge_prompt}], temperature=0.3,
+                                             max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
+                if resp.status_code == 200:
+                    merged_text = resp.json()["choices"][0]["message"]["content"].strip()
+                    if merged_text:
+                        merged = merged_text
+            except Exception as e:
+                log.warning(f"陪看事件合并失败: {e}")
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_id = str(uuid.uuid4())[:8]
-        events.append({
-            "id": new_id,
-            "content": summary,
-            "created_at": now,
-            "last_accessed_at": now,
-            "importance": 0.7,
-            "source": "watch",
-            "access_count": 0,
-            "evidence_count": 1,
-            "archived": False
-        })
-        self._current_watch_event_id = new_id
-        self._prune_memories("events")
-        save_memories(self.memory_data)
+        with self._memory_lock:
+            events = self.memory_data.setdefault("events", [])
+            ev = next((x for x in events if x.get("id") == target_id), None) if target_id else None
+            if ev is not None:
+                # **进锁复读**：模型调用期间被别的线程改过就退化成追加，绝不覆盖别人的写入
+                cur = str(ev.get("content") or "")
+                # 11/01：别人在模型调用期间写过（cur 变了）就保留别人的；模型没给结果也不动正文
+                if merged and merged != cur and (not cur or cur == old_content):
+                    ev["content"] = merged
+                ev["last_accessed_at"] = now
+                ev["importance"] = max(ev.get("importance", 0.5), 0.7)
+                ev["evidence_count"] = ev.get("evidence_count", 1) + 1
+                save_memories(self.memory_data)
+                return
+            # 目标不存在（首次 / 被淘汰）→ 新建一条；但模型没给正文就不新建，下一段再试
+            if not summary:
+                log.info("陪看段总结没拿到正文，本次不新建事件")
+                return
+            self._current_watch_event_id = None
+            new_id = str(uuid.uuid4())[:8]
+            events.append({
+                "id": new_id,
+                "content": summary,
+                "created_at": now,
+                "last_accessed_at": now,
+                "importance": 0.7,
+                "source": "watch",
+                "access_count": 0,
+                "evidence_count": 1,
+                "archived": False
+            })
+            self._current_watch_event_id = new_id
+            self._prune_memories("events")
+            save_memories(self.memory_data)
 
     def _finalize_watch_event(self):
         """陪看结束收尾：把整场事件做最后一次整理，确保不超过 WATCH_EVENT_MAX_LEN 字"""
         if self._current_watch_event_id is None:
             return
-        events = self.memory_data.get("events", [])
-        for ev in events:
-            if ev.get("id") != self._current_watch_event_id:
-                continue
-            content = (ev.get("content") or "").strip()
-            if not content:
-                return
-            try:
-                resp = self._call_text_model([{
-                    "role": "user",
-                    "content": f"请将下面这段陪看事件记录整理成最终版本：保留观看内容、观看状态、关键阶段和氛围，确保总字数不超过{WATCH_EVENT_MAX_LEN}字（含标点），直接输出整理结果，不要解释。\n事件：\n{content}"
-                }], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
-                if resp.status_code == 200:
-                    final_text = resp.json()["choices"][0]["message"]["content"].strip()
-                    if final_text:
-                        ev["content"] = final_text
-            except Exception as e:
-                log.warning(f"陪看事件收尾失败: {e}")
-            ev["content"] = self._enforce_event_length(ev["content"])
-            ev["last_accessed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_memories(self.memory_data)
+        target_id = self._current_watch_event_id
+        with self._memory_lock:
+            content = ""
+            for ev in self.memory_data.get("events", []):
+                if ev.get("id") == target_id:
+                    content = (ev.get("content") or "").strip()
+                    break
+        if not content:
+            return
+        final_text = ""
+        try:
+            resp = self._call_text_model([{
+                "role": "user",
+                "content": f"请将下面这段陪看事件记录整理成最终版本：保留观看内容、观看状态、关键阶段和氛围，确保总字数不超过{WATCH_EVENT_MAX_LEN}字（含标点），直接输出整理结果，不要解释。{chr(10)}事件：{content}"
+            }], temperature=0.3, max_tokens=DEFAULT_MAX_TOKENS, timeout=20)
+            if resp.status_code == 200:
+                final_text = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning(f"陪看事件收尾失败: {e}")
+        with self._memory_lock:
+            for ev in self.memory_data.get("events", []):
+                if ev.get("id") != target_id:
+                    continue
+                cur = (ev.get("content") or "").strip()
+                # 复读：收尾调用期间内容变了就沿用最新的，别把新片段覆盖掉
+                base = final_text if (final_text and (not cur or cur == content)) else (cur or content)
+                ev["content"] = self._enforce_event_length(base)
+                ev["last_accessed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                save_memories(self.memory_data)
+                break
             return
 
     def start_watch_loop(self):
         if self.watch_mode:
             self.analyze_and_comment(force=False)
-            # 轮询间隔取 min_interval 的一半，限制在 5~60 秒之间
-            poll_sec = max(5, min(self.watch_min_interval // 2, 60))
+            # 10/30：判断间隔仍由「最短沉默」派生（原来 /2，现在 /10，夹在 2~6 秒）——
+            # 用户把最短沉默调长，判断频率跟着变慢，这条耦合保留。
+            poll_sec = max(WATCH_POLL_MIN, min(self.watch_min_interval / WATCH_POLL_DIV, WATCH_POLL_MAX))
             self.watch_job = self.root.after(int(poll_sec * 1000), self.start_watch_loop)
+
+    def _log_watch_motion(self, last_diff, recent, color=None):
+        """把环形缓冲的逐帧差值落盘（10/30，**只用于标定 WATCH_SETTLE_MOTION**）。
+
+        写 userdata\watch_motion.jsonl，每 ~15 秒一条：d=最近两张的差，avg/max=最近 10 张的统计。
+        文件超过 2 MB 就砍掉前一半 —— 这是诊断数据，不值得无限留着。
+        """
+        try:
+            path = os.path.join(CONFIG_DIR, "watch_motion.jsonl")
+            rec = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                   "ts": round(time.time(), 1),
+                   "d": round(float(last_diff), 2),
+                   "avg": round(sum(recent) / len(recent), 2) if recent else None,
+                   "max": round(max(recent), 2) if recent else None}
+            # 11/01：色彩指纹（只采集，不参与判定）—— hue=色调构成距离，bri=亮度距离，0~100
+            if color:
+                for _k in ("hue_far", "bri_far", "hue_near", "bri_near"):
+                    rec[_k] = None if color.get(_k) is None else round(float(color[_k]), 1)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+            try:
+                if os.path.getsize(path) > 2 * 1024 * 1024:
+                    _ls = open(path, encoding="utf-8").read().splitlines()
+                    open(path, "w", encoding="utf-8").write(chr(10).join(_ls[len(_ls) // 2:]) + chr(10))
+            except Exception:
+                pass
+        except Exception as e:
+            log.debug("运动量采样写盘失败: %s", e)
 
     def _start_watch_ring(self):
         """陪玩开启时调用：起一个后台线程每 WATCH_RING_EVERY 秒抓一张，只留最近 KEEP 张。
@@ -8244,13 +9250,30 @@ class DesktopPet:
         self._watch_ring_on = True
 
         def loop():
+            _prev_sig = None
+            _motion_recent = []
+            _motion_n = 0
             while getattr(self, "_watch_ring_on", False) and self.watch_mode:
                 try:
                     b64 = self.capture_screen_base64()
                     if b64:
                         self._watch_ring.append((time.time(), b64))
-                        if len(self._watch_ring) > WATCH_RING_KEEP:
-                            del self._watch_ring[:-WATCH_RING_KEEP]
+                        if len(self._watch_ring) > getattr(self, "watch_ring_keep", WATCH_RING_KEEP):
+                            del self._watch_ring[:-getattr(self, "watch_ring_keep", WATCH_RING_KEEP)]
+                        # 10/30：采样相邻帧差，用来标定 WATCH_SETTLE_MOTION（每 ~15 秒落一条）
+                        try:
+                            _sig = self._frame_signature(b64)
+                            if _prev_sig is not None and _sig is not None:
+                                _d = self._frame_diff(_prev_sig, _sig)
+                                _motion_recent.append(_d)
+                                del _motion_recent[:-10]
+                                _motion_n += 1
+                                if _motion_n % 10 == 0:
+                                    self._log_watch_motion(_d, _motion_recent,
+                                                           color=self._watch_color_pair(b64))
+                            _prev_sig = _sig
+                        except Exception as _e:
+                            log.debug("运动量采样失败: %s", _e)
                 except Exception as e:
                     log.debug("陪看环形采集失败: %s", e)
                 # 分段睡，关陪玩时能立刻退出
@@ -8281,8 +9304,121 @@ class DesktopPet:
         step = max(1, len(ring) // n)
         return [ring[i][1] for i in range(0, len(ring), step)][:n]
 
+    def _watch_ring_pick_aged(self, n=None):
+        """同 _watch_ring_pick，但带"多少秒前"（给画面烧时间角标用）。"""
+        n = WATCH_RING_SEND if n is None else n
+        ring = list(getattr(self, "_watch_ring", []) or [])
+        if len(ring) < 2 or n <= 0:
+            return []
+        ring = ring[:-1]
+        now = time.time()
+        step = max(1, len(ring) // n)
+        return [(b64, max(0.0, now - ts)) for ts, b64 in ring[::step][:n]]
+
+    def _badge_frame(self, image_b64, label):
+        """在截图左上角烧一个"多少秒前"的角标（10/27）：模型现在能分清 5 张图的先后。
+
+        只动像素不动尺寸（仍是 1280×720 / q60）；任何异常都退回原图，绝不让角标拖垮评论。
+        """
+        try:
+            from PIL import ImageDraw, ImageFont
+            raw = base64.b64decode(image_b64)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            d = ImageDraw.Draw(img)
+            fs = max(16, int(img.height * 0.034))
+            font = None
+            for _p in ("C:\Windows\Fonts\msyh.ttc", "C:\Windows\Fonts\msyhbd.ttc",
+                       "C:\Windows\Fonts\simhei.ttf"):
+                try:
+                    font = ImageFont.truetype(_p, fs)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+            tw = int(d.textlength(label, font=font)) + fs // 2
+            d.rectangle([0, 0, tw, fs + 10], fill=(255, 226, 60))
+            d.text((fs // 4, 3), label, font=font, fill=(0, 0, 0))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=60)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as e:
+            log.debug(f"画面角标失败（忽略）: {e}")
+            return image_b64
+
+
+    def _compose_frames_grid(self, frames, cols=2, cell_w=None, cell_h=None, label_h=None):
+        """把若干历史帧拼成一张网格图（10/29 起）。
+
+        frames = [(b64, 多少秒前), ...]，**旧→新**；每格底下烧一条黑底标签写「-10.5s」。
+        为什么这么做：视觉模型按像素收 token，单张 ≥2MP 就封顶 1000；
+        5 张 1280×720 要 2926，而「拼图 1920×1080（1000）+ 当前帧 1280×720（578）」= 1579。
+        960 宽的格子文字识别率约 95%（640 宽只有 37%，所以近层不能更小）。
+        远层允许用 640 格（只看动势、不读字幕）。失败返回空串，上层退回单发。
+        """
+        try:
+            from PIL import ImageDraw, ImageFont
+            items = [(b, a) for b, a in (frames or []) if b]
+            if not items:
+                return ""
+            cw = int(cell_w or WATCH_GRID_CELL_W)
+            ch = int(cell_h or (WATCH_GRID_CELL_H if cell_w is None else cw * 9 // 16))
+            lh = int(label_h or WATCH_GRID_LABEL_H)
+            n = len(items)
+            cols = max(1, min(int(cols or 1), n))
+            rows = (n + cols - 1) // cols
+            canvas = Image.new("RGB", (cw * cols, ch * rows), (10, 10, 12))
+            d = ImageDraw.Draw(canvas)
+            try:
+                font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", max(12, int(lh * 0.62)))
+            except Exception:
+                font = ImageFont.load_default()
+            for idx, (b64s, age) in enumerate(items):
+                try:
+                    im = Image.open(io.BytesIO(base64.b64decode(b64s))).convert("RGB")
+                except Exception:
+                    continue
+                im = im.resize((cw, max(16, ch - lh)), Image.BILINEAR)
+                x = (idx % cols) * cw
+                y = (idx // cols) * ch
+                canvas.paste(im, (x, y))
+                d.rectangle([x, y + ch - lh, x + cw, y + ch], fill=(0, 0, 0))
+                d.text((x + 6, y + ch - lh + 2), "-%.1fs" % float(age),
+                       fill=(255, 220, 0), font=font)
+            buf = io.BytesIO()
+            canvas.save(buf, "JPEG", quality=60)
+            return base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            log.warning("历史帧拼图失败（退回单发）: %s", e)
+            return ""
+
+    def _watch_ring_pick_at(self, targets):
+        """按"想要距现在多少秒"取帧（取最接近的一张），返回 [(b64, 实际多少秒前)] 旧→新。
+
+        多分辨率时间轴用它：近层给 [6,4.5,3,1.5]，远层给 [12,19,26,33,40,47,54,60]。
+        """
+        ring = list(getattr(self, "_watch_ring", []) or [])
+        if not ring:
+            return []
+        now = time.time()
+        pool = [(max(0.0, now - ts), b64) for ts, b64 in ring]
+        picked, used = [], set()
+        for want in sorted(targets, reverse=True):          # 由远到近，保证时间顺序
+            best = None
+            for idx, (age, b64) in enumerate(pool):
+                if idx in used:
+                    continue
+                if best is None or abs(age - want) < abs(pool[best][0] - want):
+                    best = idx
+            if best is None:
+                continue
+            used.add(best)
+            picked.append((pool[best][1], pool[best][0]))
+        return picked
+
     def _record_watch_sample(self, comment, diff=None, force=False, elapsed=0.0,
-                             model_s=0.0, frames=1):
+                             model_s=0.0, frames=1, since_last=None, tiers=None, care=None,
+                             color=None):
         """P0 基线采集（10/19 起）：把每次陪看评论落成一条 JSONL。
 
         为什么要它：陪看评论以前从不落盘（chat_buffer 只留 15 轮、日志只有调度行），
@@ -8296,19 +9432,24 @@ class DesktopPet:
                 "comment": text,
                 "len": len(text),
                 "empty": not bool(text),
-                "summary": (getattr(self, "_watch_last_summary", "") or "").strip()[:120],
                 "gap_s": round(min(elapsed, 3600.0), 1),   # 首条 last=0 会算出 epoch，截断
                 "diff": None if diff is None else round(float(diff), 4),
                 "force": bool(force),
                 "frames": int(frames),
                 "model_s": round(model_s, 2),
+                "diff_last": None if since_last is None else round(float(since_last), 4),
+                "tiers": tiers or "",
+                "care": None if care is None else int(care),
             }
+            if color:
+                for _k in ("hue_far", "bri_far", "hue_near", "bri_near"):
+                    rec[_k] = None if color.get(_k) is None else round(float(color[_k]), 1)
             with open(os.path.join(CONFIG_DIR, "watch_log.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             log.debug("陪看样本落盘失败: %s", e)
 
-    def _record_watch_skip(self, reason, elapsed=0.0, diff=None, frames=None):
+    def _record_watch_skip(self, reason, elapsed=0.0, diff=None, frames=None, since_last=None):
         """记录一次"没说话"：原因 + 距上次发言 + 画面变化。与 sample 同一份 JSONL。"""
         try:
             rec = {
@@ -8321,6 +9462,7 @@ class DesktopPet:
                 "gap_s": round(min(elapsed, 3600.0), 1),
                 "diff": None if diff is None else round(float(diff), 4),
                 "frames": None if frames is None else int(frames),   # 跳过发生在抓帧之前 ⇒ 帧数未知
+                "diff_last": None if since_last is None else round(float(since_last), 4),
             }
             with open(os.path.join(CONFIG_DIR, "watch_log.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -8348,7 +9490,12 @@ class DesktopPet:
                 log.debug("陪看: 距上次发言 %.1fs > 最长沉默 %ds，强制触发", elapsed, self.watch_max_silence)
                 force = True
             else:
-                prob = max(0.05, (elapsed - self.watch_min_interval) / (self.watch_max_silence - self.watch_min_interval))
+                # 原公式是按 15 秒一次推的；现在 2 秒一判，按时间比例折算成单次概率（期望发言率不变）
+                p15 = max(0.05, (elapsed - self.watch_min_interval) /
+                          max(1.0, (self.watch_max_silence - self.watch_min_interval)))
+                _poll = max(WATCH_POLL_MIN, min(self.watch_min_interval / WATCH_POLL_DIV, WATCH_POLL_MAX))
+                _base = max(5.0, min(self.watch_min_interval // 2, 60))     # 原设计的判断间隔
+                prob = 1.0 - (1.0 - p15) ** (_poll / _base)
                 if random.random() > prob:
                     log.debug("陪看: 概率跳过 (elapsed=%.1fs, prob=%.2f)", elapsed, prob)
                     self._record_watch_skip("prob", elapsed)
@@ -8357,48 +9504,133 @@ class DesktopPet:
 
         log.debug("陪看: 开始分析画面")
         def process():
+            # 10/30：动作最猛的那一下别在半空中开口 —— 先等它落定，再截"现在"的帧
             try:
-                _prev_b64, image_b64 = self.capture_screen_pair()     # 前后两帧（间隔约 1.2s）
-                _n_frames = 2 if _prev_b64 else 1
+                _ring = list(getattr(self, "_watch_ring", []) or [])
+                if len(_ring) >= 2:
+                    _m = self._frame_diff(self._frame_signature(_ring[-2][1]),
+                                          self._frame_signature(_ring[-1][1]))
+                    if _m >= WATCH_SETTLE_MOTION:
+                        log.debug("陪看: 画面正在剧烈变化（%.1f），等 %.1f 秒落定再开口", _m, WATCH_SETTLE_SEC)
+                        time.sleep(WATCH_SETTLE_SEC)
+            except Exception as e:
+                log.debug("陪看: 落定等待跳过（%s）", e)
+            try:
+                # 11/01：不再现场抓一对帧（那要硬等 1.2 秒），锚点直接取环形里约 4 秒前那张。
+                # 她落地时已经过去 4 秒，所以这张正好对上"刚才"，而不是假装"现在"。
+                _anchor = self._watch_ring_pick_at([WATCH_ANCHOR_AGE])
+                if _anchor:
+                    image_b64, _anchor_age = _anchor[0]
+                else:
+                    image_b64 = self.capture_screen_base64()      # 环里还没帧（刚开陪看）才现抓
+                    _anchor_age = 0.0
                 if not image_b64:
                     self._ui(lambda: self.show_bubble_text("(normal) 唔...我现在看不到画面呢。", "normal"), status=True)
                     return
+                _prev_b64 = None
                 sig = self._frame_signature(image_b64)
-                diff = self._frame_diff(self.last_screen_sig, sig)   # 不论 force 都算：采集要用
+                since_last = self._frame_diff(self.last_screen_sig, sig)   # 不论 force 都算：采集要用
+                # 10/28：判据改成"本轮要发的那几张图互相比" —— 只有这十秒里真的在动才算有变化
+                _aged_raw = self._watch_ring_pick_aged()
+                _sigs = [self._frame_signature(_b) for _b, _a in _aged_raw]
+                _sigs.append(sig)
+                motion = self._frames_motion(_sigs)
+                if self._watch_skip_by_stillness(motion, since_last, force):
+                    log.debug("陪看: 这十秒画面没动（相邻帧最大差 %.2f < %.1f，与上次开口那帧差 %.2f），跳过不调模型",
+                              motion, WATCH_MOTION_THRESHOLD, since_last)
+                    self._record_watch_skip("same", elapsed, diff=motion,
+                                            frames=len(_sigs), since_last=since_last)
+                    return
                 if not force:
-                    if diff < WATCH_SIMILARITY_THRESHOLD and not force:   # 用户明确要看时不去重
-                        log.debug("陪看: 画面与上次评论时几乎没变（平均像素差 %.2f < %.1f），跳过不调模型",
-                                  diff, WATCH_SIMILARITY_THRESHOLD)
-                        self._record_watch_skip("same", elapsed, diff=diff, frames=_n_frames)
-                        return
-                    log.debug("陪看: 画面变化 平均像素差 %.2f", diff)
-                _earlier = self._watch_ring_pick()          # P2：环里更早的画面（可能为空）
+                    log.debug("陪看: 画面在动 相邻帧最大差 %.2f（与上次开口那帧差 %.2f）", motion, since_last)
+                # 10/30（两级时间轴）：近层 4 帧@960 宽（看细节/字幕）+ 远层 8 帧@640 宽（看动势）
+                # + 当前帧原生。token：近 1000 + 远 ~950 + 当前 578 ≈ 2510，仍低于改造前 5 张原生的 2926。
+                _recent, _older = [], []      # 兜底：拼图那段若抛异常，下面的日志/记录也不会 NameError
+                _earlier = []
+                _use_grid = False
+                try:
+                    _recent_n = max(1, min(4, int(getattr(self, "watch_recent_frames", WATCH_RECENT_FRAMES))))
+                    _older_n = max(0, min(8, int(getattr(self, "watch_older_frames", WATCH_OLDER_FRAMES))))
+                    _span = max(6.0, float(getattr(self, "watch_ring_seconds", WATCH_RING_SECONDS)))
+                    # 近层：最近 ~6 秒（含前后帧那一秒）
+                    # 11/01：整条时间轴后移 4 秒 —— 近层 4.5~10 秒、远层 10~20 秒，锚点另取。
+                    _recent_targets = [WATCH_NEAR_FROM + (WATCH_NEAR_TO - WATCH_NEAR_FROM) * i / max(1, _recent_n - 1)
+                                       for i in range(_recent_n)]
+                    _recent = self._watch_ring_pick_at(_recent_targets)
+                    # 远层：更早的一段（从近层末端到缓冲边界），均匀取
+                    _older = []
+                    if _older_n:
+                        _t0 = max(WATCH_FAR_FROM, WATCH_NEAR_TO)
+                        if _span > _t0 + 1.0:
+                            _older_targets = [_t0 + (_span - _t0) * (i + 1) / _older_n for i in range(_older_n)]
+                            _older = self._watch_ring_pick_at(_older_targets)
+                    _grids = []
+                    if len(_recent) >= 2:
+                        _g = self._compose_frames_grid(_recent, cols=2,
+                                                       cell_w=WATCH_GRID_CELL_W, cell_h=WATCH_GRID_CELL_H)
+                        if _g:
+                            _grids.append(_g)                      # 近层：旧→新
+                    if len(_older) >= 2:
+                        _g2 = self._compose_frames_grid(_older, cols=2,
+                                                        cell_w=640, cell_h=360, label_h=22)
+                        if _g2:
+                            _grids.insert(0, _g2)                  # 远层排在前面（更早，2×2）
+                    if _grids:
+                        _earlier = _grids
+                        _use_grid = True
+                        _prev_b64 = None                           # 前后帧已并进近层
+                        image_b64 = self._badge_frame(image_b64, "刚才")
+                    else:                                          # 拼图失败 ⇒ 退回原来逐张单发
+                        _earlier = [self._badge_frame(_b, "-%ds" % max(1, round(_a)))
+                                    for _b, _a in self._watch_ring_pick_aged()]
+                        if _prev_b64:
+                            _prev_b64 = self._badge_frame(_prev_b64, "-1.2s")
+                        image_b64 = self._badge_frame(image_b64, "刚才")
+                except Exception as e:
+                    log.warning(f"画面时间角标失败（照常发图）: {e}")
+                _sent_images = len(_earlier) + 1 + (1 if _prev_b64 else 0)
                 _v0 = time.time()
                 comment = self._get_vision_comment(image_b64, force=force,
                                                    image_b64_prev=_prev_b64,
                                                    image_b64_earlier=_earlier)
                 # P0 基线采集：每次（含空回）都记一条；frames=1 是旧单帧样本，2 为多帧样本，可直接对比
-                self._record_watch_sample(comment, locals().get("diff"), force, elapsed,
+                _care_hit = 1 if any(w in (comment or "") for w in WATCH_CARE_WORDS) else 0
+                log.debug("陪看: 发图 %d 张（%s）", _sent_images,
+                          "历史 4 帧拼图 + 当前帧" if _use_grid else "逐张单发")
+                _color = self._watch_color_pair(image_b64)
+                self._record_watch_sample(comment, motion, force, elapsed,
                                           time.time() - _v0,
-                                          frames=_n_frames + len(locals().get("_earlier") or []))
+                                          frames=_sent_images,
+                                          since_last=since_last,
+                                          tiers=("%d+/%d远" % (len(_recent), len(_older)) if _use_grid else "逐张"),
+                                          care=_care_hit,
+                                          color=_color)
+                log.debug("陪看: 本轮图 %d 张 / 近层 %d / 远层 %d / 锚点在 %.1f 秒前",
+                          _sent_images, len(_recent), len(_older), _anchor_age)
                 if comment:
                     # 只有"真的说了一句"才重置发言间隔（空回不吃间隔：间隔＝实际发言的间隔）
-                    add_topic_material(comment, "watch")   # 她看到的画面事实也给话题取材
+                    # 11/01：她自己的陪看评论不再进素材池（187/200 全是这个，取材等于自我模仿）
                     self.last_watch_comment_time = time.time()
                     self.last_screen_sig = sig
-                    if any(w in comment for w in ('休息', '歇', '累', '睡', '眼睛')):
+                    if _care_hit:
+                        self._watch_care_count = int(getattr(self, "_watch_care_count", 0)) + 1
                         self._rest_cooldown_until = time.time() + 5 * 60   # 真提了才进冷却
                     self._ui(lambda: self.show_bubble_text(comment, "normal"))
                     self._ui(lambda: threading.Thread(target=self._tts_play, args=(comment,), daemon=True).start())
                     # 陪玩评论写入缓冲 + 事件锚点。
                     # user 侧文本用当次画面摘要而不是固定占位符——同一个占位符连着出现
                     # 等于告诉模型"情况和上次一样，照上次说"，是句式锁死的强信号。
-                    _who = self.user_profile.get('call_name', '你')
-                    _sum = (getattr(self, '_watch_last_summary', '') or '').strip()
-                    if len(_sum) > 80:
-                        _sum = _sum[:80] + '…'
-                    _side = f"[陪玩中，{_who}在看：{_sum}]" if _sum else f"[陪玩中，{_who}在看的画面]"
+                    try:
+                        self._watch_comment_count += 1     # 10/28：本次陪玩已说几条
+                    except Exception:
+                        pass
+                    _side = self._watch_side_text()
                     self._ui(lambda: self._add_chat_buffer_turn(_side, comment, source="watch"))
+                    # 10/27：本轮真召回了相关旧记忆 → 事后补一条"想起旧事"气泡（模型可判 null）
+                    _snap = list(self._last_recall or [])
+                    if _snap:
+                        threading.Thread(target=self._maybe_recall_link,
+                                         args=(comment, _snap), daemon=True).start()
             except Exception as e:
                 log.error(f"陪看分析出错: {e}")
             finally:
@@ -8487,6 +9719,92 @@ OCR文字：
         a = np.frombuffer(sig_a, dtype=np.uint8).astype(np.int16)
         b = np.frombuffer(sig_b, dtype=np.uint8).astype(np.int16)
         return float(np.abs(a - b).mean())
+
+    @staticmethod
+    def _frame_color_sig(image_b64):
+        """色彩指纹（11/01）：色调 24 桶 + 亮度 8 桶的归一化直方图；解不开返回 None。
+
+        为什么不用"空间色块"：真实游戏帧上实测"色块网格差"和"灰度差"几乎完全一样
+        （p50 36.2 vs 36.5，只差 0.3）——空间差被亮度主导，加颜色没新信息。
+        真正与运动量正交的是**色彩构成**（哪种颜色占多少面积），所以这里只看分布不看位置。
+        """
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+            arr = np.asarray(img.resize(WATCH_COLOR_SIZE, Image.BOX).convert("HSV"), dtype=np.int32)
+            h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
+            mask = (s > 40) & (v > 40)
+            hue = np.bincount((h[mask] * 24) // 256, minlength=24).astype(np.float32)
+            if hue.sum() > 0:
+                hue = hue / hue.sum()
+            bri = np.bincount((v.ravel() * 8) // 256, minlength=8).astype(np.float32)
+            if bri.sum() > 0:
+                bri = bri / bri.sum()
+            return (hue.tobytes(), bri.tobytes())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _color_diff(sig_a, sig_b):
+        """(色调距离, 亮度距离)，各自 0~100 的半 L1 距离；缺一个就当完全不同。"""
+        try:
+            if not sig_a or not sig_b:
+                return 100.0, 100.0
+            a = np.frombuffer(sig_a[0], dtype=np.float32)
+            b = np.frombuffer(sig_b[0], dtype=np.float32)
+            c = np.frombuffer(sig_a[1], dtype=np.float32)
+            d = np.frombuffer(sig_b[1], dtype=np.float32)
+            if len(a) != len(b) or len(c) != len(d):
+                return 100.0, 100.0
+            return float(np.abs(a - b).sum() / 2.0) * 100.0, float(np.abs(c - d).sum() / 2.0) * 100.0
+        except Exception:
+            return 100.0, 100.0
+
+    def _watch_color_pair(self, image_b64, seconds=18.0):
+        """当前帧 vs 环形里 ~seconds 秒前那帧 / vs 最新那帧。
+
+        返回 dict：hue_far/bri_far（换没换地方）、hue_near/bri_near（是不是突然变色）。
+        这项只是采集，不参与任何判定 —— 先跑几场看分布再定阈值。
+        """
+        out = {"hue_far": None, "bri_far": None, "hue_near": None, "bri_near": None}
+        try:
+            cur = self._frame_color_sig(image_b64)
+            if cur is None:
+                return out
+            ring = list(getattr(self, "_watch_ring", []) or [])
+            if ring:
+                now = time.time()
+                far = min(ring, key=lambda t: abs(t[0] - (now - seconds)))
+                out["hue_far"], out["bri_far"] = self._color_diff(
+                    self._frame_color_sig(far[1]), cur)
+                out["hue_near"], out["bri_near"] = self._color_diff(
+                    self._frame_color_sig(ring[-1][1]), cur)
+        except Exception as e:
+            log.debug("色彩指纹计算失败: %s", e)
+        return out
+
+
+    @staticmethod
+    def _frames_motion(sigs):
+        """一串指纹（旧→新）最大相邻差：衡量这一小段里画面有没有真的在动。
+
+        解码失败的帧（None）直接跳过——它和任何一张的 diff 都是 255，
+        算进去会把 motion 顶到 255、让去重在本轮失效。"""
+        best = 0.0
+        prev = None
+        for s in sigs:
+            if s is None:
+                prev = None          # 断链：不拿坏帧去比
+                continue
+            if prev is not None:
+                best = max(best, DesktopPet._frame_diff(prev, s))
+            prev = s
+        return best
+
+    @staticmethod
+    def _watch_skip_by_stillness(motion, since_last, force=False):
+        """要不要因为“画面没动”跳过这一轮。"""
+        return (not force) and motion < WATCH_MOTION_THRESHOLD and since_last < WATCH_CHANGE_BIG
+
 
     def open_music_web(self):
         """网页版模式：打开网页版播放器，或让它开始播放。
@@ -8618,6 +9936,37 @@ OCR文字：
             return True, ("现在在放《%s》" % title) if st.get("status") == "playing" and title else "好"
         return True, ("《%s》" % title) if title else "好"
 
+    def _auto_glance(self):
+        """主动瞟一眼屏幕，随口说一句（跟主动话题共用调度，11/01）。
+
+        和 look_at_screen 的区别：那个是"他让你看、要把话答回去"；这个是
+"她自己看了一眼、随口嘀咕一句"，直接弹气泡 + 语音，不写陪看历史、不动陪看间隔。
+        """
+        if self.sleep_mode or getattr(self, "watch_mode", False):
+            return False
+        rc = getattr(self, "reading_companion", None)
+        if bool(getattr(rc, "active", False) or getattr(rc, "running", False)):
+            return False
+        if not self.vision_api_key or not self.vision_model:
+            return False
+        if getattr(self, "api_busy", False):
+            return False
+        try:
+            image_b64 = self.capture_screen_base64()
+        except Exception as e:
+            log.debug("主动瞟一眼：截图失败 %s", e)
+            return False
+        if not image_b64:
+            return False
+        line = self._get_vision_comment(image_b64, force=False, glance=True)
+        line = (line or "").strip()
+        if not line:
+            return False
+        self._ui(lambda: self.show_bubble_text(line, "normal"))
+        self._ui(lambda: threading.Thread(target=self._tts_play, args=(line,), daemon=True).start())
+        log.info("主动瞟一眼：%s", line[:70])
+        return True
+
     def look_at_screen(self, focus=""):
         """看一眼当前屏幕并按他的关注点说一句（工具入口，10/17 新增）。
 
@@ -8643,12 +9992,13 @@ OCR文字：
         return True, line
 
     def _get_vision_comment(self, image_b64, force=False, focus="", image_b64_prev=None,
-                            image_b64_earlier=None, look=False):
+                            image_b64_earlier=None, look=False, glance=False):
         """使用 OpenAI 兼容视觉模型分析截图"""
         if not self.vision_api_key:
             return "(worried) 请先设置视觉模型 API Key"
         if not self.vision_model:
             return "(worried) 请先设置视觉模型名称"
+        self._watch_last_spot = ""      # 本轮若失败/空回，不能沿用上一轮的标签
 
         user_name = self.user_profile.get("call_name", "你")
 
@@ -8672,17 +10022,35 @@ OCR文字：
             said_block = ("【你已经说过的陪玩评论——别再复用这些句子和切入角度，换一个说法】\n"
                           + "\n".join(f"- {s}" for s in said))
 
-        rest_line = ("" if time.time() < self._rest_cooldown_until else
-                     "他要是连着玩了很久、或者节奏明显慢下来，可以顺口提一句让他歇会儿；不用每次都说。")
+        # 10/30：用户纠正 —— 「关心」特指「倒水/喝水/休息/眯一会」这类内容，**不是**把话头引到用户。
+        # 所以这里只收这一句的许可（一场最多 2 次，说过就不再给），不加新的限制条目。
+        _care_left = max(0, WATCH_CARE_MAX - int(getattr(self, "_watch_care_count", 0)))
+        rest_line = ("" if (time.time() < self._rest_cooldown_until or _care_left <= 0) else
+                     "他要是连着玩了很久、或者节奏明显慢下来，偶尔顺口提一句让他歇会儿；不用非得说。")
         force_line = "这一轮一定要说一句。" if force else ""
         # 他明确点名要你看什么时（"看看我拿到了什么"），把关注点揉进提示词，别答非所问
         pair_line = ""
         _older = list(image_b64_earlier or [])
-        if _older and image_b64_prev:
-            pair_line = ("画面一共给了 %d 张：前面几张是过去一分钟里不同时刻的，"
-                         "最后两张是刚才一秒内的前后两帧。" % (len(_older) + 2))
+        if len(_older) == 2 and not image_b64_prev:
+            pair_line = ("画面给了三张图，按时间由远到近："
+                         "第一张是更早那段的 4 个画面（2×2，从左到右、从上到下由旧到新，"
+                         "每格底下标着距现在多少秒，只看个大概就行）；"
+                         "第二张是前几秒的 4 个画面（2×2，同样越往后越新，底下标着秒数）；"
+                         "第三张是**刚才**的画面（左上角标着“刚才”，大约四秒前）。"
+                         "注意：这些都是**已经过去**的画面，你开口的时候早就过去了——"
+                         "所以用「刚才」「刚刚」「前面」这种说法，别用「现在正在」「你正」这类实时口气。"
+                         "别说「拼图」「帧」「格子」这类词。")
+        elif len(_older) == 1 and not image_b64_prev:
+            pair_line = ("画面给了两张图：第一张是前十几秒的 4 个画面（2×2 排列，"
+                         "从左到右、从上到下越来越新，每个底下标着距现在几秒），"
+                         "第二张是**刚才**的画面（左上角标着“刚才”，大约四秒前）。"
+                         "这些都是已经过去的画面，用「刚才」「刚刚」这种说法，别用「现在正在」。"
+                         "别说「拼图」「帧」「格子」这类词。")
+        elif _older and image_b64_prev:
+            pair_line = ("画面一共给了 %d 张，是最近十几秒里连着拍的：每张左上角标着距现在多少秒"
+                         "（越往左越早，最后一张是现在，倒数第二张是一秒多前）。" % (len(_older) + 2))
         elif image_b64_prev:
-            pair_line = "画面给了前后两帧（约一秒的间隔）：先一张、后一张。"
+            pair_line = ("画面给了前后两帧（约一秒的间隔），左上角标着各是几秒前。")
         focus_line = ""
         if (focus or "").strip():
             focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()
@@ -8706,26 +10074,36 @@ OCR文字：
 你是{self.pet_name}，用你自己的语气说话。
 {pair_line}
 {focus_line}
-不要只描述画面内容——画面里有什么他自己看得见。说你自己的反应、想法，或者想到的事。
+不要只描述画面内容——画面里有什么他自己看得见。说你自己的反应就好。
+你怎么说话都行：说半句、哼一声、跟自己嘀咕、突然想起别的事，都可以。
 {rest_line}
 没什么想说的，comment 就留空，不用硬凑。{force_line}
 {said_block}
 请严格输出JSON，不要markdown代码块：
-{{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "content": "一句话事件标签：在玩/在看什么 + 当前阶段，20~40字；不要罗列画面细节，不要写数字/倒计时/坐标/UI数值"}}
+{{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "spot": "他在干什么/在看什么，12字以内，只写定位（例如“Apex 排位·搜物资”），不要复述画面细节、不要写数字和界面文字；看不出就留空字符串"}}
 """
+
+        # 11/01：主动瞟一眼模式 —— 一句就够，别堆限制
+        glance_instructions = ""
+        if glance:
+            glance_instructions = chr(10).join([
+                '你看了一眼"%s"的屏幕，随口说一句。' % self.user_profile.get("call_name", "他"),
+                '请严格输出 JSON，不要 markdown 代码块：',
+                '{"comment": "开头一个情绪括号 + 那句话", "spot": "他在干什么，12字以内"}',
+            ])
 
         messages = self.build_context_messages(
             self._effective_system_prompt(),
-            look_instructions if look else watch_instructions,
+            glance_instructions if glance else (look_instructions if look else watch_instructions),
             context_type=("look" if look else "watch"), image_b64=image_b64,
             memory_query=(_look_q if look else self._build_watch_query()),
-            extra_context=("" if look else said_block),
-            skip_sources={"watch"} if (monologue and not look) else None,
+            extra_context=("" if (look and not glance) else said_block),
+            skip_sources={"watch"} if (monologue and not look and not glance) else None,
             image_b64_prev=image_b64_prev,
             image_b64_earlier=_older)
         try:
             # 陪看走 WATCH_TEMPERATURE（0.98）；看屏幕的回答模式用 0.7 更稳
-            resp = self._call_vision_model(messages, temperature=(0.7 if look else WATCH_TEMPERATURE),
+            resp = self._call_vision_model(messages, temperature=(0.75 if glance else (0.7 if look else WATCH_TEMPERATURE)),
                                            max_tokens=DEFAULT_MAX_TOKENS, timeout=30)
             if resp.status_code != 200:
                 log.error(f"视觉模型 API 返回非200: {resp.status_code} {resp.text[:200]}")
@@ -8738,10 +10116,16 @@ OCR文字：
             # "…一眼就瞅见我自" 就是 JSON 没写完，正则兜底抠出了半句话）。
             _r = raw_reply.rstrip()
             if _r.startswith("{") and not _r.endswith("}"):
-                log.warning("视觉输出疑似被截断（JSON 没闭合），丢弃本次评论: %s", _r[-40:])
+                _fr = ""
+                try:
+                    _fr = str(resp.json()["choices"][0].get("finish_reason"))
+                except Exception:
+                    pass
+                log.warning("视觉输出疑似被截断（JSON 没闭合，len=%d, finish=%s），丢弃本次评论: %s",
+                            len(_r), _fr or "?", _r[-40:])
                 return None
-            content_text = ""
             comment = raw_reply
+            spot = ""       # JSON 解析失败时也必须已定义（10/27：漏了这句 ⇒ 整条评论丢失）
             # 10/19：实测模型偶尔吐全角 （normal），下面的情绪解析只认半角 ⇒ 先归一化，
             # 否则 UI 上会看到"（normal）镜头一转…"这种标签泄漏进正文。
             try:
@@ -8773,8 +10157,8 @@ OCR文字：
 
             data = _try_load_vision_json(raw_reply)
             if data:
-                content_text = (data.get("content") or "").strip()
                 comment = (data.get("comment") or "").strip()
+                spot = (data.get("spot") or "").strip()
                 # 10/19：上面那次归一化作用在 raw_reply（整段 JSON）上，解析出的 comment 还得再来一次
                 # —— 实测 15:23 那条就是以"（surprised）诶，大石头…"开头的。
                 try:
@@ -8787,22 +10171,24 @@ OCR文字：
                 m = re.search(r'"comment"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_reply, re.DOTALL)
                 if m:
                     comment = m.group(1).replace('\\"', '"').replace("\\n", "\n").strip()
-                m2 = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_reply, re.DOTALL)
-                if m2:
-                    content_text = m2.group(1).replace('\\"', '"').replace("\\n", "\n").strip()
 
-            if look:
-                content_text = ""        # 回答模式不写陪看摘要/锚点，免得影响下一轮陪看
-            self._watch_last_summary = content_text or ""   # 本次（可能为空）：空则不复用上次摘要
-            if content_text:
-                self._watch_last_anchor = content_text
-                self._update_watch_session(content_text)
             # 10/24：模型偶尔会吐"元话语"——输出的是"我做了什么"而不是"要说的话"
             # （实测 13:29 那条："已按规则生成评论与事件标签"，还进了 TTS 和记忆）。
             # 这属于输出契约错误，不是风格问题 ⇒ 在这里直接当空回丢掉，不写记忆不出声。
             comment = _strip_meta_comment(comment)
             if not comment:
                 return None
+            if not look and not glance:
+                # 10/27：极短定位标签，只给历史 user 侧用（不进 watch_log、不参与段总结）
+                # 11/01：瞟一眼（glance）不写陪看会话 —— 否则她的随口一句会攒进段 buffer，
+                # 之后凭空生成一条"陪看事件"，把闲聊污染成陪看记忆。
+                _sp = re.sub(r"[（(][^）)]*[）)]", "", spot or "").strip()
+                _sp = re.sub(r"\s+", " ", _sp)[:14]
+                self._watch_last_spot = _sp
+                # 10/27：陪看锚点与段总结的原料改成**她自己的评论**（视觉模型不再另写画面摘要）
+                self._watch_last_anchor = comment
+                self._update_watch_session(comment)
+
             if not re.match(r'\(\w+\)', comment.strip()):
                 comment = f"(normal) {comment}"
             return comment
@@ -8811,14 +10197,14 @@ OCR文字：
             log.error(f"视觉模型 API 失败: {e}")
             return None
 
-    # ---------- 模式相关设置界面（定时话题 + 陪玩陪看 + 陪读）----------
+    # ---------- 模式相关设置界面（陪玩陪看 + 陪读；主动话题已内置、不再可调）----------
     def open_mode_settings(self):
         """🎮 模式相关设置：定时话题、陪玩陪看、陪读（阅读）合成一个卡片窗。
 
         「最短沉默」管她最早多久能说一句，「最长沉默」到了必须说一句；
         实际检查周期 = 最短沉默 ÷ 2，上限 60 秒（见 start_watch_loop / ReadingCompanion）。
         陪玩陪看的两个秒数不设上限。陪读的截取区域只由「缩略图框选区域」决定（不再手填边距）。"""
-        win, frame = self._make_card_window("模式相关设置", 470, 690)
+        win, frame = self._make_card_window("模式相关设置", 470, 520)
         s = self._dpi_scale
         rc = self.reading_companion
         region = dict(rc.region)        # 陪读截取区域：框选改它，保存时写回
@@ -8829,11 +10215,6 @@ OCR文字：
 
         wmin_var = tk.StringVar(value=str(self.watch_min_interval))
         wmax_var = tk.StringVar(value=str(self.watch_max_silence))
-        enabled_var = tk.BooleanVar(value=self.topic_enabled)
-        mode_var = tk.StringVar(value=self.topic_mode)
-        interval_var = tk.StringVar(value=str(self.topic_interval_minutes))
-        rmin_var = tk.StringVar(value=str(self.topic_random_min))
-        rmax_var = tk.StringVar(value=str(self.topic_random_max))
         cap_var = tk.DoubleVar(value=rc.capture_interval)
         read_min_var = tk.IntVar(value=rc.min_interval)
         read_max_var = tk.IntVar(value=rc.max_silence)
@@ -8842,9 +10223,6 @@ OCR文字：
             try:
                 w_min = int(wmin_var.get())
                 w_max = int(wmax_var.get())
-                t_fixed = int(interval_var.get())
-                t_rmin = int(rmin_var.get())
-                t_rmax = int(rmax_var.get())
             except ValueError:
                 messagebox.showwarning("输入错误", "请输入有效的整数")
                 return
@@ -8854,10 +10232,6 @@ OCR文字：
             if w_max <= w_min:
                 messagebox.showwarning("输入错误", "最长沉默必须大于最短沉默")
                 return
-            mode = mode_var.get()
-            if mode == "random" and t_rmin > t_rmax:
-                messagebox.showwarning("提示", "话题最小间隔不能大于最大间隔")
-                return
             try:
                 read_cap = float(cap_var.get())
                 read_min = int(read_min_var.get())
@@ -8865,22 +10239,6 @@ OCR文字：
             except (ValueError, tk.TclError):
                 messagebox.showwarning("输入错误", "陪读设置：请输入有效的数字")
                 return
-            # 定时话题
-            self.topic_enabled = bool(enabled_var.get())
-            if mode == "random":
-                self.topic_mode = "random"
-                self.topic_random_min = max(1, min(240, t_rmin))
-                self.topic_random_max = max(1, min(240, t_rmax))
-            else:
-                self.topic_mode = "fixed"
-                self.topic_interval_minutes = max(1, min(240, t_fixed))
-            if self.topic_enabled:
-                self.start_topic_timer()
-            elif self.topic_timer_job:
-                self.root.after_cancel(self.topic_timer_job)
-                self.topic_timer_job = None
-            save_topic_config(self.topic_enabled, self.topic_interval_minutes, self.topic_mode,
-                              self.topic_random_min, self.topic_random_max)
             # 陪玩陪看
             self.watch_min_interval = w_min
             self.watch_max_silence = w_max
@@ -8891,15 +10249,8 @@ OCR文字：
             rc.min_interval = read_min
             rc.max_silence = read_max
             rc.save_config()
-            if not self.topic_enabled:
-                topic_msg = "已关闭"
-            elif self.topic_mode == "random":
-                topic_msg = "随机 %d~%d 分钟" % (self.topic_random_min, self.topic_random_max)
-            else:
-                topic_msg = "固定 %d 分钟" % self.topic_interval_minutes
-            log.info("模式相关设置已保存：定时话题 %s；陪看 %d~%d 秒；陪读截图 %.1f 秒",
-                     topic_msg, w_min, w_max, read_cap)
-            messagebox.showinfo("成功", "已保存：定时话题 %s；陪玩陪看 %d~%d 秒" % (topic_msg, w_min, w_max))
+            log.info("模式相关设置已保存：陪看 %d~%d 秒；陪读截图 %.1f 秒", w_min, w_max, read_cap)
+            messagebox.showinfo("成功", "已保存：陪玩陪看 %d~%d 秒" % (w_min, w_max))
             win.destroy()
 
         RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
@@ -8921,69 +10272,6 @@ OCR文字：
         def _sep():
             tk.Frame(frame, height=max(1, int(s)), bg=CARD_BORDER).pack(fill=tk.X, pady=(10, 4))
 
-        # ── 定时话题 ──
-        tk.Label(frame, text="定时话题", font=(self.font_family, 12, "bold"), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(anchor='w', pady=(2, 2))
-        tk.Label(frame, text="没话聊的时候，她隔一段时间自己找个话题开口。",
-                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
-                 justify='left').pack(anchor='w')
-        ttk.Checkbutton(frame, text="启用定时话题", variable=enabled_var).pack(anchor='w', pady=(4, 2))
-        tk.Label(frame, text="间隔模式:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(anchor='w', pady=(4, 2))
-        mode_row = tk.Frame(frame, bg=DIALOG_BG)
-        mode_row.pack(anchor='w', pady=2)
-        btn_fixed = RoundedButton(mode_row, text="固定间隔", width=int(110 * s), height=int(30 * s),
-                                  radius=int(8 * s), font=(self.font_family, 11), variant="primary",
-                                  command=lambda: select_mode("fixed"))
-        btn_fixed.pack(side=tk.LEFT, padx=(0, 8))
-        btn_random = RoundedButton(mode_row, text="随机间隔", width=int(110 * s), height=int(30 * s),
-                                   radius=int(8 * s), font=(self.font_family, 11), variant="subtle",
-                                   command=lambda: select_mode("random"))
-        btn_random.pack(side=tk.LEFT)
-
-        # 话题的输入行放进专属容器：切换固定/随机时只在容器内部重排，
-        # 不会因为 pack_forget + 重新 pack 而跑到整个窗口的最底下（Tk 的坑）
-        topic_body = tk.Frame(frame, bg=DIALOG_BG)
-        topic_body.pack(anchor='w', fill=tk.X)
-
-        fixed_row = tk.Frame(topic_body, bg=DIALOG_BG)
-        tk.Label(fixed_row, text="间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(fixed_row, textvariable=interval_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11),
-                     justify="center").pack(side=tk.LEFT, padx=8)
-
-        rmin_row = tk.Frame(topic_body, bg=DIALOG_BG)
-        tk.Label(rmin_row, text="最小间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(rmin_row, textvariable=rmin_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11),
-                     justify="center").pack(side=tk.LEFT, padx=8)
-
-        rmax_row = tk.Frame(topic_body, bg=DIALOG_BG)
-        tk.Label(rmax_row, text="最大间隔（分钟）:", font=(self.font_family, 11), fg=TEXT_MAIN,
-                 bg=DIALOG_BG).pack(side=tk.LEFT)
-        RoundedEntry(rmax_row, textvariable=rmax_var, width=int(90 * s), height=int(30 * s),
-                     radius=int(8 * s), font=(self.font_family, 11),
-                     justify="center").pack(side=tk.LEFT, padx=8)
-        tip = tk.Label(topic_body, text="随机间隔：每次触发后在此区间内随机抽一个间隔",
-                       font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG)
-
-        def select_mode(mode):
-            mode_var.set(mode)
-            btn_fixed.set_variant("primary" if mode == "fixed" else "subtle")
-            btn_random.set_variant("primary" if mode == "random" else "subtle")
-            for _w in (fixed_row, rmin_row, rmax_row, tip):
-                _w.pack_forget()
-            if mode == "random":
-                rmin_row.pack(anchor='w', pady=(4, 2))
-                rmax_row.pack(anchor='w', pady=2)
-                tip.pack(anchor='w', pady=2)
-            else:
-                fixed_row.pack(anchor='w', pady=(4, 2))
-
-        select_mode(mode_var.get())
-        _sep()
 
         # ── 陪玩陪看 ──
         tk.Label(frame, text="陪玩陪看", font=(self.font_family, 12, "bold"), fg=TEXT_MAIN,

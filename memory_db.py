@@ -52,7 +52,13 @@ class MemoryDB:
                 created_at TEXT,
                 observation TEXT,
                 description TEXT,
-                evidence TEXT
+                evidence TEXT,
+                kind TEXT,
+                used_count INTEGER,
+                last_used_at TEXT,
+                user_hits INTEGER,
+                last_user_hit_at TEXT,
+                last_injected_at TEXT
             )
         """)
         # 兼容旧库：缺列时补列（性格画像的观察内容/描述/证据列表）
@@ -69,6 +75,17 @@ class MemoryDB:
             conn.execute("ALTER TABLE memories ADD COLUMN starred INTEGER")
         if "starred_at" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN starred_at TEXT")
+        # 10/28：kind / 三个计数器（老库补列）
+        for _col, _ddl in (
+            ("kind", "ALTER TABLE memories ADD COLUMN kind TEXT"),
+            ("used_count", "ALTER TABLE memories ADD COLUMN used_count INTEGER"),
+            ("last_used_at", "ALTER TABLE memories ADD COLUMN last_used_at TEXT"),
+            ("user_hits", "ALTER TABLE memories ADD COLUMN user_hits INTEGER"),
+            ("last_user_hit_at", "ALTER TABLE memories ADD COLUMN last_user_hit_at TEXT"),
+            ("last_injected_at", "ALTER TABLE memories ADD COLUMN last_injected_at TEXT"),
+        ):
+            if _col not in cols:
+                conn.execute(_ddl)
         conn.commit()
 
     def replace_all(self, data):
@@ -108,6 +125,13 @@ class MemoryDB:
                      (rel.get("content") or "").strip()),
                 )
 
+            # 10/28：自我认知层（self/about_user/lesson）—— 每行一个 note
+            for note in (data.get("profile", {}).get("notes") or []):
+                self._insert_note(conn, note, now, old_vec.get(note.get("id")))
+            # 10/28：about_user 单独一条列表（界面上归性格画像）
+            for note in (data.get("profile", {}).get("user_notes") or []):
+                self._insert_note(conn, note, now, old_vec.get(note.get("id")))
+
             conn.commit()
 
     def set_embedding(self, item_id, vec):
@@ -140,8 +164,9 @@ class MemoryDB:
             INSERT OR REPLACE INTO memories
             (id, type, content, embedding, importance, access_count,
              last_accessed_at, evidence_count, archived, archived_at, starred, starred_at,
-             source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source, created_at, kind, used_count, last_used_at,
+             user_hits, last_user_hit_at, last_injected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.get("id") or str(uuid.uuid4())[:8],
@@ -158,6 +183,35 @@ class MemoryDB:
                 item.get("starred_at"),       # 收藏时刻：收藏块内按它倒序（最近收藏在最上面）
                 item.get("source", ""),
                 item.get("created_at", now),
+                item.get("kind") or "experience",
+                int(item.get("used_count", 0)),
+                item.get("last_used_at"),
+                int(item.get("user_hits", 0)),
+                item.get("last_user_hit_at"),
+                item.get("last_injected_at"),
+            )
+        )
+
+    def _insert_note(self, conn, item, now, embedding_blob=None):
+        """自我认知层的一行（self / about_user / lesson）"""
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memories
+            (id, type, content, embedding, importance, access_count, last_accessed_at,
+             evidence_count, archived, archived_at, starred, starred_at, source, created_at, kind)
+            VALUES (?, 'note', ?, ?, ?, 0, ?, ?, 0, NULL, ?, ?, '', ?, ?)
+            """,
+            (
+                item.get("id") or str(uuid.uuid4())[:8],
+                item.get("content", ""),
+                embedding_blob,
+                0.9,
+                item.get("updated_at", now),
+                int(item.get("evidence_count", 1)),
+                1 if item.get("starred", False) else 0,
+                item.get("starred_at"),
+                item.get("created_at", now),
+                item.get("kind") or "self",
             )
         )
 
@@ -196,6 +250,8 @@ class MemoryDB:
             topics = []
             events = []
             traits = []
+            notes = []
+            user_notes = []
             relation = None
 
             for row in rows:
@@ -204,6 +260,13 @@ class MemoryDB:
                     topics.append(self._row_to_topic(row))
                 elif rtype == "event":
                     events.append(self._row_to_event(row))
+                elif rtype == "note":
+                    # 10/28：按 kind 分流 —— self/lesson 是自我认知，about_user 是"关于他"
+                    _n = self._row_to_note(row)
+                    if _n.get("kind") == "about_user":
+                        user_notes.append(_n)
+                    else:
+                        notes.append(_n)
                 elif rtype == "profile":
                     if row["content"] == "__relation__":
                         relation = {
@@ -217,7 +280,8 @@ class MemoryDB:
             return {
                 "topics": topics,
                 "events": events,
-                "profile": {"traits": traits, "relation": relation},
+                "profile": {"traits": traits, "relation": relation,
+                            "notes": notes, "user_notes": user_notes},
             }
 
     def _row_to_topic(self, row):
@@ -233,6 +297,12 @@ class MemoryDB:
             "archived_at": row["archived_at"],
             "starred": bool(row["starred"]),
             "starred_at": row["starred_at"],
+            "kind": row["kind"] if "kind" in row.keys() else "experience",
+            "used_count": (row["used_count"] if "used_count" in row.keys() else 0) or 0,
+            "last_used_at": row["last_used_at"] if "last_used_at" in row.keys() else None,
+            "user_hits": (row["user_hits"] if "user_hits" in row.keys() else 0) or 0,
+            "last_user_hit_at": row["last_user_hit_at"] if "last_user_hit_at" in row.keys() else None,
+            "last_injected_at": row["last_injected_at"] if "last_injected_at" in row.keys() else None,
         }
 
     def _row_to_event(self, row):
@@ -249,6 +319,24 @@ class MemoryDB:
             "starred": bool(row["starred"]),
             "starred_at": row["starred_at"],
             "source": row["source"],
+            "kind": row["kind"] if "kind" in row.keys() else "experience",
+            "used_count": (row["used_count"] if "used_count" in row.keys() else 0) or 0,
+            "last_used_at": row["last_used_at"] if "last_used_at" in row.keys() else None,
+            "user_hits": (row["user_hits"] if "user_hits" in row.keys() else 0) or 0,
+            "last_user_hit_at": row["last_user_hit_at"] if "last_user_hit_at" in row.keys() else None,
+            "last_injected_at": row["last_injected_at"] if "last_injected_at" in row.keys() else None,
+        }
+
+    def _row_to_note(self, row):
+        return {
+            "id": row["id"],
+            "content": row["content"],
+            "kind": row["kind"] if "kind" in row.keys() else "self",
+            "created_at": row["created_at"],
+            "updated_at": row["last_accessed_at"],
+            "evidence_count": row["evidence_count"],
+            "starred": bool(row["starred"]) if "starred" in row.keys() else False,
+            "starred_at": row["starred_at"] if "starred_at" in row.keys() else None,
         }
 
     def _row_to_trait(self, row):
