@@ -808,6 +808,85 @@ def topic_refill_per_hour():
     return (TOPIC_PROACTIVE_PER_DAY * TOPIC_RATE_BOOST / total) if total > 0 else 0.0
 
 
+def _topic_probe_chance(n_unknown):
+    """还有多少类目没采集到 ⇒ 本轮"去补空白"的概率（11/05 用户要求：补空白优先级更高）。
+
+    画像还稀疏时几乎每轮都去问；快补齐了就退回偶尔问，免得像审问。
+    """
+    try:
+        n = int(n_unknown)
+    except Exception:
+        return TOPIC_PROBE_CHANCE
+    for need, p in TOPIC_PROBE_BY_UNKNOWN:
+        if n >= need:
+            return p
+    return 0.0
+
+
+_FR_SAFE_CONFIG = {
+    # 白名单：只列"确定不敏感"的字段（不按 key 名黑名单过滤——嵌套字典会漏）。
+    # 11/05 按真实 config.json 的键名对齐（llm/tts.api_key/speaker_id 一律不列）。
+    ("form", "name"),
+    ("zoom", "zoom_char"), ("zoom", "zoom_bubble"), ("zoom", "window_width"),
+    ("watch", "min_interval"), ("watch", "max_silence"),
+    ("reading", "capture_interval"), ("reading", "min_interval"), ("reading", "max_silence"),
+    ("tools", "music_mode"), ("tools", "music_volume"),
+    ("voice", "enabled"), ("voice", "wake_window"),
+    ("voice", "hotkey_enabled"), ("voice", "hotkey_name"),
+    ("tts", "enabled"), ("tts", "mode"), ("tts", "volc_lang"), ("tts", "edge_lang"),
+    ("tts", "edge_voice"),
+    ("ui", "input_visible"), ("ui", "hide_reply_bubble"),
+    ("costume", "item"), ("costume", "head"),
+}
+_FR_LOG_DROP = ("凑过来", "瞟一眼", "话题生成", "语音识别", "识别到", "用户说",
+                "TTS 播放", "播放语音", "聊天", "comment", "记忆提取完成:")
+_FR_SECRET_RE = None
+
+
+def _fr_redact(text):
+    """把明显的密钥形态抹掉（白名单之外的最后一道保险）。"""
+    import re as _re
+    if not text:
+        return text
+    text = _re.sub(r"(sk-[A-Za-z0-9]{6})[A-Za-z0-9\-]{6,}", r"***", text)
+    text = _re.sub(r"([A-Za-z0-9_\-]{24,})", lambda m: (m.group(1)[:6] + "***") if len(m.group(1)) >= 24 else m.group(1), text)
+    return text
+
+
+def _fr_env_lines():
+    """环境信息（不改任何状态，失败就跳过）。"""
+    import platform as _pf
+    out = []
+    try:
+        out.append("Windows: %s (%s)" % (_pf.platform(), _pf.version()))
+    except Exception:
+        pass
+    try:
+        out.append("Python: %s" % _pf.python_version())
+    except Exception:
+        pass
+    try:
+        out.append("CPU 逻辑核: %s" % os.cpu_count())
+    except Exception:
+        pass
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        out.append("屏幕: %sx%s" % (u.GetSystemMetrics(0), u.GetSystemMetrics(1)))
+        try:
+            dpi = ctypes.windll.shcore.GetDpiForSystem()
+            out.append("系统 DPI: %s (缩放 %.0f%%)" % (dpi, dpi / 96 * 100))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        out.append("工作目录: %s" % os.getcwd())
+    except Exception:
+        pass
+    return out
+
+
 def load_topic_config():
     """加载话题定时器状态（开关/间隔模式：fixed=固定分钟，random=随机区间分钟）"""
     data = _get_section("topic")
@@ -1153,7 +1232,10 @@ PROFILE_NOTE_CHARS = 60      # 单条上限
 PROFILE_NOTE_DUP_COS = 0.85  # 自我认知判重阈值（向量余弦；"我只认他一个人管" vs "…老大…" 约 0.95）
 CONTEXT_TRAITS = 8          # 注入上下文时最多携带的画像条数（按最近更新排序）
 CONTEXT_TRAIT_EVIDENCE = 1  # 注入上下文时每条画像附带的最新证据条数
-TOPIC_PROBE_CHANCE = 0.4    # 话题轮次中带画像采集方向的概率（其余轮次纯闲聊，防连问）
+TOPIC_PROBE_CHANCE = 0.4    # 兜底基准值（现在按空白类目数量分档，见 _topic_probe_chance）
+TOPIC_PROBE_BY_UNKNOWN = ((4, 1.0), (3, 0.8), (2, 0.55), (1, 0.3))   # (剩余空白类目数 >=, 概率)
+TOPIC_TRAITS_PICK = 3        # 话题素材主要来自"性格画像"：每轮挑几条已知画像
+TOPIC_RECALL_CHANCE = 0.15   # 旧事彩蛋：只有这么小的概率把一条经历记忆塞进话题素材
 # 10/28：注入按"一个池"算预算（不再 5 话题 + 5 经历分开给名额）
 MEMORY_INJECT_MAX = 8
 MEMORY_INJECT_CHARS = 600
@@ -1192,15 +1274,17 @@ WATCH_RECALL_PER_COMMENTS = 4   # 10/31 用户：每 4 条评论才攒 1 次"想
 WATCH_RECALL_LINK_MAX = None       # 保留旧名（None=不再用它做硬上限）
 WATCH_RECALL_LINK_COOLDOWN = 1800  # 同一条记忆这么多秒内不再提
 WATCH_RECALL_LINK_GAP = 1.2        # 等她这一轮 TTS 念完后，固定停顿多少秒再补这句
+WATCH_RECALL_CHANCE = 0.05         # 11/05 用户：想起旧事只是小概率彩蛋 —— 每次评论最多掷一次
+WATCH_RECALL_MIN_GAP = 900         # 两次"想起旧事"之间至少隔 15 分钟（硬间隔，概率再高也压得住）
 WATCH_TEMPERATURE = 0.98   # 陪看评论的温度（10/23 用户指定 0.98；过低会平、过高会飘）
 WATCH_MONOLOGUE_TURNS = 2  # 末尾连续这么多轮陪玩、且中间没有用户发言 → 视为独白（才断回喂）
 WATCH_SIG_SIZE = (64, 36)
 WATCH_COLOR_SIZE = (160, 90)   # 11/01 色彩指纹：缩到这个尺寸算 HSV 直方图（只统计分布、不看位置）          # 画面指纹尺寸：缩成这么小的灰度图，用来判断两帧像不像
 # 10/30：时间轴改成多分辨率 —— 缓冲区覆盖 ring_seconds 秒，采样分两级：
 #   近层 4 帧（最近几秒，格 960 宽，看得清字幕）+ 远层 8 帧（更早，格 640 宽，只看动势）
-WATCH_RING_EVERY = 1.5     # 抓帧间隔（留多长由 ring_seconds 决定）
-WATCH_RING_SECONDS = 20    # 环形缓冲覆盖时长（20 秒 ≈ 14 张，内存 1.8 MB；直播换场景快，60 秒太远）
-WATCH_RING_KEEP = 14       # = ceil(ring_seconds / every) + 1，启动时按配置重算
+WATCH_RING_EVERY = 0.5     # 抓帧间隔（11/04 再加密到 0.5：20 秒留 40 帧，给"挑稳定帧"留选择余地）
+WATCH_RING_SECONDS = 20    # 环形缓冲覆盖时长（20 秒 ≈ 20 张、内存约 2.6 MB）
+WATCH_RING_KEEP = 41       # = ceil(ring_seconds / every) + 1，启动时按配置重算
 WATCH_RING_SEND = 3        # 兼容旧路径：逐张单发时捎几张更早的
 WATCH_RECENT_FRAMES = 4    # 近层：最近 ~6 秒取 4 帧，格 960 宽
 WATCH_OLDER_FRAMES = 4     # 远层：更早那段取 4 帧，格 640 宽（2×2，约 0.9MP）
@@ -1219,10 +1303,21 @@ WATCH_MOTION_THRESHOLD = 1.4       # 十秒窗口内相邻帧差都小于它 ⇒
 WATCH_CHANGE_BIG = 12.0            # 与“上次开口那帧”的差大到这个量级（换场景/换游戏）⇒ 静止也放行
 # 10/30：触发时机的两个新参数 —— 决策粒度从 15 秒细化到 2 秒；动作最猛时先等它落定再开口
 # 11/01：时间轴整体后移 —— 模型 + TTS 落地约 4 秒，所以"锚点帧"取 4 秒前那张（说的自然是"刚才"）。
-WATCH_ANCHOR_AGE = 4.0           # 锚点帧距现在多少秒（= 她开口时的实际延迟）
-WATCH_NEAR_FROM = 5.5            # 近层时间窗起点（锚点 4 秒 + 一格 1.5 秒，避免和锚点同图）
-WATCH_NEAR_TO = 11.0             # 近层时间窗终点
-WATCH_FAR_FROM = 11.0            # 远层时间窗起点
+WATCH_TIER_MODE = "uniform"      # "uniform"=8 格均匀覆盖整段（注意力放在过程上）/ "layered"=近密远疏（旧）
+WATCH_UNIFORM_FROM = 0.5         # uniform：最近这一格（秒前）
+WATCH_UNIFORM_TO = 20.0          # uniform：最远这一格（秒前）
+WATCH_NEAR_FROM = 1.0            # 近层：最新 4 秒（1.0 秒一格，4 帧）
+WATCH_NEAR_TO = 4.0              # 近层终点
+WATCH_FAR_FROM = 4.0             # 远层：4 秒到缓冲边界（20 秒），4 帧稀疏采样
+
+# 11/02：突变直通 —— 画面"啪"一下换了的时候，不掷骰子，直接让她看这一眼。
+# 判据按 watch_motion.jsonl 729 条真实采样校准：帧差中位 17.5、p90 39.6；地板 20 占 43% 太松，30 只占 20%。
+WATCH_SPIKE_PEAK = 22.0          # 相邻帧差达到它才算"突变"（11/04 环形加密到 1 秒后帧差整体变小：30 是 1.5 秒采样的 p75，1 秒采样约 ×0.7 ⇒ 22 才等价）
+WATCH_SPIKE_RATIO = 2.5          # 且要是尖峰：超过最近几帧中位的 2.5 倍
+WATCH_SPIKE_WINDOW = 8.0         # 突变后这么久之内，判断到点就放行（不掷骰子）
+WATCH_MOTION_POT_WINDOW = 20.0
+WATCH_STABLE_DIFF = 8.0          # 相邻帧差小于它就算"这一帧是静的"（挑帧用：数字刚滚停、没在过渡）
+WATCH_STABLE_WINDOW = 3.0        # 在目标时刻前后这么多秒里找稳定帧   # 累计运动量的窗口（秒）——11/04 先只观测、写进日志，等真实分布再定触发阈值
 WATCH_POLL_DIV = 10.0       # 判断间隔 = 最短沉默 / 10（原来是 /2；仍是你的设置派生，只是更细）
 WATCH_POLL_MIN = 2.0        # 判断间隔下限（秒）
 WATCH_POLL_MAX = 6.0        # 判断间隔上限（秒）
@@ -1300,7 +1395,7 @@ TOPIC_PROMPT = """你是{pet_name}，你想对"{user_name}"发起一个日常聊
 - 话题方向要轮换着选，每次尽量换一个方向：白饭和吃的东西、深海与游水、泡泡和尾鳍、对{user_name}的关心（吃饭/休息/心情）、今天的小得意、今天犯的小傻、困了或者饿了。
 - 不要连着用同一种开头（比如不要总说"今天看到……"），分享、提问、关心要交替出现。
 - 不要强势提问，多用分享和闲聊的语气。
-- **上面那些真实发生过的事优先**：能从里面挑一件说起就挑，比凭空编一件小事自然得多；都不合适再自己找话题。
+- **上面那些是你对他的了解**：能顺口提起一件事就说，比凭空编一件小事自然；都不合适就自己找话题。
 - 可以参考以下风格示例（从你的话题库里随机抽的，仅作风格参考，不要照抄）：
 {topic_examples}
 
@@ -1968,6 +2063,70 @@ def add_topic_material(text, source="event"):
             _write_topic_materials(items)
     except Exception as e:
         log.warning("话题素材写入失败: %s", e)
+
+
+SAID_RECENT_FILE = os.path.join(CONFIG_DIR, "said_recent.jsonl")
+_SAID_RECENT_LOCK = threading.Lock()
+
+
+def add_recent_said(text):
+    """记下"他亲口说过的一句话"，供之后发起话题取材（11/05）。
+
+    为什么不直接用记忆/事件总结：那类内容是"陪看过程"的总结，拿它当话题
+    只会变成复述他今天干了什么，很别扭；他自己说过的话才是天然的聊天由头。
+    """
+    try:
+        t = " ".join(str(text or "").split())
+        if not (4 <= len(t) <= 80):
+            return
+        with _SAID_RECENT_LOCK:
+            items = []
+            if os.path.exists(SAID_RECENT_FILE):
+                with open(SAID_RECENT_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        if isinstance(d, dict) and d.get("text"):
+                            items.append(d)
+            items.append({"t": time.time(), "text": t})
+            keep = time.time() - 7 * 24 * 3600
+            items = [x for x in items if float(x.get("t") or 0) >= keep][-150:]
+            tmp = SAID_RECENT_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                for d in items:
+                    f.write(json.dumps(d, ensure_ascii=False) + chr(10))
+            os.replace(tmp, SAID_RECENT_FILE)
+    except Exception as e:
+        log.debug("记录他说过的话失败: %s", e)
+
+
+def load_recent_said(limit=3, hours=72):
+    """取最近他真说过的话（新的在前，去重）。"""
+    out = []
+    try:
+        if not os.path.exists(SAID_RECENT_FILE):
+            return out
+        cut = time.time() - hours * 3600
+        rows = []
+        with open(SAID_RECENT_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("text") and float(d.get("t") or 0) >= cut:
+                    rows.append(d)
+        for d in reversed(rows):
+            t = str(d["text"]).strip()
+            if t and t not in out:
+                out.append(t)
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        log.debug("读取他说过的话失败: %s", e)
+    return out
 
 
 def load_topic_materials(limit=5, hours=None):
@@ -4386,6 +4545,11 @@ class DesktopPet:
             {"role": "user", "content": user_msg, "source": source},
             {"role": "assistant", "content": ai_reply, "source": source}
         ]
+        if source == "chat":
+            try:
+                add_recent_said(user_msg)
+            except Exception:
+                pass
         with self._memory_lock:
             self.chat_buffer.append(turn)
             # 聊天权重1.0，陪玩/读书评论权重0.3，减少无对话时的提取频率
@@ -4772,6 +4936,7 @@ class DesktopPet:
         settings_menu.add_command(label="🎧 TTS 音色与语言...", command=self.open_tts_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🎩 装扮", command=self._open_costume_window)
+        settings_menu.add_command(label="🧾 导出故障报告...", command=self.export_fault_report)
         settings_menu.add_command(label="关于", command=self.show_about)
         self.menu.add_cascade(label="⚙️ 设置", menu=settings_menu)
         self.menu.add_separator()
@@ -6621,6 +6786,126 @@ class DesktopPet:
         else:
             desc = "快撑不住了... 💤"
         messagebox.showinfo("精力值", f"当前精力：{level} / {MAX_ENERGY}\n{desc}")
+
+    def _build_fault_report(self):
+        """生成一份"发给 AI 就能排查"的故障报告（Markdown）。不碰任何状态。"""
+        L = []
+        L.append("# 大肥鱼桌宠 故障报告")
+        L.append("")
+        L.append("- 生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            L.append("- 当前形态：%s" % getattr(self, "form", "?"))
+        except Exception:
+            pass
+        L.append("")
+        L.append("## 运行状态")
+        try:
+            _up = int(time.time() - float(getattr(self, "_boot_at", time.time())))
+            L.append("- 已运行：%d 分 %d 秒" % (_up // 60, _up % 60))
+        except Exception:
+            pass
+        for k, label in (("watch_mode", "陪玩中"), ("sleep_mode", "睡眠中")):
+            try:
+                L.append("- %s：%s" % (label, "是" if getattr(self, k, False) else "否"))
+            except Exception:
+                pass
+        try:
+            rc = getattr(self, "reading_companion", None)
+            L.append("- 陪读中：%s" % ("是" if rc is not None and getattr(rc, "running", False) else "否"))
+        except Exception:
+            pass
+        try:
+            L.append("- 精力：%s" % self.energy_value())
+        except Exception:
+            pass
+        try:
+            L.append("- 陪看环形缓冲：%d 帧" % len(getattr(self, "_watch_ring", []) or []))
+        except Exception:
+            pass
+        try:
+            _md = getattr(self, "memory_data", {}) or {}
+            L.append("- 记忆：话题 %d / 事件 %d / 画像 %d / 自我认知 %d / 关于他 %d" % (
+                len(_md.get("topics") or []), len(_md.get("events") or []),
+                len((_md.get("profile") or {}).get("traits") or []),
+                len((_md.get("profile") or {}).get("notes") or []),
+                len((_md.get("profile") or {}).get("user_notes") or [])))
+        except Exception:
+            pass
+        L.append("")
+        L.append("## 环境")
+        for line in _fr_env_lines():
+            L.append("- " + line)
+        try:
+            cfgs = load_json_file(CONFIG_FILE, {}) or {}
+            secs = []
+            for section, key in _FR_SAFE_CONFIG:
+                val = (cfgs.get(section) or {}).get(key)
+                if isinstance(val, (str, int, float, bool)) or val is None:
+                    if isinstance(val, str):
+                        val = _fr_redact(val)[:40]
+                    secs.append("%s.%s=%s" % (section, key, val))
+            if secs:
+                L.append("")
+                L.append("## 配置（白名单，已脱敏）")
+                for s in secs:
+                    L.append("- " + s)
+        except Exception as e:
+            L.append("- （配置读取失败：%s）" % e)
+        # 故障日志
+        try:
+            _fp = os.path.join(CONFIG_DIR, "dafeiyu_fault.log")
+            if os.path.exists(_fp):
+                with open(_fp, "r", encoding="utf-8", errors="replace") as f:
+                    _fl = f.read().splitlines()[-40:]
+                if _fl:
+                    L.append("")
+                    L.append("## 崩溃/故障记录（最后 40 行）")
+                    L.append("```")
+                    for ln in _fl:
+                        L.append(_fr_redact(ln)[:200])
+                    L.append("```")
+        except Exception:
+            pass
+        # 日志尾部（剔除台词/聊天类行）
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    _ll = f.read().splitlines()[-400:]
+                _keep = [x for x in _ll if not any(t in x for t in _FR_LOG_DROP)]
+                _keep = _keep[-100:]
+                L.append("")
+                L.append("## 日志尾部（已剔除台词/聊天，最后 %d 行）" % len(_keep))
+                L.append("```")
+                for ln in _keep:
+                    L.append(_fr_redact(ln)[:200])
+                L.append("```")
+        except Exception:
+            pass
+        L.append("")
+        L.append("---")
+        L.append("说明：报告只含程序版本、环境、白名单配置与该程序自己的日志；")
+        L.append("不含 API 密钥、聊天内容与台词。直接把它发给 AI 即可排查。")
+        return chr(10).join(L)
+
+    def export_fault_report(self):
+        """一键导出故障报告到 userdata（并打开所在文件夹）。"""
+        try:
+            text = self._build_fault_report()
+            name = "故障报告_%s.md" % datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(CONFIG_DIR, name)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            log.info("故障报告已导出：%s（%d 字）", path, len(text))
+            try:
+                os.startfile(CONFIG_DIR)
+            except Exception:
+                pass
+            self._ui(lambda: self.show_bubble_text(
+                "(relaxed) 报告写好啦，就在 userdata 里：%s" % name, "relaxed", status=True))
+        except Exception as e:
+            log.exception("导出故障报告失败: %s", e)
+            _msg = "(worried) 报告没写成…%s" % e
+            self._ui(lambda: self.show_bubble_text(_msg, "worried", status=True))
 
     def show_about(self):
         """关于框：署名按形态列（FORM_CREDITS 里为空的那几套先不显示）"""
@@ -8501,41 +8786,112 @@ class DesktopPet:
 
             seen_rejected = []  # 本轮被判定重复的话题，回喂给模型避开
 
-            # —— 性格画像采集引导：概率穿插，只有部分话题轮次带采集方向（防连问）——
-            probe_hint = ""
-            if random.random() < TOPIC_PROBE_CHANCE:
-                try:
-                    _traits = (self.memory_data.get("profile", {}) or {}).get("traits") or []
-                    _known = {t.get("trait"): t for t in _traits}
-                    _unknown = []
-                    for _n in TRAIT_LIST:
-                        if _n == "其他":
-                            continue
-                        _t = _known.get(_n)
-                        if _t is None or (not str(_t.get("description") or "").strip()
-                                          and not _t.get("evidence")):
-                            _unknown.append(_n)
-                    if _unknown:
-                        _cand = _unknown
-                        _last = getattr(self, "_last_topic_probe", None)
-                        if _last in _cand and len(_cand) > 1:
-                            _cand = [_n for _n in _cand if _n != _last]
-                        _pick = random.choice(_cand)
-                        self._last_topic_probe = _pick
-                        probe_hint = (f"\n\n额外目标：你还没了解{user_name}的「{_pick}」。"
-                                      f"如果这次的话题能自然触及这个方向（比如通过分享你自己的相关小事、"
-                                      f"或轻声问一句来引出对方的话）会很有帮助；"
-                                      f"但如果生硬就不要勉强，按平时那样正常发起话题即可。")
-                except Exception:
-                    probe_hint = ""
+            # —— 性格画像：缺什么就去聊什么（11/05 并进素材块，不再当"额外目标"）——
+            _unknown_traits = []
+            try:
+                _traits_all = (self.memory_data.get("profile", {}) or {}).get("traits") or []
+                _known_map = {t.get("trait"): t for t in _traits_all if isinstance(t, dict)}
+                for _n in TRAIT_LIST:
+                    if _n == "其他":
+                        continue
+                    _t = _known_map.get(_n)
+                    if _t is None or (not str(_t.get("description") or "").strip()
+                                      and not _t.get("evidence")):
+                        _unknown_traits.append(_n)
+            except Exception:
+                _unknown_traits = []
+            _probe_trait = ""
+            _probe_p = _topic_probe_chance(len(_unknown_traits))
+            if _unknown_traits and random.random() < _probe_p:
+                _cand = _unknown_traits
+                _lastp = getattr(self, "_last_topic_probe", None)
+                if _lastp in _cand and len(_cand) > 1:
+                    _cand = [_n for _n in _cand if _n != _lastp]
+                _probe_trait = random.choice(_cand)
+                self._last_topic_probe = _probe_trait
 
-            # 10/25：取材——把今天真实发生过的事塞进提示词（治“话题生硬”）
-            _materials = load_topic_materials(limit=5)
-            if _materials:
-                _mat_lines = ["- " + str(m["text"]) for m in _materials]
-                material_block = "今天真实发生过的事（挑一件说起最自然）：" + chr(10) + chr(10).join(_mat_lines)
+            # 11/05：素材改成"你俩之间真发生过的事"——原来喂的是陪看事件总结
+            # （"老大在仓库反复比价…我吐槽像挑白菜"），拿它当话题只会变成复述你今天干了啥。
+            _mat_lines = []
+            try:
+                _said = [x for x in load_recent_said(limit=3) if not x.startswith("（")]
+                if not _said:
+                    # 旧数据兜底：从聊天缓冲里找他最近说的话（多数轮次是陪看，可能为空）
+                    for _turn in reversed(getattr(self, "chat_buffer", []) or []):
+                        if not _turn or not isinstance(_turn, list):
+                            continue
+                        _u = _turn[0] if isinstance(_turn[0], dict) else {}
+                        if _u.get("source") != "chat":
+                            continue
+                        _t = str(_u.get("content") or "").strip()
+                        _t = re.sub(r"^（关于话题[:：].*?）回应[:：]", "", _t).strip()
+                        if 4 <= len(_t) <= 60 and _t not in _said:
+                            _said.append(_t)
+                        if len(_said) >= 3:
+                            break
+                _unotes = []
+                for _n in ((self.memory_data.get("profile") or {}).get("user_notes") or []):
+                    _c = str(_n.get("content") or "").strip() if isinstance(_n, dict) else ""
+                    if 6 <= len(_c) <= 60:
+                        _unotes.append(_c)
+                random.shuffle(_unotes)
+                _mat_lines = _said + _unotes[:2]
+            except Exception as _me:
+                log.debug("话题素材整理跳过: %s", _me)
+                _mat_lines = []
+            if _mat_lines:
+                material_block = ("你俩最近真有过的事（顺手提起一件最自然，不用逐条交代）："
+                                  + chr(10) + chr(10).join("- " + x for x in _mat_lines))
             else:
-                material_block = "（今天还没发生什么特别的事，按你自己的想法找话题）"
+                material_block = "（最近没什么特别的事，按你自己的想法找话题）"
+
+            # 11/05：素材主要来自「性格画像」——话题该围绕"他是个什么样的人"，
+            # 而不是复述他今天干了什么；旧事（经历记忆）只当低概率彩蛋。
+            _trait_lines = []
+            try:
+                _traits = [t for t in ((self.memory_data.get("profile") or {}).get("traits") or [])
+                           if isinstance(t, dict) and str(t.get("description") or "").strip()]
+                random.shuffle(_traits)
+                _traits.sort(key=lambda t: -len(t.get("evidence") or []))
+                _last_trait = getattr(self, "_last_topic_trait", None)
+                _picked_traits = []
+                for t in _traits:
+                    if t.get("trait") == _last_trait and len(_traits) > 1:
+                        continue
+                    _picked_traits.append(t)
+                    if len(_picked_traits) >= TOPIC_TRAITS_PICK:
+                        break
+                if _picked_traits:
+                    self._last_topic_trait = _picked_traits[0].get("trait")
+                _trait_lines = ["- " + str(t.get("trait") or "他") + "：" + str(t.get("description") or "").strip()
+                                for t in _picked_traits]
+            except Exception as _te:
+                log.debug("话题画像取材跳过: %s", _te)
+                _trait_lines = []
+            if _probe_trait and _trait_lines:
+                # 还有没采集到的类目 ⇒ 这轮就聊它（比拿已知画像闲聊更有价值）
+                material_block = (
+                    "你还没了解到他「%s」这方面——这轮就从这儿聊起：说说你自己的相关小事，"
+                    "或者轻声问一句，都行；聊着不自然就当普通闲聊。" % _probe_trait
+                    + chr(10) * 2 + "（你已知的他，供参照，不必都用上）：" + chr(10)
+                    + chr(10).join(_trait_lines[:2]))
+            elif _probe_trait:
+                material_block = ("你还没了解到他「%s」这方面——这轮就从这儿聊起：说说你自己的相关小事，"
+                                  "或者轻声问一句，都行。" % _probe_trait)
+            elif _trait_lines:
+                material_block = ("你对他的了解（话题可以从这里长出来，说一件就行）："
+                                  + chr(10) + chr(10).join(_trait_lines))
+            # 旧事彩蛋：低概率才把一条经历记忆塞进来
+            try:
+                if random.random() < TOPIC_RECALL_CHANCE:
+                    _pool = list((self.memory_data.get("topics") or [])) + list((self.memory_data.get("events") or []))
+                    _pool = [m for m in _pool if isinstance(m, dict) and str(m.get("content") or "").strip()]
+                    if _pool:
+                        _m = random.choice(_pool)
+                        material_block += (chr(10) * 2 + "（顺口的话，可以想起这件旧事，不想提就当没看见）："
+                                           + chr(10) + "- " + str(_m.get("content"))[:60])
+            except Exception as _re:
+                log.debug("话题旧事彩蛋跳过: %s", _re)
 
             _start_all = time.time()
             for attempt in range(2):
@@ -8564,7 +8920,7 @@ class DesktopPet:
                     prompt += ("\n注意：你刚才生成的内容与最近话题重复了（" +
                                "；".join(seen_rejected[-2:]) +
                                "）。请彻底换一个方向和说法，不要再用相同的句式。")
-                prompt += probe_hint
+                # （画像采集方向已并入 material_block，不再追加）
                 
                 with self.api_lock:
                     self.api_busy = True
@@ -8584,7 +8940,6 @@ class DesktopPet:
                                 save_topic_history(self.topic_history)
                                 log.info(f"话题生成 第{attempt+1}次 成功，耗时 {time.time()-_t0:.1f}s")
                                 self._ui(lambda: self.show_event_bubble(context, opt1, opt2))
-                                mark_topic_materials_used([m["text"] for m in _materials])
                                 return
                             else:
                                 seen_rejected.append(context)
@@ -8924,6 +9279,13 @@ class DesktopPet:
             recall = self._last_recall if recall is None else recall
             if not recall or not self.watch_mode:
                 return
+            # 11/05：先看"距上次想起旧事"够不够久，再掷"彩蛋骰"——想起旧事本来就该稀罕
+            _since_last = time.time() - float(getattr(self, "_last_recall_at", 0.0) or 0.0)
+            if _since_last < WATCH_RECALL_MIN_GAP:
+                return
+            if random.random() > WATCH_RECALL_CHANCE:
+                log.debug("陪看·想起旧事：本轮没掷中（%.0f%%）", WATCH_RECALL_CHANCE * 100)
+                return
             # 10/31：额度按评论数攒 —— 每 WATCH_RECALL_PER_COMMENTS 条评论才允许一次
             _quota = int(getattr(self, "_watch_comment_count", 0)) // max(1, WATCH_RECALL_PER_COMMENTS)
             if WATCH_RECALL_LINK_MAX and self._recall_link_count >= WATCH_RECALL_LINK_MAX:
@@ -8975,6 +9337,7 @@ class DesktopPet:
             if not text:
                 return
             self._recall_link_cool[cand.get("id") or ""] = now
+            self._last_recall_at = time.time()          # 11/05：给"两次之间至少隔 15 分钟"用
             self._recall_link_count += 1
             # 10/28：这才是"她真的用了这条记忆"的信号（注入不算）
             try:
@@ -9257,15 +9620,40 @@ class DesktopPet:
                 try:
                     b64 = self.capture_screen_base64()
                     if b64:
-                        self._watch_ring.append((time.time(), b64))
+                        # 11/04：抓帧时就把指纹算掉（挑稳定帧、算 motion 都要用），存进环形
+                        try:
+                            _sig = self._frame_signature(b64)
+                        except Exception:
+                            _sig = None
+                        self._watch_ring.append((time.time(), b64, _sig))
                         if len(self._watch_ring) > getattr(self, "watch_ring_keep", WATCH_RING_KEEP):
                             del self._watch_ring[:-getattr(self, "watch_ring_keep", WATCH_RING_KEEP)]
                         # 10/30：采样相邻帧差，用来标定 WATCH_SETTLE_MOTION（每 ~15 秒落一条）
                         try:
-                            _sig = self._frame_signature(b64)
                             if _prev_sig is not None and _sig is not None:
                                 _d = self._frame_diff(_prev_sig, _sig)
                                 _motion_recent.append(_d)
+                                # 11/04：20 秒累计运动量（先只观测 —— 用来标定"匀速运动也该说话"的阈值）
+                                try:
+                                    _now_pot = time.time()
+                                    _pot_list = getattr(self, "_motion_pot", None)
+                                    if _pot_list is None:
+                                        _pot_list = self._motion_pot = []
+                                    _pot_list.append((_now_pot, _d))
+                                    _cut = _now_pot - WATCH_MOTION_POT_WINDOW
+                                    while _pot_list and _pot_list[0][0] < _cut:
+                                        _pot_list.pop(0)
+                                    self._motion_pot_sum = round(sum(x[1] for x in _pot_list), 1)
+                                except Exception as _pe:
+                                    log.debug("累计运动量统计跳过: %s", _pe)
+                                try:
+                                    if self._watch_is_spike(_d, _motion_recent):
+                                        self._watch_spike_at = time.time()
+                                        log.debug("陪看: 画面突变（帧差 %.1f），立刻判断一次", _d)
+                                        threading.Thread(target=self.analyze_and_comment,
+                                                         daemon=True).start()
+                                except Exception as _se:
+                                    log.debug("突变检查跳过: %s", _se)
                                 del _motion_recent[:-10]
                                 _motion_n += 1
                                 if _motion_n % 10 == 0:
@@ -9313,7 +9701,7 @@ class DesktopPet:
         ring = ring[:-1]
         now = time.time()
         step = max(1, len(ring) // n)
-        return [(b64, max(0.0, now - ts)) for ts, b64 in ring[::step][:n]]
+        return [(b64, max(0.0, now - ts), sig) for ts, b64, sig in ring[::step][:n]]
 
     def _badge_frame(self, image_b64, label):
         """在截图左上角烧一个"多少秒前"的角标（10/27）：模型现在能分清 5 张图的先后。
@@ -9392,6 +9780,66 @@ class DesktopPet:
             log.warning("历史帧拼图失败（退回单发）: %s", e)
             return ""
 
+    def _watch_ring_diffs(self):
+        """环形里相邻两帧的差（长度 = 帧数-1）；指纹缺失的位置给 None。"""
+        ring = list(getattr(self, "_watch_ring", []) or [])
+        out = []
+        for i in range(1, len(ring)):
+            a, b = ring[i - 1][2], ring[i][2]
+            if a is None or b is None:
+                out.append(None)
+            else:
+                try:
+                    out.append(self._frame_diff(a, b))
+                except Exception:
+                    out.append(None)
+        return out
+
+    def _watch_pick_stable(self, targets, window=None, thr=None, min_gap=None):
+        """按"想要距现在多少秒"取帧，但优先挑**前后都没怎么变**的那一帧。
+
+        为什么要它（11/04）：结算页的数字是从 0 滚上去的，锚点取"4 秒前"很可能正好
+        卡在 270 万那一刻 —— 这不是模型不认得数字，是取到了一张过渡帧。
+        "前后两帧差都小于 WATCH_STABLE_DIFF"的帧 = 数字已经停住、画面没在动。
+        """
+        window = WATCH_STABLE_WINDOW if window is None else window
+        thr = WATCH_STABLE_DIFF if thr is None else thr
+        if min_gap is None:
+            _order = sorted(targets)
+            _gaps = [b - a for a, b in zip(_order, _order[1:]) if b > a]
+            min_gap = max(0.3, 0.55 * min(_gaps)) if _gaps else 0.0
+        ring = list(getattr(self, "_watch_ring", []) or [])
+        if not ring:
+            return []
+        now = time.time()
+        ages = [max(0.0, now - e[0]) for e in ring]
+        diffs = self._watch_ring_diffs()
+        # 每一帧的"稳定度"＝与前后邻居里更差的那一边（首尾只算一边）
+        stable = []
+        for i in range(len(ring)):
+            nb = []
+            if i - 1 < len(diffs) and diffs[i - 1] is not None:
+                nb.append(diffs[i - 1])
+            if i < len(diffs) and diffs[i] is not None:
+                nb.append(diffs[i])
+            stable.append(max(nb) if nb else None)
+        picked, used = [], set()
+        picked_ages = []
+        for want in sorted(targets, reverse=True):        # 由远到近，保证时间顺序
+            cands = [i for i in range(len(ring))
+                     if i not in used and abs(ages[i] - want) <= window
+                     and all(abs(ages[i] - pa) >= min_gap for pa in picked_ages)]
+            cands.sort(key=lambda i: abs(ages[i] - want))
+            choice = next((i for i in cands if stable[i] is not None and stable[i] <= thr), None)
+            if choice is None and cands:
+                choice = cands[0]                          # 附近全在动 ⇒ 退回"最近那张"
+            if choice is None:
+                continue
+            used.add(choice)
+            picked_ages.append(ages[choice])
+            picked.append((ring[choice][1], ages[choice]))
+        return picked
+
     def _watch_ring_pick_at(self, targets):
         """按"想要距现在多少秒"取帧（取最接近的一张），返回 [(b64, 实际多少秒前)] 旧→新。
 
@@ -9401,7 +9849,7 @@ class DesktopPet:
         if not ring:
             return []
         now = time.time()
-        pool = [(max(0.0, now - ts), b64) for ts, b64 in ring]
+        pool = [(max(0.0, now - ts), b64) for ts, b64, *_ in ring]
         picked, used = [], set()
         for want in sorted(targets, reverse=True):          # 由远到近，保证时间顺序
             best = None
@@ -9418,7 +9866,7 @@ class DesktopPet:
 
     def _record_watch_sample(self, comment, diff=None, force=False, elapsed=0.0,
                              model_s=0.0, frames=1, since_last=None, tiers=None, care=None,
-                             color=None):
+                             color=None, trig=None, pot=None):
         """P0 基线采集（10/19 起）：把每次陪看评论落成一条 JSONL。
 
         为什么要它：陪看评论以前从不落盘（chat_buffer 只留 15 轮、日志只有调度行），
@@ -9440,6 +9888,10 @@ class DesktopPet:
                 "diff_last": None if since_last is None else round(float(since_last), 4),
                 "tiers": tiers or "",
                 "care": None if care is None else int(care),
+                "pre": False,          # 11/02 起没有预生成命中这回事，字段留着兼容旧样本
+                # 11/04：这一轮是被哪条路放行的（spike/force/prob），以及当时 20 秒累计运动量
+                "trig": trig or "",
+                "pot": None if pot is None else round(float(pot), 1),
             }
             if color:
                 for _k in ("hue_far", "bri_far", "hue_near", "bri_near"):
@@ -9469,6 +9921,81 @@ class DesktopPet:
         except Exception as e:
             log.debug("陪看跳过记录失败: %s", e)
 
+    def _watch_prepare(self, force=False):
+        """取帧 + 算 motion/since_last + 拼两张 960 的图，返回本轮要发的图。
+
+        11/02 改成"均匀注意力"：不再有原生 1280 锚点 —— 近段（最新 6 秒，1.5 秒一格）
+        拼一张，远段（6 秒到缓冲边界，稀疏）也拼一张且同样 960 宽。
+        旧的远层是 640、糊到读不出字，等于白给；现在 20 秒里每一段都"说得出"。
+        """
+        out = {"ok": False}
+        try:
+            ring = list(getattr(self, "_watch_ring", []) or [])
+            if ring:
+                newest_b64 = ring[-1][1]
+            else:
+                newest_b64 = self.capture_screen_base64()      # 环里还没帧（刚开陪看）才现抓
+            if not newest_b64:
+                return out
+            sig = self._frame_signature(newest_b64)
+            since_last = self._frame_diff(self.last_screen_sig, sig)
+            _sigs = [s for _b, _a, s in self._watch_ring_pick_aged() if s is not None]
+            _sigs.append(sig)
+            motion = self._frames_motion(_sigs)
+            out.update({"ok": True, "sig": sig, "since_last": since_last,
+                        "motion": motion, "sigs": _sigs, "prev": None,
+                        "color_src": newest_b64})
+
+            _recent_n = max(1, min(4, int(getattr(self, "watch_recent_frames", WATCH_RECENT_FRAMES))))
+            _older_n = max(0, min(8, int(getattr(self, "watch_older_frames", WATCH_OLDER_FRAMES))))
+            _span = max(6.0, float(getattr(self, "watch_ring_seconds", WATCH_RING_SECONDS)))
+            _mode = str(getattr(self, "watch_tier_mode", WATCH_TIER_MODE) or "uniform").lower()
+            if _mode == "uniform":
+                # 11/04：8 格均等铺满整段 —— 没有哪一格"更清楚"，注意力只能落在"这过程怎么走的"
+                _total_n = _recent_n + _older_n
+                _hi = min(WATCH_UNIFORM_TO, max(WATCH_UNIFORM_FROM + 1.0, _span - 0.5))
+                _targets = [WATCH_UNIFORM_FROM + (_hi - WATCH_UNIFORM_FROM) * i / max(1, _total_n - 1)
+                            for i in range(_total_n)]
+                _picked = sorted(self._watch_pick_stable(_targets), key=lambda t: -t[1])   # 远 → 近
+                _older = _picked[:max(0, len(_picked) - _recent_n)] if _older_n else []
+                _recent = _picked[len(_older):]
+            else:
+                _recent_targets = [WATCH_NEAR_FROM + (WATCH_NEAR_TO - WATCH_NEAR_FROM) * i / max(1, _recent_n - 1)
+                                   for i in range(_recent_n)]
+                _recent = self._watch_pick_stable(_recent_targets)
+                _older = []
+                if _older_n:
+                    _t0 = max(WATCH_FAR_FROM, WATCH_NEAR_TO)
+                    if _span > _t0 + 1.0:
+                        _older_targets = [_t0 + (_span - _t0) * (i + 1) / _older_n for i in range(_older_n)]
+                        _older = self._watch_pick_stable(_older_targets)
+            _near_img = None
+            if len(_recent) >= 2:
+                _near_img = self._compose_frames_grid(_recent, cols=2,
+                                                      cell_w=WATCH_GRID_CELL_W, cell_h=WATCH_GRID_CELL_H)
+            _far_img = None
+            if len(_older) >= 2:
+                _far_img = self._compose_frames_grid(_older, cols=2,
+                                                     cell_w=WATCH_GRID_CELL_W, cell_h=WATCH_GRID_CELL_H)
+            if _near_img:
+                # 顺序：远 → 近（build_context_messages 把 earlier 排在前、主图排最后）
+                _earlier = [_far_img] if _far_img else []
+                out.update({"image_b64": _near_img, "earlier": _earlier, "recent": _recent,
+                            "older": _older, "use_grid": True,
+                            "sent_images": len(_earlier) + 1})
+            else:
+                # 拼图失败 ⇒ 退回逐张单发（保持能看）
+                _earlier = [self._badge_frame(_b, "-%ds" % max(1, round(_a)))
+                            for _b, _a, _s in self._watch_ring_pick_aged()]
+                out.update({"image_b64": self._badge_frame(newest_b64, "刚才"),
+                            "earlier": _earlier, "recent": _recent, "older": _older,
+                            "use_grid": False, "sent_images": len(_earlier) + 1})
+            return out
+        except Exception as e:
+            log.warning("陪看: 取帧/拼图失败 %s", e)
+            return out
+
+
     def analyze_and_comment(self, force=False):
         if self.sleep_mode:
             return
@@ -9480,6 +10007,7 @@ class DesktopPet:
         now = time.time()
         elapsed = now - self.last_watch_comment_time
 
+        _trig = "force" if force else "?"
         if not force:
             if elapsed < self.watch_min_interval:
                 log.debug("陪看: 距上次发言 %.1fs < 最小间隔 %ds，跳过", elapsed, self.watch_min_interval)
@@ -9489,6 +10017,7 @@ class DesktopPet:
             elif elapsed >= self.watch_max_silence:
                 log.debug("陪看: 距上次发言 %.1fs > 最长沉默 %ds，强制触发", elapsed, self.watch_max_silence)
                 force = True
+                _trig = "force"
             else:
                 # 原公式是按 15 秒一次推的；现在 2 秒一判，按时间比例折算成单次概率（期望发言率不变）
                 p15 = max(0.05, (elapsed - self.watch_min_interval) /
@@ -9496,11 +10025,19 @@ class DesktopPet:
                 _poll = max(WATCH_POLL_MIN, min(self.watch_min_interval / WATCH_POLL_DIV, WATCH_POLL_MAX))
                 _base = max(5.0, min(self.watch_min_interval // 2, 60))     # 原设计的判断间隔
                 prob = 1.0 - (1.0 - p15) ** (_poll / _base)
-                if random.random() > prob:
+                # 11/02：画面刚突变过就不掷骰子 —— 让她由"画面变了"驱动，而不是随机数
+                _spike_age = time.time() - float(getattr(self, "_watch_spike_at", 0.0) or 0.0)
+                if _spike_age <= WATCH_SPIKE_WINDOW:
+                    self._watch_spike_at = 0.0
+                    _trig = "spike"
+                    log.debug("陪看: 画面刚突变过（%.1f 秒前），直接放行", _spike_age)
+                elif random.random() > prob:
                     log.debug("陪看: 概率跳过 (elapsed=%.1fs, prob=%.2f)", elapsed, prob)
                     self._record_watch_skip("prob", elapsed)
                     self.watch_lock.release()
                     return
+                else:
+                    _trig = "prob"
 
         log.debug("陪看: 开始分析画面")
         def process():
@@ -9508,33 +10045,34 @@ class DesktopPet:
             try:
                 _ring = list(getattr(self, "_watch_ring", []) or [])
                 if len(_ring) >= 2:
-                    _m = self._frame_diff(self._frame_signature(_ring[-2][1]),
-                                          self._frame_signature(_ring[-1][1]))
+                    _sig_a = _ring[-2][2] if len(_ring[-2]) > 2 else None
+                    _sig_b = _ring[-1][2] if len(_ring[-1]) > 2 else None
+                    if _sig_a is None or _sig_b is None:
+                        _sig_a = self._frame_signature(_ring[-2][1])
+                        _sig_b = self._frame_signature(_ring[-1][1])
+                    _m = self._frame_diff(_sig_a, _sig_b)
                     if _m >= WATCH_SETTLE_MOTION:
                         log.debug("陪看: 画面正在剧烈变化（%.1f），等 %.1f 秒落定再开口", _m, WATCH_SETTLE_SEC)
                         time.sleep(WATCH_SETTLE_SEC)
             except Exception as e:
                 log.debug("陪看: 落定等待跳过（%s）", e)
             try:
-                # 11/01：不再现场抓一对帧（那要硬等 1.2 秒），锚点直接取环形里约 4 秒前那张。
-                # 她落地时已经过去 4 秒，所以这张正好对上"刚才"，而不是假装"现在"。
-                _anchor = self._watch_ring_pick_at([WATCH_ANCHOR_AGE])
-                if _anchor:
-                    image_b64, _anchor_age = _anchor[0]
-                else:
-                    image_b64 = self.capture_screen_base64()      # 环里还没帧（刚开陪看）才现抓
-                    _anchor_age = 0.0
-                if not image_b64:
+                # 11/02：取帧/拼图抽到 _watch_prepare()，预生成那条路也用同一份逻辑
+                _prep = self._watch_prepare(force)
+                if not _prep.get("ok"):
                     self._ui(lambda: self.show_bubble_text("(normal) 唔...我现在看不到画面呢。", "normal"), status=True)
                     return
-                _prev_b64 = None
-                sig = self._frame_signature(image_b64)
-                since_last = self._frame_diff(self.last_screen_sig, sig)   # 不论 force 都算：采集要用
-                # 10/28：判据改成"本轮要发的那几张图互相比" —— 只有这十秒里真的在动才算有变化
-                _aged_raw = self._watch_ring_pick_aged()
-                _sigs = [self._frame_signature(_b) for _b, _a in _aged_raw]
-                _sigs.append(sig)
-                motion = self._frames_motion(_sigs)
+                image_b64 = _prep["image_b64"]
+                _prev_b64 = _prep["prev"]
+                sig = _prep["sig"]
+                since_last = _prep["since_last"]
+                motion = _prep["motion"]
+                _sigs = _prep["sigs"]
+                _recent = _prep["recent"]
+                _older = _prep["older"]
+                _earlier = _prep["earlier"]
+                _use_grid = _prep["use_grid"]
+                _color_src = _prep.get("color_src") or image_b64
                 if self._watch_skip_by_stillness(motion, since_last, force):
                     log.debug("陪看: 这十秒画面没动（相邻帧最大差 %.2f < %.1f，与上次开口那帧差 %.2f），跳过不调模型",
                               motion, WATCH_MOTION_THRESHOLD, since_last)
@@ -9543,70 +10081,29 @@ class DesktopPet:
                     return
                 if not force:
                     log.debug("陪看: 画面在动 相邻帧最大差 %.2f（与上次开口那帧差 %.2f）", motion, since_last)
-                # 10/30（两级时间轴）：近层 4 帧@960 宽（看细节/字幕）+ 远层 8 帧@640 宽（看动势）
-                # + 当前帧原生。token：近 1000 + 远 ~950 + 当前 578 ≈ 2510，仍低于改造前 5 张原生的 2926。
-                _recent, _older = [], []      # 兜底：拼图那段若抛异常，下面的日志/记录也不会 NameError
-                _earlier = []
-                _use_grid = False
-                try:
-                    _recent_n = max(1, min(4, int(getattr(self, "watch_recent_frames", WATCH_RECENT_FRAMES))))
-                    _older_n = max(0, min(8, int(getattr(self, "watch_older_frames", WATCH_OLDER_FRAMES))))
-                    _span = max(6.0, float(getattr(self, "watch_ring_seconds", WATCH_RING_SECONDS)))
-                    # 近层：最近 ~6 秒（含前后帧那一秒）
-                    # 11/01：整条时间轴后移 4 秒 —— 近层 4.5~10 秒、远层 10~20 秒，锚点另取。
-                    _recent_targets = [WATCH_NEAR_FROM + (WATCH_NEAR_TO - WATCH_NEAR_FROM) * i / max(1, _recent_n - 1)
-                                       for i in range(_recent_n)]
-                    _recent = self._watch_ring_pick_at(_recent_targets)
-                    # 远层：更早的一段（从近层末端到缓冲边界），均匀取
-                    _older = []
-                    if _older_n:
-                        _t0 = max(WATCH_FAR_FROM, WATCH_NEAR_TO)
-                        if _span > _t0 + 1.0:
-                            _older_targets = [_t0 + (_span - _t0) * (i + 1) / _older_n for i in range(_older_n)]
-                            _older = self._watch_ring_pick_at(_older_targets)
-                    _grids = []
-                    if len(_recent) >= 2:
-                        _g = self._compose_frames_grid(_recent, cols=2,
-                                                       cell_w=WATCH_GRID_CELL_W, cell_h=WATCH_GRID_CELL_H)
-                        if _g:
-                            _grids.append(_g)                      # 近层：旧→新
-                    if len(_older) >= 2:
-                        _g2 = self._compose_frames_grid(_older, cols=2,
-                                                        cell_w=640, cell_h=360, label_h=22)
-                        if _g2:
-                            _grids.insert(0, _g2)                  # 远层排在前面（更早，2×2）
-                    if _grids:
-                        _earlier = _grids
-                        _use_grid = True
-                        _prev_b64 = None                           # 前后帧已并进近层
-                        image_b64 = self._badge_frame(image_b64, "刚才")
-                    else:                                          # 拼图失败 ⇒ 退回原来逐张单发
-                        _earlier = [self._badge_frame(_b, "-%ds" % max(1, round(_a)))
-                                    for _b, _a in self._watch_ring_pick_aged()]
-                        if _prev_b64:
-                            _prev_b64 = self._badge_frame(_prev_b64, "-1.2s")
-                        image_b64 = self._badge_frame(image_b64, "刚才")
-                except Exception as e:
-                    log.warning(f"画面时间角标失败（照常发图）: {e}")
-                _sent_images = len(_earlier) + 1 + (1 if _prev_b64 else 0)
+                _sent_images = _prep["sent_images"]
                 _v0 = time.time()
-                comment = self._get_vision_comment(image_b64, force=force,
-                                                   image_b64_prev=_prev_b64,
-                                                   image_b64_earlier=_earlier)
+                comment = None
+                if True:
+                    comment = self._get_vision_comment(image_b64, force=force,
+                                                       image_b64_prev=_prev_b64,
+                                                       image_b64_earlier=_earlier)
                 # P0 基线采集：每次（含空回）都记一条；frames=1 是旧单帧样本，2 为多帧样本，可直接对比
                 _care_hit = 1 if any(w in (comment or "") for w in WATCH_CARE_WORDS) else 0
                 log.debug("陪看: 发图 %d 张（%s）", _sent_images,
-                          "历史 4 帧拼图 + 当前帧" if _use_grid else "逐张单发")
-                _color = self._watch_color_pair(image_b64)
+                          "远段 4 格 + 近段 4 格（都 960）" if _use_grid else "逐张单发")
+                _color = self._watch_color_pair(_color_src)
                 self._record_watch_sample(comment, motion, force, elapsed,
                                           time.time() - _v0,
                                           frames=_sent_images,
                                           since_last=since_last,
                                           tiers=("%d+/%d远" % (len(_recent), len(_older)) if _use_grid else "逐张"),
                                           care=_care_hit,
-                                          color=_color)
-                log.debug("陪看: 本轮图 %d 张 / 近层 %d / 远层 %d / 锚点在 %.1f 秒前",
-                          _sent_images, len(_recent), len(_older), _anchor_age)
+                                          color=_color,
+                                          trig=_trig,
+                                          pot=getattr(self, "_motion_pot_sum", None))
+                log.debug("陪看: 本轮图 %d 张 / 近层 %d / 远层 %d（两张都 960）",
+                          _sent_images, len(_recent), len(_older))
                 if comment:
                     # 只有"真的说了一句"才重置发言间隔（空回不吃间隔：间隔＝实际发言的间隔）
                     # 11/01：她自己的陪看评论不再进素材池（187/200 全是这个，取材等于自我模仿）
@@ -9964,7 +10461,7 @@ OCR文字：
             return False
         self._ui(lambda: self.show_bubble_text(line, "normal"))
         self._ui(lambda: threading.Thread(target=self._tts_play, args=(line,), daemon=True).start())
-        log.info("主动瞟一眼：%s", line[:70])
+        log.info("主动凑过来：%s", line[:70])
         return True
 
     def look_at_screen(self, focus=""):
@@ -10029,28 +10526,6 @@ OCR文字：
                      "他要是连着玩了很久、或者节奏明显慢下来，偶尔顺口提一句让他歇会儿；不用非得说。")
         force_line = "这一轮一定要说一句。" if force else ""
         # 他明确点名要你看什么时（"看看我拿到了什么"），把关注点揉进提示词，别答非所问
-        pair_line = ""
-        _older = list(image_b64_earlier or [])
-        if len(_older) == 2 and not image_b64_prev:
-            pair_line = ("画面给了三张图，按时间由远到近："
-                         "第一张是更早那段的 4 个画面（2×2，从左到右、从上到下由旧到新，"
-                         "每格底下标着距现在多少秒，只看个大概就行）；"
-                         "第二张是前几秒的 4 个画面（2×2，同样越往后越新，底下标着秒数）；"
-                         "第三张是**刚才**的画面（左上角标着“刚才”，大约四秒前）。"
-                         "注意：这些都是**已经过去**的画面，你开口的时候早就过去了——"
-                         "所以用「刚才」「刚刚」「前面」这种说法，别用「现在正在」「你正」这类实时口气。"
-                         "别说「拼图」「帧」「格子」这类词。")
-        elif len(_older) == 1 and not image_b64_prev:
-            pair_line = ("画面给了两张图：第一张是前十几秒的 4 个画面（2×2 排列，"
-                         "从左到右、从上到下越来越新，每个底下标着距现在几秒），"
-                         "第二张是**刚才**的画面（左上角标着“刚才”，大约四秒前）。"
-                         "这些都是已经过去的画面，用「刚才」「刚刚」这种说法，别用「现在正在」。"
-                         "别说「拼图」「帧」「格子」这类词。")
-        elif _older and image_b64_prev:
-            pair_line = ("画面一共给了 %d 张，是最近十几秒里连着拍的：每张左上角标着距现在多少秒"
-                         "（越往左越早，最后一张是现在，倒数第二张是一秒多前）。" % (len(_older) + 2))
-        elif image_b64_prev:
-            pair_line = ("画面给了前后两帧（约一秒的间隔），左上角标着各是几秒前。")
         focus_line = ""
         if (focus or "").strip():
             focus_line = "他刚才让你看的是「%s」——先就这个说一句，别答非所问。" % focus.strip()
@@ -10070,24 +10545,26 @@ OCR文字：
 画面上那只桌宠就是你自己，别把她认成别人。
 如果画面里根本看不出他在问什么，就直说看不出，别编。
 请严格输出 JSON，不要 markdown 代码块：{{"comment": "开头一个情绪括号 + 你要说的那一句话"}}"""
-        watch_instructions = f"""你在陪"{user_name}"一起看屏幕（可能是直播/电影/视频，也可能是他自己在玩游戏或使用软件）。
+        watch_instructions = f"""你就坐在"{user_name}"旁边，跟他一起看这块屏幕。
 你是{self.pet_name}，用你自己的语气说话。
-{pair_line}
+这些格子是从头到尾的一小段过程，每格底下标着距现在几秒——先看它是怎么走到这一步的。
+说说你自己的感受。
 {focus_line}
-不要只描述画面内容——画面里有什么他自己看得见。说你自己的反应就好。
 你怎么说话都行：说半句、哼一声、跟自己嘀咕、突然想起别的事，都可以。
 {rest_line}
 没什么想说的，comment 就留空，不用硬凑。{force_line}
 {said_block}
 请严格输出JSON，不要markdown代码块：
-{{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "spot": "他在干什么/在看什么，12字以内，只写定位（例如“Apex 排位·搜物资”），不要复述画面细节、不要写数字和界面文字；看不出就留空字符串"}}
+{{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "spot": "这是哪儿，12字以内，只写场景（例如“Apex 排位·房间”），不要写数字和界面文字；看不出就留空字符串"}}
 """
 
-        # 11/01：主动瞟一眼模式 —— 一句就够，别堆限制
+        # 11/03：凑过来看一眼 —— 关注"他在干什么"，然后说个小感想，不是评论画面
         glance_instructions = ""
         if glance:
             glance_instructions = chr(10).join([
-                '你看了一眼"%s"的屏幕，随口说一句。' % self.user_profile.get("call_name", "他"),
+                '你刚从旁边凑过来，看了一眼"%s"的屏幕。' % self.user_profile.get("call_name", "他"),
+                '先看他这会儿在干什么，再说一句你对这件事的感想——好奇、关心、或者夸他一句，都行。',
+                '像刚凑近才看明白的那种口气，一两句。',
                 '请严格输出 JSON，不要 markdown 代码块：',
                 '{"comment": "开头一个情绪括号 + 那句话", "spot": "他在干什么，12字以内"}',
             ])
@@ -10100,7 +10577,7 @@ OCR文字：
             extra_context=("" if (look and not glance) else said_block),
             skip_sources={"watch"} if (monologue and not look and not glance) else None,
             image_b64_prev=image_b64_prev,
-            image_b64_earlier=_older)
+            image_b64_earlier=image_b64_earlier)
         try:
             # 陪看走 WATCH_TEMPERATURE（0.98）；看屏幕的回答模式用 0.7 更稳
             resp = self._call_vision_model(messages, temperature=(0.75 if glance else (0.7 if look else WATCH_TEMPERATURE)),
@@ -10182,6 +10659,7 @@ OCR文字：
                 # 10/27：极短定位标签，只给历史 user 侧用（不进 watch_log、不参与段总结）
                 # 11/01：瞟一眼（glance）不写陪看会话 —— 否则她的随口一句会攒进段 buffer，
                 # 之后凭空生成一条"陪看事件"，把闲聊污染成陪看记忆。
+                # 11/02：预生成也走这条 —— spot 照样记（突变即开口时要写会话），但**不进段缓冲**，
                 _sp = re.sub(r"[（(][^）)]*[）)]", "", spot or "").strip()
                 _sp = re.sub(r"\s+", " ", _sp)[:14]
                 self._watch_last_spot = _sp
@@ -11215,6 +11693,79 @@ OCR文字：
                 del_btn.grid(row=0, column=1, rowspan=2, padx=10, sticky="e")
         refresh_display()
 
+# ------------------------- OCR 坐标工具（11/03）-------------------------
+def _ocr_lines_with_boxes(ocr_out):
+    """把 RapidOCR 的输出整理成"带坐标、按阅读顺序排好"的文字块。
+
+    返回 [{"text", "x1", "x2", "y1", "y2", "cy", "h", "score"}]，
+    先按 y 聚成行（同一行 y 中心差小于半行高），行内再按 x 从左到右。
+    没有 boxes 时退回纯文本（退化路径），保证老行为不会崩。
+    """
+    # 注意：boxes/scores 可能是 numpy 数组，不能用 `or []`（数组的真值有歧义）
+    def _seq(name):
+        v = getattr(ocr_out, name, None)
+        return [] if v is None else list(v)
+    txts, boxes, scores = _seq("txts"), _seq("boxes"), _seq("scores")
+    items = []
+    for i, t in enumerate(txts):
+        t = (t or "").strip()
+        if not t:
+            continue
+        b = boxes[i] if i < len(boxes) else None
+        if b is None or len(b) == 0:
+            items.append({"text": t, "x1": 0, "x2": 0, "y1": i, "y2": i,
+                          "cy": i, "h": 1, "score": None})
+            continue
+        xs = [p[0] for p in b]
+        ys = [p[1] for p in b]
+        items.append({"text": t,
+                      "x1": min(xs), "x2": max(xs),
+                      "y1": min(ys), "y2": max(ys),
+                      "cy": (min(ys) + max(ys)) / 2.0,
+                      "h": max(1.0, max(ys) - min(ys)),
+                      "score": scores[i] if i < len(scores) else None})
+    if not items:
+        return []
+    # 聚行：按 cy 排序后，若与当前行的平均 cy 差 > 0.6×行高，就开新行
+    items.sort(key=lambda r: (r["cy"], r["x1"]))
+    lines, cur, cur_cy = [], [], None
+    for it in items:
+        if cur and abs(it["cy"] - cur_cy) > 0.6 * max(it["h"], 1.0):
+            cur.sort(key=lambda r: r["x1"])
+            lines.append(cur)
+            cur = []
+        if not cur:
+            cur_cy = it["cy"]
+        else:
+            cur_cy = sum(r["cy"] for r in cur) / len(cur)
+        cur.append(it)
+    if cur:
+        cur.sort(key=lambda r: r["x1"])
+        lines.append(cur)
+    flat = []
+    for line in lines:                     # 行内用空格拼、行之间保留结构
+        flat.extend(line)
+    return flat
+
+
+def _ocr_text_by_lines(ocr_out):
+    """同一份输出按行拼成文本（行间 
+，行内空格）。给需要"读顺序"的地方用。"""
+    blocks = _ocr_lines_with_boxes(ocr_out)
+    if not blocks:
+        return ""
+    rows, cur, cy = [], [], None
+    for b in blocks:
+        if cur and abs(b["cy"] - cy) > 0.6 * max(b["h"], 1.0):
+            rows.append(" ".join(x["text"] for x in cur))
+            cur = []
+        if not cur:
+            cy = b["cy"]
+        cur.append(b)
+    if cur:
+        rows.append(" ".join(x["text"] for x in cur))
+    return chr(10).join(rows)
+
 # ------------------------------- 阅读伴侣（RapidOCR）--------------------------------
 class ReadingCompanion:
     RING_MAX = 2000
@@ -11243,6 +11794,7 @@ class ReadingCompanion:
         self.reply_check_job = None
         self._ocr_thread = None
         self.reader = None
+        self.last_ocr_blocks = []          # 上一次 OCR 的文字块（带坐标）
         self._reader_loading = False
 
     def _init_reader(self):
@@ -11350,8 +11902,14 @@ class ReadingCompanion:
                 return
             img_np = np.array(pil_img)
             _ocr_out = self.reader(img_np)          # RapidOCROutput：.txts / .boxes / .scores
-            results = list(getattr(_ocr_out, "txts", None) or [])
-            text = ' '.join(results).strip()
+            # 11/03：改用坐标 —— 按行聚、行内从左到右，读出来的顺序才和页面上一致
+            self.last_ocr_blocks = _ocr_lines_with_boxes(_ocr_out)
+            text = _ocr_text_by_lines(_ocr_out).strip()
+            if self.last_ocr_blocks:
+                log.debug("读书OCR：%d 块，第一块在 (%d,%d)-(%d,%d)",
+                          len(self.last_ocr_blocks), self.last_ocr_blocks[0]["x1"],
+                          self.last_ocr_blocks[0]["y1"], self.last_ocr_blocks[0]["x2"],
+                          self.last_ocr_blocks[0]["y2"])
             if not re.search(r'[一-鿿]', text):
                 return
             new_lines = []
