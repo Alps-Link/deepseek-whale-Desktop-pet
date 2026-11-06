@@ -524,6 +524,25 @@ def _get_section(name, default=None):
         return sec
     return json.loads(json.dumps(default)) if isinstance(default, dict) else {}
 
+def load_dsh_settings():
+    """DSH 外包的配置：{"enabled": bool, "cli": str}（cli 空 = 自动检测）。"""
+    sec = _get_section("tools", {}) or {}
+    try:
+        enabled = bool(sec.get("dsh_enabled", True))
+    except Exception:
+        enabled = True
+    cli = str(sec.get("dsh_cli") or "").strip()
+    return {"enabled": enabled, "cli": cli}
+
+
+def save_dsh_settings(enabled, cli):
+    """保存 DSH 外包配置（读-改-写 tools 节，别覆盖同节其它键）。"""
+    sec = dict(_get_section("tools", {}) or {})
+    sec["dsh_enabled"] = bool(enabled)
+    sec["dsh_cli"] = (cli or "").strip()
+    _update_section("tools", sec)
+
+
 def _update_section(name, value):
     """读-改-写一节（带锁：后台线程与 UI 可能同时保存，别互相覆盖）"""
     with _config_lock:
@@ -1316,6 +1335,16 @@ WATCH_SPIKE_PEAK = 22.0          # 相邻帧差达到它才算"突变"（11/04 �
 WATCH_SPIKE_RATIO = 2.5          # 且要是尖峰：超过最近几帧中位的 2.5 倍
 WATCH_SPIKE_WINDOW = 8.0         # 突变后这么久之内，判断到点就放行（不掷骰子）
 WATCH_MOTION_POT_WINDOW = 20.0
+# 11/06：把"她做不到的事"外包给 DSH（headless 一次性任务）
+DSH_CLI_CANDIDATES = (
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "DeepSeek Harness",
+                 "resources", "runtime", "cli", "bin", "dsh.cmd"),
+    os.path.join(os.environ.get("APPDATA", ""), "npm", "dsh.cmd"),
+)
+DSH_ASK_TIMEOUT = 180          # 一次外包最多等这么久（秒）
+DSH_ASK_MAX_TASK = 400         # 任务描述最长多少字
+DSH_ASK_KEEP_CHARS = 900       # 回填给她的结果最多保留多少字
+
 WATCH_STABLE_DIFF = 8.0          # 相邻帧差小于它就算"这一帧是静的"（挑帧用：数字刚滚停、没在过渡）
 WATCH_STABLE_WINDOW = 3.0        # 在目标时刻前后这么多秒里找稳定帧   # 累计运动量的窗口（秒）——11/04 先只观测、写进日志，等真实分布再定触发阈值
 WATCH_POLL_DIV = 10.0       # 判断间隔 = 最短沉默 / 10（原来是 /2；仍是你的设置派生，只是更细）
@@ -3629,6 +3658,7 @@ class DesktopPet:
         self._ui_q = queue.Queue()
         self._shutdown = False
         self._memory_lock = threading.RLock()
+        self._dsh_ask_lock = threading.Lock()      # 一次只外包一件事
         self._tts_lock = threading.Lock()
         self._win_x = 100
         self._win_y = 100
@@ -4013,6 +4043,24 @@ class DesktopPet:
                                     "description": "seek 时：0~1 比例（0.6=跳到 60%），大于 1 当秒数"},
                     },
                     "required": ["action"],
+                },
+            },
+        }, {
+            "type": "function",
+            "function": {
+                "name": "ask_dsh",
+                "description": "把一件**她做不到的事**外包给 DeepSeek Harness（另一个AI助手，能读写文件、跑命令、查资料）。"
+                               "只在他说的事需要动电脑、查网络资料、跑脚本、批量处理文件时调用，比如："
+                               "“帮我整理一下这个文件夹”“看看我那个下载完了没”“查查明天天气”“把这些文件改名”。"
+                               "闲聊、陪玩评论、问时间问日期这类不需要调。"
+                               "任务描述要写清楚“要什么结果”，不要写一堆寒暄。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string",
+                                 "description": "交给 DSH 的具体任务（一句话说清目标，含路径/文件名等关键信息）"},
+                    },
+                    "required": ["task"],
                 },
             },
         }]
@@ -4936,6 +4984,7 @@ class DesktopPet:
         settings_menu.add_command(label="🎧 TTS 音色与语言...", command=self.open_tts_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🎩 装扮", command=self._open_costume_window)
+        settings_menu.add_command(label="🔌 DSH 协作...", command=self.open_dsh_settings)
         settings_menu.add_command(label="🧾 导出故障报告...", command=self.export_fault_report)
         settings_menu.add_command(label="关于", command=self.show_about)
         self.menu.add_cascade(label="⚙️ 设置", menu=settings_menu)
@@ -5608,6 +5657,8 @@ class DesktopPet:
                             ok, note = self.control_browser(
                                 str(args.get("action", "") or ""), args.get("seek_to"),
                                 args.get("value"), args.get("delta"))
+                        elif fname == "ask_dsh":
+                            ok, note = self.ask_dsh(str(args.get("task", "") or ""))
                         elif fname == "look_at_screen":
                             ok, note = self.look_at_screen(str(args.get("focus", "") or ""))
                             if ok:
@@ -10464,6 +10515,114 @@ OCR文字：
         log.info("主动凑过来：%s", line[:70])
         return True
 
+    def _find_dsh_cli(self):
+        """找 DSH 的命令行入口（找不到返回空串）。配置里指定的路径优先。"""
+        try:
+            _configured = load_dsh_settings().get("cli") or ""
+        except Exception:
+            _configured = ""
+        if _configured:
+            try:
+                if os.path.isfile(_configured):
+                    return _configured
+            except Exception:
+                pass
+        for p in DSH_CLI_CANDIDATES:
+            try:
+                if p and os.path.isfile(p):
+                    return p
+            except Exception:
+                continue
+        from shutil import which
+        for name in ("dsh.cmd", "dsh"):
+            try:
+                p = which(name)
+                if p:
+                    return p
+            except Exception:
+                continue
+        return ""
+
+    def ask_dsh(self, task):
+        """把一件事外包给 DSH 的 headless 模式，返回 (ok, 文本)。
+
+        定位（11/06）：她是主体，DSH 只是她的一双手——她做不到的（动文件、跑命令、
+        查资料）才外包。只跑一次性任务、只回结果，不把上下文交出去。
+        """
+        task = " ".join(str(task or "").split())
+        if not task:
+            return False, "要办的事还没说清呢"
+        try:
+            if not load_dsh_settings().get("enabled", True):
+                return False, "我这边把外包关掉了，这件事得你自己来"
+        except Exception:
+            pass
+        if len(task) > DSH_ASK_MAX_TASK:
+            task = task[:DSH_ASK_MAX_TASK]
+        cli = self._find_dsh_cli()
+        if not cli:
+            return False, "我这边找不到 DSH 的命令行，暂时办不了这件事"
+        if not self._dsh_ask_lock.acquire(blocking=False):
+            return False, "上一件外包的事还没办完，等一下再说"
+        try:
+            _env = dict(os.environ)
+            _env.setdefault("PYTHONIOENCODING", "utf-8")
+            _env.setdefault("NO_COLOR", "1")
+            # headless profile 不会自动拿到 GUI 里存的密钥 ⇒ 用她自己的文本模型 key。
+            # 注意：**不要传 DEEPSEEK_BASE_URL** —— 实测传 /v1 会让它走 Messages 接口并 404，
+            # 只给 key 时它会自己用 https://api.deepseek.com/models 探测（11/06 验证）。
+            try:
+                _k = str(getattr(self, "text_api_key", "") or "").strip()
+                if _k:
+                    _env.setdefault("DEEPSEEK_API_KEY", _k)
+            except Exception:
+                pass
+            import subprocess as _sp
+            _flags = getattr(_sp, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            log.info("外包给 DSH：%s", task[:80])
+            _t0 = time.time()
+            # 任务用 stdin 传（`headless -`），中文与引号都不用转义
+            proc = _sp.Popen(["cmd", "/c", cli, "headless", "-"],
+                                    stdout=_sp.PIPE, stderr=_sp.PIPE,
+                                    stdin=_sp.PIPE, cwd=CONFIG_DIR,
+                                    env=_env, creationflags=_flags)
+            try:
+                out, err = proc.communicate(task.encode("utf-8"), timeout=DSH_ASK_TIMEOUT)
+            except _sp.TimeoutExpired:
+                log.warning("外包超时（%d 秒），结束 DSH 进程", DSH_ASK_TIMEOUT)
+                try:
+                    _sp.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                   capture_output=True, timeout=10)
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False, "这件事办得比我想的久，先放下了"
+            text = (out or b"").decode("utf-8", "replace")
+            text = re.sub(r"\[[0-9;]*m", "", text)      # 去 ANSI
+            lines = [ln.rstrip() for ln in text.splitlines()]
+            lines = [ln for ln in lines if ln.strip() and not ln.startswith("[llm-")]
+            body = chr(10).join(lines).strip()
+            if len(body) > DSH_ASK_KEEP_CHARS:
+                body = body[:DSH_ASK_KEEP_CHARS] + "…"
+            _err = (err or b"").decode("utf-8", "replace").strip()
+            took = time.time() - _t0
+            log.info("外包完成：%.1f 秒，输出 %d 字，退出码 %s", took, len(body), proc.returncode)
+            if proc.returncode not in (0, None):
+                _why = " | ".join((_err or body or "").strip().splitlines()[-2:])[:300]
+                return False, "它办到一半出错了：" + _why
+            if not body:
+                _why = " | ".join((_err or "").strip().splitlines()[-2:])[:300]
+                return False, "它那边没给出结果" + ("（%s）" % _why if _why else "")
+            return True, body
+        except Exception as e:
+            log.exception("外包失败：%s", e)
+            return False, "外包的时候出岔子了（%s）" % e
+        finally:
+            self._dsh_ask_lock.release()
+
     def look_at_screen(self, focus=""):
         """看一眼当前屏幕并按他的关注点说一句（工具入口，10/17 新增）。
 
@@ -10524,7 +10683,7 @@ OCR文字：
         _care_left = max(0, WATCH_CARE_MAX - int(getattr(self, "_watch_care_count", 0)))
         rest_line = ("" if (time.time() < self._rest_cooldown_until or _care_left <= 0) else
                      "他要是连着玩了很久、或者节奏明显慢下来，偶尔顺口提一句让他歇会儿；不用非得说。")
-        force_line = "这一轮一定要说一句。" if force else ""
+        force_line = "这一轮得说一句——画面里没什么可说的，就说你自己这会儿怎么样。" if force else ""
         # 他明确点名要你看什么时（"看看我拿到了什么"），把关注点揉进提示词，别答非所问
         focus_line = ""
         if (focus or "").strip():
@@ -10552,7 +10711,7 @@ OCR文字：
 {focus_line}
 你怎么说话都行：说半句、哼一声、跟自己嘀咕、突然想起别的事，都可以。
 {rest_line}
-没什么想说的，comment 就留空，不用硬凑。{force_line}
+没什么想说的，comment 就留空，不用硬凑——他只是翻界面看数据的时候尤其如此。{force_line}
 {said_block}
 请严格输出JSON，不要markdown代码块：
 {{"comment": "开头一个情绪括号 + 你要对他说的那句话本身（不是“我做了什么/已按规则生成”这种回执）；没什么想说的就留空字符串", "spot": "这是哪儿，12字以内，只写场景（例如“Apex 排位·房间”），不要写数字和界面文字；看不出就留空字符串"}}
@@ -11308,6 +11467,164 @@ OCR文字：
         build_page(st["mode"])
         refresh_cur()
         return win, frame
+
+    def open_dsh_settings(self):
+        """DSH 协作设置：开关 + 命令行路径 + 检测/测试。"""
+        cfg = load_dsh_settings()
+        win, frame = self._make_card_window("DSH 协作", 660, 520)
+        s = self._dpi_scale
+        enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", True)))
+
+        # ── 底部先 pack（固定按钮永不被挤）──
+        btn_frame = tk.Frame(frame, bg=DIALOG_BG)
+        btn_frame.pack(side=tk.BOTTOM, pady=(6, 14))
+
+        # ── 顶部：开关 ──
+        tk.Label(frame, text="要不要让她把做不到的事外包出去", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w", padx=16, pady=(12, 6))
+        switch_row = tk.Frame(frame, bg=DIALOG_BG)
+        switch_row.pack(anchor="w", padx=16)
+
+        def render_switch():
+            for w in switch_row.winfo_children():
+                w.destroy()
+            for val, label in ((True, "允许"), (False, "不允许")):
+                RoundedButton(switch_row, text=label,
+                              command=lambda v=val: (enabled_var.set(v), render_switch()),
+                              variant=("primary" if enabled_var.get() == val else "subtle"),
+                              width=int(110 * s), height=int(36 * s), radius=int(8 * s),
+                              font=(self.font_family, 11)).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(frame, text="只会外包\u201c动文件、跑命令、查网络、多步任务\u201d这类事；闲聊、陪玩、看屏幕还是她自己做。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify="left", wraplength=int(600 * s)).pack(anchor="w", padx=16, pady=(6, 0))
+
+        # ── 命令行 ──
+        tk.Label(frame, text="DSH 命令行", font=(self.font_family, 11, "bold"),
+                 fg=TEXT_MAIN, bg=DIALOG_BG).pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(frame, text="留空 = 自动检测（桌面版默认安装位置、npm 全局、PATH）。装在别处就手动指定 dsh.cmd。",
+                 font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                 justify="left", wraplength=int(600 * s)).pack(anchor="w", padx=16, pady=(0, 4))
+        cli_entry = RoundedEntry(frame, width=int(580 * s), height=int(34 * s),
+                                 radius=int(8 * s), font=(self.font_family, 10))
+        cli_entry.pack(anchor="w", padx=16)
+        cli_entry.set(cfg.get("cli") or "")
+
+        status_lbl = tk.Label(frame, text="", font=(self.font_family, 9), fg=TEXT_SUB,
+                              bg=DIALOG_BG, justify="left", wraplength=int(600 * s))
+        status_lbl.pack(anchor="w", padx=16, pady=(6, 0))
+
+        def show_status(text, ok=None):
+            try:
+                if ok is True:
+                    status_lbl.config(text=text, fg="#1a7f37")      # 成功绿
+                elif ok is False:
+                    status_lbl.config(text=text, fg=DANGER_RED)
+                else:
+                    status_lbl.config(text=text, fg=TEXT_SUB)
+            except Exception:
+                pass
+
+        def do_detect():
+            _cli = str(cli_entry.get() or "").strip()
+            if _cli and not os.path.isfile(_cli):
+                show_status("这个路径下没有文件：%s" % _cli, False)
+                return
+            found = self._find_dsh_cli()
+            if found:
+                show_status("\u2713 找到了：%s" % found, True)
+            else:
+                show_status("没找到 dsh.cmd。手动填路径，或确认 DSH 装在默认位置。", False)
+
+        def do_test():
+            show_status("正在试\u2026（最多等 60 秒）", None)
+
+            def run():
+                try:
+                    import subprocess as _sp
+                    _cli = self._find_dsh_cli()
+                    if not _cli:
+                        self._ui(lambda: show_status("没找到 dsh.cmd，先在上面填路径", False))
+                        return
+                    _env = dict(os.environ)
+                    _env["NO_COLOR"] = "1"
+                    _env["PYTHONIOENCODING"] = "utf-8"
+                    _k = str(getattr(self, "text_api_key", "") or "").strip()
+                    if _k:
+                        _env.setdefault("DEEPSEEK_API_KEY", _k)
+                    _flags = getattr(_sp, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                    proc = _sp.Popen(["cmd", "/c", _cli, "headless", "-"],
+                                     stdout=_sp.PIPE, stderr=_sp.PIPE, stdin=_sp.PIPE,
+                                     cwd=CONFIG_DIR, env=_env, creationflags=_flags)
+                    out, err = proc.communicate("用一句话回答：今天是几号，星期几。不要读文件。".encode("utf-8"),
+                                                timeout=60)
+                    _txt = (out or b"").decode("utf-8", "replace").strip()
+                    _er = (err or b"").decode("utf-8", "replace").strip()
+                    if proc.returncode == 0 and _txt:
+                        _line = _txt.splitlines()[-1][:60]
+                        self._ui(lambda: show_status("\u2713 通了：%s" % _line, True))
+                    else:
+                        _why = ((_er or _txt).splitlines() or ["没有输出"])[-1][:80]
+                        self._ui(lambda: show_status("\u00d7 没通：%s" % _why, False))
+                except Exception as _e:
+                    _msg = "\u00d7 没通：%s" % _e
+                    self._ui(lambda: show_status(_msg, False))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def do_pick():
+            try:
+                from tkinter import filedialog
+                _p = filedialog.askopenfilename(
+                    parent=win, title="选择 dsh.cmd",
+                    filetypes=[("命令行", "*.cmd;*.bat;*.exe"), ("所有文件", "*.*")])
+                if _p:
+                    cli_entry.set(_p)
+                    do_detect()
+            except Exception as e:
+                log.debug("选择 DSH 路径失败: %s", e)
+
+        row = tk.Frame(frame, bg=DIALOG_BG)
+        row.pack(anchor="w", padx=16, pady=(8, 0))
+        RoundedButton(row, text="重新检测", command=do_detect,
+                      variant="subtle", width=int(100 * s), height=int(32 * s),
+                      radius=int(8 * s), font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(0, 8))
+        RoundedButton(row, text="浏览...", command=do_pick,
+                      variant="subtle", width=int(90 * s), height=int(32 * s),
+                      radius=int(8 * s), font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(0, 8))
+        RoundedButton(row, text="测试连接", command=do_test,
+                      variant="subtle", width=int(100 * s), height=int(32 * s),
+                      radius=int(8 * s), font=(self.font_family, 10)).pack(side=tk.LEFT)
+
+        def do_save():
+            try:
+                save_dsh_settings(enabled_var.get(), str(cli_entry.get() or "").strip())
+                self._ui(lambda: self.show_bubble_text("(relaxed) 记下了", "relaxed", status=True))
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                win.destroy()
+            except Exception as e:
+                log.warning("保存 DSH 设置失败: %s", e)
+                show_status("保存失败：%s" % e, False)
+
+        def do_cancel():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        RoundedButton(btn_frame, text="保存", command=do_save, variant="primary",
+                      width=int(120 * s), height=int(38 * s), radius=int(9 * s),
+                      font=(self.font_family, 11, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        RoundedButton(btn_frame, text="取消", command=do_cancel, variant="subtle",
+                      width=int(100 * s), height=int(38 * s), radius=int(9 * s),
+                      font=(self.font_family, 11)).pack(side=tk.LEFT)
+
+        render_switch()
+        do_detect()
 
     def open_voice_settings(self):
         """🎤 语音识别设置：免唤醒窗口（0 = 关闭）+ 按键说话（PTT）"""
