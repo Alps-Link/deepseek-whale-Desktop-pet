@@ -740,7 +740,7 @@ def load_tts_config():
     """加载 TTS 状态（开关/模式/语言/音色），避免每次启动重新设置"""
     data = _get_section("tts")
     mode = data.get("mode", "volc")
-    if mode not in ("volc", "edge"):
+    if mode not in ("volc", "edge", "deepseek"):
         mode = "volc"
     volc_lang = str(data.get("volc_lang", "") or "").lower()
     if volc_lang not in ("zh", "en", "ja"):
@@ -754,6 +754,12 @@ def load_tts_config():
         edge_voice = EDGE_VOICE_DEFAULT.get(edge_lang) or EDGE_VOICE_TABLE[edge_lang][0][1]
     edge_proxy = str(data.get("edge_proxy", "") or "").strip() or EDGE_PROXY_AUTO
     volc_cluster = str(data.get("volc_cluster", "") or "").strip() or "auto"
+    ds_voice = str(data.get("deepseek_voice", "") or "").strip() or DEEPSEEK_TTS_VOICE_DEFAULT
+    if ds_voice not in [v for v, _n in DEEPSEEK_TTS_VOICES]:
+        ds_voice = DEEPSEEK_TTS_VOICE_DEFAULT
+    ds_lang = str(data.get("deepseek_lang", "") or "").lower()
+    if ds_lang not in ("zh", "en", "ja"):
+        ds_lang = "zh"
     return {
         "enabled": bool(data.get("enabled", False)),
         "mode": mode,
@@ -763,11 +769,16 @@ def load_tts_config():
         "edge_voice": edge_voice,
         "edge_proxy": edge_proxy,
         "volc_cluster": volc_cluster,
+        "deepseek_voice": ds_voice,
+        "deepseek_lang": ds_lang,
+        "deepseek_api_key": str(data.get("deepseek_api_key", "") or "").strip(),
     }
 
 def save_tts_config(enabled=None, mode=None, japanese=None,
                     volc_lang=None, edge_lang=None, edge_voice=None,
-                    edge_proxy=None, volc_cluster=None):
+                    edge_proxy=None, volc_cluster=None,
+                    deepseek_voice=None, deepseek_api_key=None,
+                    deepseek_lang=None):
     """只写传入的字段，其余保持原值（同节的 api_key / speaker_id 一律保留）"""
     sec = _get_section("tts")
     if enabled is not None:
@@ -786,6 +797,12 @@ def save_tts_config(enabled=None, mode=None, japanese=None,
         sec["edge_proxy"] = str(edge_proxy).strip() or EDGE_PROXY_AUTO
     if volc_cluster is not None:
         sec["volc_cluster"] = str(volc_cluster).strip() or "auto"
+    if deepseek_voice is not None:
+        sec["deepseek_voice"] = deepseek_voice
+    if deepseek_lang is not None:
+        sec["deepseek_lang"] = deepseek_lang
+    if deepseek_api_key is not None:
+        sec["deepseek_api_key"] = str(deepseek_api_key).strip()
     sec["japanese"] = (sec.get("volc_lang") == "ja")  # 旧键跟着走，别的版本读它也不会错
     _update_section("tts", sec)
 
@@ -1679,7 +1696,12 @@ READING_CONFIG_FILE = os.path.join(CONFIG_DIR, "reading_config.json")
 def load_chats():
     return load_json_file(CHATS_LOG_FILE, [])
 
-TTS_MODE_NAMES = {"volc": "声音复刻", "edge": "Edge"}
+TTS_MODE_NAMES = {"volc": "声音复刻", "edge": "Edge", "deepseek": "DeepSeek"}
+# 11/15：DeepSeek 原生 TTS（11/13 上线的全家桶应用 API 里的独立接口）
+DEEPSEEK_TTS_URL = "https://api.deepseek.com/v1/tools/tts"
+DEEPSEEK_TTS_VOICES = (("stella", "海星（女声）"),)   # 11/15 用户要求删掉男声 tide
+DEEPSEEK_TTS_VOICE_DEFAULT = "stella"
+DEEPSEEK_TTS_PRICE = 3.0 / 10000   # 刊例 3 元/万"计费字符"（汉字算 2 个字符）
 
 # ---------- 形象转换：让她自己做点事（模型自带动作）----------
 # 索引对应 live2d_viewer/model/c_0120.model3.json 里 Action 组的顺序
@@ -3909,7 +3931,12 @@ class DesktopPet:
         self.tts_volc_cluster = tts_cfg["volc_cluster"]  # 火山集群：auto=按音色 ID 判 / 显式覆盖
         self.tts_api_key = load_tts_api_key() or os.environ.get("VOLC_TTS_API_KEY", "")
         self.tts_speaker_id = load_tts_speaker_id() or os.environ.get("VOLC_TTS_SPEAKER_ID", "")
-        self.tts_mode = tts_cfg["mode"]  # "volc" 或 "edge"
+        self.tts_deepseek_voice = tts_cfg["deepseek_voice"]   # DeepSeek 原生 TTS 音色（只有女声）
+        self.tts_deepseek_lang = tts_cfg["deepseek_lang"]     # zhen 区语言：zh/en/ja（非中文先翻译再念）
+        # DeepSeek TTS 的 key：自己没配就用文本模型的 key（只要它是 DeepSeek 的）
+        self.tts_deepseek_key = (tts_cfg.get("deepseek_api_key") or ""
+                                 or (self.text_api_key if "deepseek" in str(self.text_base_url).lower() else ""))
+        self.tts_mode = tts_cfg["mode"]  # "volc" / "edge" / "deepseek"
 
         self.api_lock = threading.Lock()
         self.api_busy = False
@@ -4755,6 +4782,27 @@ class DesktopPet:
                 time.sleep(TTS_FADE_STEP_MS / 1000.0)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _fix_wav_header(path):
+        """DeepSeek 返回的 wav 头里 RIFF/data 长度是 0xFFFFFFFF（流式占位）。
+
+        SDL 能按文件长度自己算，但别的播放器/工具会读成"8 万秒"；这里按实际字节改回来。
+        """
+        try:
+            size = os.path.getsize(path)
+            if size < 44:
+                return
+            with open(path, "r+b") as fh:
+                head = fh.read(44)
+                if not head.startswith(b"RIFF") or head[36:40] != b"data":
+                    return
+                fh.seek(4)
+                fh.write((size - 8).to_bytes(4, "little"))
+                fh.seek(40)
+                fh.write((size - 44).to_bytes(4, "little"))
+        except Exception as e:
+            log.debug("修 wav 头失败: %s", e)
 
     def _play_tts_file(self, temp_file):
         """在**她自己的声道**上播一段音频并等它播完。
@@ -6479,6 +6527,8 @@ class DesktopPet:
             return
         if self.tts_mode == "edge":
             return self._tts_play_edge(chinese_text, refresh_voice)
+        if self.tts_mode == "deepseek":
+            return self._tts_play_deepseek(chinese_text, refresh_voice)
         # 火山引擎声音复刻 TTS
         api_key = self.tts_api_key
         speaker_id = self.tts_speaker_id
@@ -6667,6 +6717,86 @@ class DesktopPet:
                     self._start_pending_music()  # TTS 说完：启动挂起的音乐（若有）
 
         threading.Thread(target=_play_edge, daemon=True).start()
+
+    def _tts_play_deepseek(self, chinese_text, refresh_voice=False):
+        """DeepSeek 原生 TTS（11/13 上线的 /v1/tools/tts）：返回 wav，走她的专属声道。"""
+        api_key = getattr(self, "tts_deepseek_key", "") or ""
+        if not api_key:
+            log.warning("DeepSeek TTS 未配置 API Key，跳过语音播放")
+            return
+        clean = re.sub(r"[（(][^）)]*[）)]", "", chinese_text).strip()
+        if not clean:
+            return
+        voice = getattr(self, "tts_deepseek_voice", DEEPSEEK_TTS_VOICE_DEFAULT) or DEEPSEEK_TTS_VOICE_DEFAULT
+        lang = getattr(self, "tts_deepseek_lang", "zh") or "zh"
+        tts_text = clean
+        if lang in ("en", "ja"):
+            translated = self._translate_for_tts(clean, lang)
+            if translated:
+                tts_text = translated
+            else:
+                log.warning("TTS 翻译失败（%s），改用中文原文朗读", TTS_LANG_NAMES.get(lang, lang))
+        # 计费字符：汉字算 2、其他算 1（官方口径）
+        _billed = sum(2 if ("\u4e00" <= ch <= "\u9fff") else 1 for ch in tts_text)
+        log.info("DeepSeek TTS(%s, %d 计费字符≈¥%.4f): %s", voice, _billed,
+                 _billed * DEEPSEEK_TTS_PRICE, tts_text[:40])
+
+        def _play_ds():
+            if not self._tts_lock.acquire(timeout=1):
+                log.warning("TTS 播放被跳过：上一条语音仍在播放")
+                return
+            temp_file = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                    temp_file = tf.name
+                with requests.post(DEEPSEEK_TTS_URL,
+                                   headers={"Authorization": "Bearer " + api_key},
+                                   json={"text": tts_text, "voice_id": voice, "format": "wav",
+                                         "filter_markdown": True},
+                                   stream=True, timeout=(10, 120)) as resp:
+                    if resp.status_code != 200:
+                        log.error("DeepSeek TTS 失败: http=%s body=%s", resp.status_code,
+                                  (resp.text or "")[:200].replace(chr(10), " "))
+                        return
+                    with open(temp_file, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=16384):
+                            if chunk:
+                                fh.write(chunk)
+                self._fix_wav_header(temp_file)
+                if not os.path.exists(temp_file) or os.path.getsize(temp_file) < 1000:
+                    log.error("DeepSeek TTS 返回的音频异常（%d 字节）",
+                              os.path.getsize(temp_file) if os.path.exists(temp_file) else 0)
+                    return
+                self._music_duck_for_tts()
+                if self.stt is not None and self.voice_on:
+                    self.stt.set_muted(True)
+                self._play_tts_file(temp_file)
+            except Exception as e:
+                log.error("DeepSeek TTS 播放错误: %s", e)
+            finally:
+                try:
+                    if self._tts_channel is not None:
+                        try:
+                            self._tts_channel.stop()
+                        except Exception:
+                            pass
+                    self._music_finish_tts(self._music_duck is not None)
+                    if self.stt is not None and self.voice_on:
+                        self.stt.set_muted(False)
+                    if refresh_voice:
+                        self._on_output_finished(True, from_tts=True)
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.warning("DeepSeek TTS 收尾出错（锁照常释放）: %s", e)
+                finally:
+                    self._tts_lock.release()
+                    self._start_pending_music()
+
+        threading.Thread(target=_play_ds, daemon=True).start()
 
     # ---------- 事件气泡 ----------
     def _add_topic_open_turn(self, context):
@@ -12384,6 +12514,11 @@ OCR文字：
 
     def toggle_tts_speak(self):
         """🔊 语音朗读开关（TTS）：菜单在「🎮 模式」里，音色与语言在设置窗里选"""
+        if not self.tts_enabled and self.tts_mode == "deepseek" and not getattr(self, "tts_deepseek_key", ""):
+            self.root.after(0, lambda: messagebox.showwarning(
+                "未配置 DeepSeek API Key", "DeepSeek TTS 用文本模型那把 DeepSeek key；\n"
+                "如果文本模型不是 DeepSeek，请到 设置 → 语音 → DeepSeek 里单独填。"))
+            return
         if not self.tts_enabled and self.tts_mode == "volc":
             if not self.tts_api_key:
                 self.root.after(0, lambda: messagebox.showwarning(
@@ -12493,6 +12628,8 @@ OCR文字：
                 return False
             if self.tts_mode == "edge":
                 return bool(EDGE_TTS_IMPORTED)
+            if self.tts_mode == "deepseek":
+                return bool(getattr(self, "tts_deepseek_key", ""))
             return bool(self.tts_api_key and self.tts_speaker_id)
         except Exception:
             return False
@@ -12525,7 +12662,28 @@ OCR文字：
                 return
             temp_file = None
             try:
-                if provider == "edge":
+                if provider == "deepseek":
+                    key = getattr(self, "tts_deepseek_key", "") or ""
+                    if not key:
+                        log.warning("试听失败：DeepSeek TTS 未配置 API Key")
+                        return
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                        temp_file = tf.name
+                    with requests.post(DEEPSEEK_TTS_URL,
+                                       headers={"Authorization": "Bearer " + key},
+                                       json={"text": text, "voice_id": voice or DEEPSEEK_TTS_VOICE_DEFAULT,
+                                             "format": "wav", "filter_markdown": True},
+                                       stream=True, timeout=(10, 120)) as r0:
+                        if r0.status_code != 200:
+                            log.error("试听失败（DeepSeek）: http=%s %s", r0.status_code,
+                                      (r0.text or "")[:160].replace(chr(10), " "))
+                            return
+                        with open(temp_file, "wb") as fh0:
+                            for chunk in r0.iter_content(chunk_size=16384):
+                                if chunk:
+                                    fh0.write(chunk)
+                    self._fix_wav_header(temp_file)
+                elif provider == "edge":
                     if not EDGE_TTS_IMPORTED:
                         log.warning("试听失败：edge-tts 不可用")
                         return
@@ -12600,7 +12758,9 @@ OCR文字：
         win, frame = self._make_card_window("TTS 音色与语言", 470, 500)
         s = self._dpi_scale
         st = {"mode": self.tts_mode, "volc_lang": self.tts_volc_lang,
-              "edge_lang": self.tts_edge_lang, "edge_voice": self.tts_edge_voice}
+              "edge_lang": self.tts_edge_lang, "edge_voice": self.tts_edge_voice,
+              "deepseek_voice": getattr(self, "tts_deepseek_voice", DEEPSEEK_TTS_VOICE_DEFAULT),
+              "deepseek_lang": getattr(self, "tts_deepseek_lang", "zh")}
 
         # 底部按钮先 pack（内容变高时收尾按钮不被挤走）
         btn_frame = tk.Frame(frame, bg=DIALOG_BG)
@@ -12614,17 +12774,27 @@ OCR文字：
                 return
             try:
                 save_tts_config(enabled=self.tts_enabled, mode=st["mode"], volc_lang=st["volc_lang"],
-                                edge_lang=st["edge_lang"], edge_voice=st["edge_voice"])
+                                edge_lang=st["edge_lang"], edge_voice=st["edge_voice"],
+                                deepseek_voice=st["deepseek_voice"],
+                                deepseek_lang=st["deepseek_lang"])
             except Exception as e:
                 log.warning("保存 TTS 设置失败: %s", e)
             self.tts_mode = st["mode"]
             self.tts_volc_lang = st["volc_lang"]
             self.tts_edge_lang = st["edge_lang"]
             self.tts_edge_voice = st["edge_voice"]
+            self.tts_deepseek_voice = st["deepseek_voice"]
+            self.tts_deepseek_lang = st["deepseek_lang"]
             refresh_cur()
-            lang_now = st["volc_lang"] if st["mode"] == "volc" else st["edge_lang"]
-            messagebox.showinfo("成功", "TTS 设置已保存\n当前使用：%s · %s" %
-                                ("声音复刻" if st["mode"] == "volc" else "Edge", TTS_LANG_NAMES[lang_now]))
+            if st["mode"] == "deepseek":
+                _v = next((n for v, n in DEEPSEEK_TTS_VOICES if v == st["deepseek_voice"]),
+                          st["deepseek_voice"])
+                messagebox.showinfo("成功", "TTS 设置已保存\n当前使用：DeepSeek 原生 · %s · %s" %
+                                    (_v, TTS_LANG_NAMES.get(st["deepseek_lang"], "中文")))
+            else:
+                lang_now = st["volc_lang"] if st["mode"] == "volc" else st["edge_lang"]
+                messagebox.showinfo("成功", "TTS 设置已保存\n当前使用：%s · %s" %
+                                    ("声音复刻" if st["mode"] == "volc" else "Edge", TTS_LANG_NAMES[lang_now]))
             win.destroy()
 
         RoundedButton(btn_frame, text="保存", command=save, width=int(120 * s), height=int(36 * s),
@@ -12654,6 +12824,13 @@ OCR文字：
                 desc = "🔥 火山声音复刻 · %s" % TTS_LANG_NAMES.get(self.tts_volc_lang, "中文")
                 if not (self.tts_api_key and self.tts_speaker_id):
                     desc += "（未配置 API Key / Speaker ID）"
+            elif self.tts_mode == "deepseek":
+                vname = next((n for v, n in DEEPSEEK_TTS_VOICES
+                              if v == st["deepseek_voice"]), st["deepseek_voice"])
+                desc = "🀄 DeepSeek 原生 TTS · %s · %s" % (
+                    TTS_LANG_NAMES.get(st["deepseek_lang"], "中文"), vname)
+                if not (getattr(self, "tts_deepseek_key", "") or ""):
+                    desc += "（未配置 API Key）"
             else:
                 vname = next((n for n, v in EDGE_VOICE_TABLE.get(self.tts_edge_lang, [])
                               if v == self.tts_edge_voice), self.tts_edge_voice)
@@ -12681,6 +12858,8 @@ OCR文字：
             def pick(c):
                 if kind == "volc":
                     st["volc_lang"] = c
+                elif kind == "deepseek":
+                    st["deepseek_lang"] = c
                 else:
                     st["edge_lang"] = c
                     if not edge_voice_valid(c, st["edge_voice"]):
@@ -12692,6 +12871,9 @@ OCR文字：
             if kind == "volc":
                 lang_row(page, ("zh", "en", "ja"), lambda: st["volc_lang"], pick)
                 tip = "非中文时，她会把要说的话翻译成该语言再念（气泡和聊天记录仍是中文）。"
+            elif kind == "deepseek":
+                lang_row(page, ("zh", "en", "ja"), lambda: st["deepseek_lang"], pick)
+                tip = "非中文时，她会把要说的话翻译成该语言再念（气泡和聊天记录仍是中文）。"
             else:
                 lang_row(page, ("zh", "en"), lambda: st["edge_lang"], pick)
                 tip = "选英文时先翻译成英文再用英文音色念；翻译失败会退回中文音色念原文。"
@@ -12701,7 +12883,25 @@ OCR文字：
             tk.Frame(page, bg=CARD_BORDER, height=1).pack(fill=tk.X, pady=8)
             tk.Label(page, text="音色", font=(self.font_family, 11, "bold"), fg=TEXT_MAIN,
                      bg=DIALOG_BG).pack(anchor='w', pady=(0, 2))
-            if kind == "volc":
+            if kind == "deepseek":
+                vrow = tk.Frame(page, bg=DIALOG_BG)
+                vrow.pack(anchor='w', pady=(2, 0))
+                for vid, vname in DEEPSEEK_TTS_VOICES:
+                    RoundedButton(vrow, text=vname, width=int(130 * s), height=int(30 * s),
+                                  radius=int(8 * s), font=(self.font_family, 10),
+                                  variant="primary" if vid == st["deepseek_voice"] else "subtle",
+                                  command=lambda v=vid: (st.__setitem__("deepseek_voice", v),
+                                                         build_page("deepseek"))
+                                  ).pack(side=tk.LEFT, padx=(0, 6))
+                _key = getattr(self, "tts_deepseek_key", "") or ""
+                tk.Label(page, text=("API Key：已就绪（%s…）" % _key[:6]) if _key else
+                         "API Key：未配置 —— 文本模型是 DeepSeek 时会自动复用它的 key",
+                         font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                         justify='left').pack(anchor='w', pady=(6, 2))
+                tk.Label(page, text="计费约 ¥0.042/句（≤70 汉字），限时 5 折约 ¥0.021。没有声音复刻。",
+                         font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                         justify='left', wraplength=int(400 * s)).pack(anchor='w')
+            elif kind == "volc":
                 sid = self.tts_speaker_id
                 shown = (sid[:4] + "…" + sid[-2:]) if sid else "未配置"
                 tk.Label(page, text="声音复刻音色：%s\n（音色属于你的账号，在 API 密钥里换）" % shown,
@@ -12722,13 +12922,21 @@ OCR文字：
                                   ).pack(side=tk.LEFT, padx=(0, 6))
 
             tk.Frame(page, bg=CARD_BORDER, height=1).pack(fill=tk.X, pady=8)
-            RoundedButton(page, text="▶ 试听",
-                          command=(lambda: self._tts_preview("volc", st["volc_lang"])) if kind == "volc"
-                          else (lambda: self._tts_preview("edge", st["edge_lang"], st["edge_voice"])),
+            if kind == "deepseek":
+                _pv = lambda: self._tts_preview("deepseek", st["deepseek_lang"], st["deepseek_voice"])
+            elif kind == "volc":
+                _pv = lambda: self._tts_preview("volc", st["volc_lang"])
+            else:
+                _pv = lambda: self._tts_preview("edge", st["edge_lang"], st["edge_voice"])
+            RoundedButton(page, text="▶ 试听", command=_pv,
                           width=int(96 * s), height=int(32 * s), radius=int(8 * s),
                           font=(self.font_family, 10), variant="primary").pack(anchor='w')
 
         def set_mode(kind):
+            if kind == "deepseek" and not (getattr(self, "tts_deepseek_key", "") or ""):
+                messagebox.showwarning("未配置 DeepSeek API Key",
+                                       "DeepSeek 原生 TTS 需要 DeepSeek 的 API Key。\n"
+                                       "文本模型是 DeepSeek 时会自动复用；否则要先在 API 密钥里配好。")
             if kind == "volc" and not (self.tts_api_key and self.tts_speaker_id):
                 messagebox.showwarning("未配置声音复刻",
                                        "火山区还没配置 API Key / Speaker ID，选了也不会出声。\n"
@@ -12737,7 +12945,8 @@ OCR文字：
             build_page(kind)
             refresh_cur()
 
-        for kind, label in (("volc", "🔥 火山声音复刻"), ("edge", "🎧 Edge TTS")):
+        for kind, label in (("volc", "🔥 火山声音复刻"), ("edge", "🎧 Edge TTS"),
+                            ("deepseek", "🀄 DeepSeek 原生")):
             b = RoundedButton(tab_row, text=label, width=int(150 * s), height=int(34 * s),
                               radius=int(8 * s), font=(self.font_family, 10),
                               command=lambda k=kind: set_mode(k))
