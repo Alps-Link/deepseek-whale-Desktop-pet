@@ -58,7 +58,15 @@ class MemoryDB:
                 last_used_at TEXT,
                 user_hits INTEGER,
                 last_user_hit_at TEXT,
-                last_injected_at TEXT
+                last_injected_at TEXT,
+                level TEXT,
+                weight REAL,
+                links TEXT,
+                evidence_dates TEXT,
+                invalid_at TEXT,
+                superseded_by TEXT,
+                tension INTEGER,
+                tension_dates TEXT
             )
         """)
         # 兼容旧库：缺列时补列（性格画像的观察内容/描述/证据列表）
@@ -83,6 +91,15 @@ class MemoryDB:
             ("user_hits", "ALTER TABLE memories ADD COLUMN user_hits INTEGER"),
             ("last_user_hit_at", "ALTER TABLE memories ADD COLUMN last_user_hit_at TEXT"),
             ("last_injected_at", "ALTER TABLE memories ADD COLUMN last_injected_at TEXT"),
+            # 11/14：印象卡（v2）—— level 分层 / weight 加法强化 / links 指回事件 / 改口痕迹
+            ("level", "ALTER TABLE memories ADD COLUMN level TEXT"),
+            ("weight", "ALTER TABLE memories ADD COLUMN weight REAL"),
+            ("links", "ALTER TABLE memories ADD COLUMN links TEXT"),
+            ("evidence_dates", "ALTER TABLE memories ADD COLUMN evidence_dates TEXT"),
+            ("invalid_at", "ALTER TABLE memories ADD COLUMN invalid_at TEXT"),
+            ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+            ("tension", "ALTER TABLE memories ADD COLUMN tension INTEGER"),
+            ("tension_dates", "ALTER TABLE memories ADD COLUMN tension_dates TEXT"),
         ):
             if _col not in cols:
                 conn.execute(_ddl)
@@ -131,6 +148,10 @@ class MemoryDB:
             # 10/28：about_user 单独一条列表（界面上归性格画像）
             for note in (data.get("profile", {}).get("user_notes") or []):
                 self._insert_note(conn, note, now, old_vec.get(note.get("id")))
+
+            # 11/14：印象卡（v2 的 L2 层）
+            for imp in (data.get("impressions") or []):
+                self._insert_impression(conn, imp, now, old_vec.get(imp.get("id")))
 
             conn.commit()
 
@@ -215,6 +236,38 @@ class MemoryDB:
             )
         )
 
+    def _insert_impression(self, conn, item, now, embedding_blob=None):
+        """印象卡：一句话看法 + 它指向的事件 + 分层/权重/改口痕迹（v2，11/14）"""
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memories
+            (id, type, content, embedding, importance, access_count, last_accessed_at,
+             evidence_count, archived, archived_at, starred, starred_at, source, created_at,
+             kind, used_count, last_used_at, user_hits, last_user_hit_at, last_injected_at,
+             level, weight, links, evidence_dates, invalid_at, superseded_by,
+             tension, tension_dates)
+            VALUES (?, 'impression', ?, ?, ?, 0, ?, ?, 0, NULL, 0, NULL, '', ?, 'impression',
+                    0, NULL, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.get("id") or str(uuid.uuid4())[:8],
+                item.get("text", ""),
+                embedding_blob,
+                float(item.get("importance", 0.6)),
+                item.get("updated_at", now),
+                int(item.get("evidence_count", 1)),
+                item.get("created_at", now),
+                item.get("level") or "normal",
+                float(item.get("weight", 1.0)),
+                json.dumps(item.get("links") or [], ensure_ascii=False),
+                json.dumps(item.get("evidence_dates") or [], ensure_ascii=False),
+                item.get("invalid_at"),
+                item.get("superseded_by"),
+                int(item.get("tension") or 0),
+                json.dumps(item.get("tension_dates") or [], ensure_ascii=False),
+            )
+        )
+
     def _insert_trait(self, conn, item, now, embedding_blob=None):
         conn.execute(
             """
@@ -252,6 +305,7 @@ class MemoryDB:
             traits = []
             notes = []
             user_notes = []
+            impressions = []
             relation = None
 
             for row in rows:
@@ -267,6 +321,8 @@ class MemoryDB:
                         user_notes.append(_n)
                     else:
                         notes.append(_n)
+                elif rtype == "impression":
+                    impressions.append(self._row_to_impression(row))
                 elif rtype == "profile":
                     if row["content"] == "__relation__":
                         relation = {
@@ -280,6 +336,7 @@ class MemoryDB:
             return {
                 "topics": topics,
                 "events": events,
+                "impressions": impressions,
                 "profile": {"traits": traits, "relation": relation,
                             "notes": notes, "user_notes": user_notes},
             }
@@ -325,6 +382,34 @@ class MemoryDB:
             "user_hits": (row["user_hits"] if "user_hits" in row.keys() else 0) or 0,
             "last_user_hit_at": row["last_user_hit_at"] if "last_user_hit_at" in row.keys() else None,
             "last_injected_at": row["last_injected_at"] if "last_injected_at" in row.keys() else None,
+        }
+
+    def _row_to_impression(self, row):
+        def _arr(name):
+            try:
+                raw = row[name] if name in row.keys() else None
+                parsed = json.loads(raw) if raw else []
+                return [str(x) for x in parsed] if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return {
+            "id": row["id"],
+            "who": row["source"] if ("source" in row.keys() and row["source"] in ("him", "her", "us")) else "him",
+            "text": row["content"] or "",
+            "level": (row["level"] if "level" in row.keys() else None) or "normal",
+            "weight": float(row["weight"]) if ("weight" in row.keys() and row["weight"] is not None) else 1.0,
+            "links": _arr("links"),
+            "evidence_dates": _arr("evidence_dates"),
+            "importance": row["importance"],
+            "evidence_count": row["evidence_count"],
+            "used_count": (row["used_count"] if "used_count" in row.keys() else 0) or 0,
+            "last_used_at": row["last_used_at"] if "last_used_at" in row.keys() else None,
+            "created_at": row["created_at"],
+            "updated_at": row["last_accessed_at"],
+            "invalid_at": row["invalid_at"] if "invalid_at" in row.keys() else None,
+            "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+            "tension": int(row["tension"]) if ("tension" in row.keys() and row["tension"] is not None) else 0,
+            "tension_dates": _arr("tension_dates"),
         }
 
     def _row_to_note(self, row):
