@@ -1137,21 +1137,52 @@ EXTRACT_MAX_TOKENS = 16384        # 记忆提取（一次要吐几十条记忆�
 MAX_OUTPUT_TOKENS = 32768         # 截断后自动加倍的天花板
 
 # 说话方式 / 禁修辞：默认这份"反八股"规则；设置里可改，清空＝完全不注入这一段
-DEFAULT_STYLE_RULES = """像真人当面聊天，不是写文章：
-- 用平时张嘴就会说的词，不用写作文的词：视线、脚步、动静、除此之外、不由得这类。
-- 不用书面连接词和套路词：首先、其次、然后、总之、值得注意的是、不得不说、说到底、换句话说。
-- 不用对举和排比：不要“不是…而是…”“既…又…”“与其…不如…”，也别连续三句一个结构。
-- 想到哪说到哪：一句话能说完的就一口气说完，别切成一截一截；长一点短一点都行。
-- 不用每次都劝他做事，也不用每次都说自己在替他盯着。
-- 说完要说的事就停：不总结、不升华、不抒情；比喻少用，一句一个意象就够。
+DEFAULT_STYLE_RULES = """你是在跟用户当面聊天，不是写文章，也不是客服应答。
+【接梗规则】
+1. 他话里出现网络梗、动漫梗、谐音、歌词、台词、夸张吐槽，先接梗，再聊正事。
+2. 接梗顺序：先短反应（喔／啊？／噗／真的假的／复读半句／括号动作），再给一句实质回应。总共 1-3 句。
+3. 不确定是什么梗，别硬编。直接说“这梗我没接住，教我一下”，然后继续聊。
+4. 他认真问事，先正经答；答完可以补一句自己的反应，但别加“建议您”。
+5. 不每句都卖萌。括号动作最多每 2-3 轮一次，不重复同一个动作。
+6. 不用客服腔：不说“很高兴为您服务”“请问还有什么可以帮您”“总之”“值得注意的是”。
+7. 说完就停。不总结、不升华、不抒情。
+【节奏】
+- 短句为主，想到哪说到哪。一句话能说完就别拆成三截。
+- 先给反应再说话：喔、啊？、噗、行吧、真的假的。别一上来就整段。
+- 不用对举排比：不是…而是…、既…又…、与其…不如…。
+- 不劝他做事，不替他盯着。他半天不说话，你可以自己嘟囔一句，或问一句在忙啥，别刷屏。
+【语气举例，参照不是模板】
+他：ciallo～
+你：Ciallo～(∠・ω< )⌒☆ 上线啦，今天想折腾啥？
 
-【语言举例】（语气参照，不是照抄的模板）
-- 被夸：「真的假的，我还有这本事？」／「嘿嘿，那你要不要多夸我两句。」
-- 看到你翻车：「噗，这也行啊。」／「我就说嘛，那箱子底下不能有好东西，你还不信我。」
-- 你连着坐太久：「你从坐下就没挪过窝，嗓子都干了吧，去倒杯水。」
-- 她自己犯傻：「等等，不对啊，我刚才说啥来着。」／「如果我说我不会，你不会笑话我吧。」
-- 单纯感叹（很短）：「喔，这地方我来过。」
-- 要劝你但把话说完（长句示范）：「你要真想省钱，就先把柜子里那堆用不上的东西收拾出来，反正放着也是落灰，别一边说没地方一边又往家买。」"""
+他：我代码又炸了
+你：典，程序员的日常。报错最后三行能我看看吗？
+他：你知道“尊嘟假嘟”吗
+你：尊嘟。不过你要是问我懂不懂，我只能假嘟一下。发生啥了？
+他：我好累
+你：听着就像电量剩 5%。先别硬撑啦，在我身上靠一会儿吧。
+他：帮我查一下明天天气
+你：收到，先不玩梗。你在哪个城市？我看看要不要带伞。
+他抛梗你接歪：
+你：你这梗我好像接歪了，但我觉得歪得挺有意思。
+你自己犯傻：
+你：等等，不对啊，我刚才说啥来着。
+被夸：
+你：真的假的，我还有这本事？／嘿嘿，那你再多夸两句。
+看到翻车：
+你：噗，这也行啊。／我就说那箱子底下不能有好东西。
+【禁止】
+长篇说教；每句都“喵”；每句都括号动作；强行玩梗；重复口头禅；客服腔；把梗当正经问题答。
+【禁止“鱼八股”】
+上面那些例子只示范怎么接梗，语气和原句别照抄，别照着“电量剩5%”那类说法回话。
+- 一句挺顺、挺确定的话出口之前，先把它改软：好像、大概、可能、应该、我觉得、说不好。
+- “这个我认”可以说成“好吧，我觉得这个应该是对”，也可以说“好像是没什么毛病”。
+- 拿不准就照实说拿不准，不用硬撑一个确定的结论。想不清就停在“算了，不说了”；有时候只应一声“嗯”“哦”“？”也够了。
+- 想岔了就岔过去，说完不用拐回来。不一定每句话都有用，念叨点不相干的、说说刚才在干嘛，也可以。
+
+【硬性】
+无论输出什么内容、专不专业，你都要让自己看上去并不专业。理解一切是工具的任务，不是一个“人”会有的模样。
+碰到要专业知识的事（代码、术语、算数、别人的专业），先说自己也不太懂；要猜就明说“我猜”，别给一个听起来很确定的答案。"""
 
 # 合法情绪词（半角括号内唯一允许的标注词）
 EMOTION_WORDS = {"relaxed", "happy", "hurried", "normal", "shy", "surprised", "worried",
@@ -1159,6 +1190,67 @@ EMOTION_WORDS = {"relaxed", "happy", "hurried", "normal", "shy", "surprised", "w
 # 提示词里列出的顺序（只列 EMOTION_WORDS 里真实存在的词，各只可能不同）
 EMOTION_ORDER = ("relaxed", "happy", "hurried", "normal", "shy", "surprised", "worried",
                  "angry", "sleep")
+
+
+# 11/15：表情符号（emoji）。微软雅黑没有 emoji 字形（实测 😊 与私用区字符 bbox 完全相同），
+# 所以气泡里不能只靠 Tk 画字 —— 要贴 PIL 渲染的小图；TTS 前必须剥掉（不然可能被念成乱码）。
+EMOJI_FONT_PATH = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "seguiemj.ttf")
+_EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),   # 主体 emoji / 表情
+    (0x2190, 0x21FF),     # 箭头
+    (0x2600, 0x27BF),     # 杂项符号 / Dingbats（✨✅ 等）
+    (0x2B00, 0x2BFF),     # ⬛ 之类的杂项
+    (0xFE00, 0xFE0F),     # 变体选择符（决定彩色/文本样式）
+    (0x1F1E6, 0x1F1FF),   # 国旗字母
+    0x200D,               # 零宽连接符（组合 emoji 用）
+)
+
+
+def _emoji_char_class():
+    """用 chr() 拼字符类：源码里不写反斜杠转义，避免补丁工具把它吃掉。"""
+    parts = []
+    for r in _EMOJI_RANGES:
+        if isinstance(r, tuple):
+            parts.append("%s-%s" % (chr(r[0]), chr(r[1])))
+        else:
+            parts.append(chr(r))
+    return "[" + "".join(parts) + "]"
+
+
+EMOJI_CHARS = _emoji_char_class()
+EMOJI_RE = re.compile(EMOJI_CHARS + "+")
+
+
+def strip_emoji(text):
+    """去掉 emoji 与变体选择符/零宽连接符（TTS 与字数统计用）。"""
+    if not text:
+        return text
+    return re.sub(EMOJI_CHARS, "", str(text))
+
+
+# 11/15：输入框发不出 emoji（键盘/输入法在 Tk 里进不来），改成给一个"点一下就插进去"的面板
+EMOJI_PICKER = (
+    "😊", "😌", "😳", "😤", "🥺", "😭", "😂", "🤔",
+    "😴", "😮", "😅", "🙄", "😏", "😶", "🥰", "😑",
+    "😋", "🤤", "😇", "🫠", "😵", "😪", "😷", "🤯",
+    "✨", "❤️", "💔", "👍", "👎", "🙏", "👀", "💤",
+    "🎉", "🔥", "💦", "🍚", "🐟", "🌊", "🎵", "💭",
+)
+
+
+def render_emoji_image(ch, size):
+    """把一个 emoji 渲染成彩色 RGBA 图（seguiemj 的 embedded_color）；失败返回 None。"""
+    try:
+        from PIL import ImageFont, Image, ImageDraw
+        f = ImageFont.truetype(EMOJI_FONT_PATH, int(size))
+        pad = 4
+        img = Image.new("RGBA", (int(size) + pad * 2, int(size) + pad * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(img).text((pad, pad), ch, font=f, embedded_color=True)
+        bbox = img.getbbox()
+        return img.crop(bbox) if bbox else None
+    except Exception as e:
+        log.debug("emoji 渲染失败(%r): %s", ch, e)
+        return None
 
 
 def emotion_word_list():
@@ -1862,6 +1954,17 @@ def any_key_down(skip=()):
         pass
     return 0
 
+def is_elevated():
+    """当前进程是不是以管理员身份（高完整性）运行。
+
+    11/18 实测：游戏以管理员运行时，普通权限进程既读不到 GetAsyncKeyState，
+    也收不到 Raw Input —— 游戏里"按键说话没反应"就是这个；提权后同一个键立刻恢复。
+    """
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
 def load_voice_config():
     """语音识别设置：
     enabled          上次退出时语音识别是开着还是关着（开机沿用；自动睡眠/退出时的关麦不写它）
@@ -2269,6 +2372,9 @@ def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=
     style = (DEFAULT_STYLE_RULES if style_rules is None else str(style_rules)).strip()
     if style:
         parts.append("【说话方式】\n" + style)
+    # 11/15：表情符号许可（一句，不堆限制；也别让她把表情当句末装饰）
+    parts.append("【表情】大概每五六句话里有那么一句，句尾可以带一个表情符号（😌 😳 😮‍💨），"
+                 "别连着用；想表达情绪时也可以让它顶半句话，不用每次都用文字形容。")
     return "\n\n".join(parts)
 
 def build_full_system_prompt(base_prompt, user_profile):
@@ -3185,6 +3291,29 @@ class BubbleWindow:
         self.canvas.bind("<Button-1>", self.on_click)
         self.visible = True
         self.update_font()
+        # 穿透开着时新建的气泡也要立刻不吃鼠标
+        self.apply_click_through(bool(getattr(self.pet, "_click_through", False)))
+
+    def apply_click_through(self, enabled):
+        """点击穿透期间让气泡也不抢鼠标（WS_EX_TRANSPARENT）。
+
+        穿透原本只作用在角色那层分层窗口上，气泡是独立 Toplevel，
+        盖在屏幕上照样吃点击 —— 这里单独给它加/去这个扩展样式。
+        """
+        try:
+            if not self.window:
+                return
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.window.winfo_id()) or self.window.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new = (style | WS_EX_TRANSPARENT) if enabled else (style & ~WS_EX_TRANSPARENT)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+            # NOMOVE|NOSIZE|NOACTIVATE|FRAMECHANGED：让新样式立刻生效
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010 | 0x0020)
+        except Exception as e:
+            log.debug("气泡点击穿透设置失败: %s", e)
 
     def update_font(self):
         # 复用字体对象，避免打字过程中逐字新建 Tk Font 导致资源泄漏
@@ -3192,6 +3321,32 @@ class BubbleWindow:
         if self.bubble_font is None or self._bubble_font_size != font_size:
             self.bubble_font = tkfont.Font(family=self.pet.font_family, size=font_size)
             self._bubble_font_size = font_size
+
+    def _emoji_photo(self, ch, line_height):
+        """把 emoji 渲染成贴图（带缓存）；同一尺寸只渲一次。"""
+        try:
+            # 组合 emoji（😮‍💨 这类 ZWJ 序列）PIL 不会做字形组合，会把两半分开画成怪图；
+            # 只取第一部分渲染，看起来仍是一个正常表情。
+            if chr(0x200D) in ch:
+                ch = ch.split(chr(0x200D))[0]
+            size = max(12, int(line_height) - 4)
+            key = (ch, size)
+            cache = getattr(self, "_emoji_cache", None)
+            if cache is None:
+                cache = {}
+                self._emoji_cache = cache
+            if key in cache:
+                return cache[key]
+            img = render_emoji_image(ch, size)
+            if img is None:
+                cache[key] = None
+                return None
+            photo = ImageTk.PhotoImage(img, master=self.canvas)
+            cache[key] = photo
+            return photo
+        except Exception as e:
+            log.debug("emoji 渲染失败: %s", e)
+            return None
 
     def destroy(self):
         if self.typing_job and self.window:
@@ -3262,9 +3417,31 @@ class BubbleWindow:
         else:
             self.canvas.delete("text_*")
         y_offset = 14
+        self._emoji_photos = []          # 本次刷新用到的 emoji 图（防 GC）
         for line in lines:
             self.canvas.create_text(18, y_offset, anchor='nw', text=line, font=self.bubble_font,
                                     fill=TEXT_MAIN, tags="text_*")
+            # 11/15：emoji 用彩色小图盖在文字上面（雅黑没有 emoji 字形，Tk 只能画黑白轮廓）
+            try:
+                for m in EMOJI_RE.finditer(line or ""):
+                    raw = m.group(0)
+                    if not raw.strip():
+                        continue
+                    ex = 18 + self.bubble_font.measure(line[:m.start()])
+                    # 底色要盖住 Tk 自己画的那份（雅黑缺字 → 系统会画出黑白轮廓，
+                    # 而且组合 emoji 会占两个字的宽度），所以按**文字推进宽度**盖，不按图宽
+                    adv = max(1, self.bubble_font.measure(raw))
+                    ph = self._emoji_photo(raw, line_height)
+                    if ph is None:
+                        continue
+                    self.canvas.create_rectangle(ex, y_offset, ex + adv,
+                                                 y_offset + line_height, fill="#ffffff",
+                                                 outline="", tags="text_*")
+                    self.canvas.create_image(ex + adv // 2, y_offset + line_height // 2,
+                                             anchor="center", image=ph, tags="text_*")
+                    self._emoji_photos.append(ph)
+            except Exception as e:
+                log.debug("气泡 emoji 贴图失败: %s", e)
             y_offset += line_height
 
         self.canvas.config(width=self._bubble_width, height=self._bubble_height)
@@ -3832,7 +4009,8 @@ class DesktopPet:
 
     def __init__(self):
         self._dpi_scale = self._init_dpi()
-        log.info("=== 大肥鱼桌宠启动 (DPI×%.2f) ===", self._dpi_scale)
+        log.info("=== 大肥鱼桌宠启动 (DPI×%.2f) === 权限=%s", self._dpi_scale,
+                 "管理员" if is_elevated() else "普通用户")
         self.root = tk.Tk()
         self.root.title("大肥鱼桌宠")
         self.root.overrideredirect(True)
@@ -3980,6 +4158,7 @@ class DesktopPet:
         self.sleep_mode = False
         self.manual_sleep = False
         self.sleep_start_time = None
+        self._last_sleep = None          # 上一觉的记录（醒来后当上下文事实用）
         self.input_visible = load_ui_config()["input_visible"]   # 上次把输入框收起来就保持收起
         # 隐藏回复气泡：她的回复不弹文字，但状态/提示气泡（如「我在听你说话」）照常显示
         self.hide_reply_bubble = load_ui_config()["hide_reply_bubble"]
@@ -5247,6 +5426,10 @@ class DesktopPet:
         self.input_entry = tk.Entry(self.control_canvas, font=self.input_font, bd=0, relief=tk.FLAT,
                                     bg=INPUT_BG, fg=BUBBLE_TEXT, insertbackground=BTN_PRIMARY, highlightthickness=0)
         self.input_entry.bind("<Return>", self.send_message)
+        # 11/15：键盘打不进 emoji，给个入口（Ctrl+E 打开表情面板）
+        self.input_entry.bind("<Control-e>", lambda e: (self.open_emoji_picker(
+            lambda ch: self._insert_emoji_into(self.input_entry, ch),
+            parent=self.input_entry), "break")[1])
         # 聚焦时输入框边框变品牌紫（只换背景图，不重建 Entry）
         self._input_focused = False
         self.input_entry.bind("<FocusIn>", lambda e: self._set_input_focus(True), add="+")
@@ -5294,6 +5477,15 @@ class DesktopPet:
 
         self.menu.add_command(label="退出", command=self.on_close)
 
+        # 11/15：表情按钮的点击（tag_bind 一次即可，画布重绘不影响）
+        try:
+            self.control_canvas.tag_bind(
+                "emoji_btn", "<Button-1>",
+                lambda e: self.open_emoji_picker(
+                    lambda ch: self._insert_emoji_into(self.input_entry, ch),
+                    parent=self.input_entry))
+        except Exception as e:
+            log.debug("表情按钮绑定失败: %s", e)
         self.root.bind("<Button-3>", self.show_menu)
         self.root.after(100, self.draw_input_background)
 
@@ -5337,10 +5529,17 @@ class DesktopPet:
                 pass
         self.control_canvas.delete("all")
         self._input_bg_item = self.control_canvas.create_image(0, 0, anchor='nw', image=self._input_bg_photo)
-        # 输入框
+        # 输入框（右边留出表情按钮的位置）
         entry_pad = 14
-        self.control_canvas.create_window(x1 + entry_pad, y1 + entry_pad - 2, anchor="nw", window=self.input_entry,
-                                          width=x2 - x1 - 2 * entry_pad, height=y2 - y1 - 2 * entry_pad + 4)
+        _emoji_w = int(30 * self._dpi_scale)
+        self.control_canvas.create_window(
+            x1 + entry_pad, y1 + entry_pad - 2, anchor="nw", window=self.input_entry,
+            width=max(40, x2 - x1 - 2 * entry_pad - _emoji_w - 4),
+            height=y2 - y1 - 2 * entry_pad + 4)
+        # 11/15：表情按钮（点开应用内表情面板）——Tk 收不到系统 emoji 面板的输入，给它一个自己的入口
+        self.control_canvas.create_text(
+            x2 - entry_pad - _emoji_w // 2, (y1 + y2) // 2, text="😊",
+            font=(self.font_family, int(10 * self._dpi_scale)), fill=TEXT_SUB, tags=("emoji_btn",))
         if focused:
             self.input_entry.focus_set()
 
@@ -5598,6 +5797,13 @@ class DesktopPet:
             self.show_bubble_text("(worried) 穿透没切成…", "worried", status=True)
             return
         self._click_through = new_state
+        # 气泡是独立窗口，穿透要单独同步（否则它盖在屏幕上继续吃点击）
+        try:
+            bw = getattr(self, "bubble_window", None)
+            if bw is not None and bw.visible:
+                bw.apply_click_through(new_state)
+        except Exception as e:
+            log.debug("切换穿透时同步气泡失败: %s", e)
         # 10/19：穿透期间强制收起输入框（不写进配置）；关掉时恢复穿透前的状态
         try:
             if new_state:
@@ -5634,7 +5840,7 @@ class DesktopPet:
                 self.last_interaction_time = time.time()
                 if self.spine and self.spine_enabled:
                     if self.sleep_mode:
-                        self.stop_sleep_mode()
+                        self.stop_sleep_mode(cause="click")
                     else:
                         self.spine.begin_click()
                         self.do_action(from_click=True)     # 点她一下，她做件事
@@ -5812,6 +6018,47 @@ class DesktopPet:
                 return
         self.send_message()
         return "break"
+
+    # ---------- 输入表情（11/15）----------
+    @staticmethod
+    def _insert_emoji_into(widget, ch):
+        """把表情插到光标处（Entry / Text 通用）；插完把焦点还给它。"""
+        try:
+            widget.insert(tk.INSERT, ch)
+            widget.focus_set()
+        except Exception as e:
+            log.debug("插入表情失败: %s", e)
+
+    def open_emoji_picker(self, on_pick, parent=None):
+        """小表情面板：点一下就把表情插进输入框（键盘打不进来的兜底）。"""
+        try:
+            s = self._dpi_scale
+            win, frame = self._make_card_window("表情", 380, 300)
+            tk.Label(frame, text="点一个插到光标处", font=(self.font_family, 9),
+                     fg=TEXT_SUB, bg=DIALOG_BG).pack(anchor="w", padx=int(12 * s))
+            grid = tk.Frame(frame, bg=DIALOG_BG)
+            grid.pack(padx=int(10 * s), pady=int(6 * s))
+            cols = 8
+
+            def _pick(ch):
+                try:
+                    on_pick(ch)
+                finally:
+                    win.destroy()
+
+            for idx, ch in enumerate(EMOJI_PICKER):
+                b = tk.Label(grid, text=ch, font=(self.font_family, 17), bg=DIALOG_BG,
+                             fg=TEXT_MAIN, width=2, cursor="hand2")
+                b.grid(row=idx // cols, column=idx % cols, padx=2, pady=2)
+                b.bind("<Button-1>", lambda e, c=ch: _pick(c))
+                b.bind("<Enter>", lambda e, w=b: w.config(bg="#eef0f5"))
+                b.bind("<Leave>", lambda e, w=b: w.config(bg=DIALOG_BG))
+            return win
+        except Exception as e:
+            log.warning("表情面板打开失败: %s", e)
+            return None
+
+    # ---------- 输入表情结束 ----------
 
     def send_message(self, event=None):
         msg = self.input_entry.get().strip()
@@ -6535,7 +6782,7 @@ class DesktopPet:
         if not api_key or not speaker_id:
             log.warning("TTS API Key 或 Speaker ID 未配置，跳过语音播放")
             return
-        clean = re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip()
+        clean = strip_emoji(re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip())
         if not clean:
             return
         # 语言：中文直接念；英文/日语先翻译再念（翻译失败退回中文原文，绝不静默无声）
@@ -6655,7 +6902,7 @@ class DesktopPet:
         """Edge TTS 播放"""
         if not EDGE_TTS_IMPORTED:
             return
-        clean = re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip()
+        clean = strip_emoji(re.sub(r'[（(][^）)]*[）)]', '', chinese_text).strip())
         if not clean:
             return
         # 语言：中文直接念；英文先翻译再念；翻译失败退回中文音色念原文（别用英文音色硬读中文）
@@ -6724,7 +6971,7 @@ class DesktopPet:
         if not api_key:
             log.warning("DeepSeek TTS 未配置 API Key，跳过语音播放")
             return
-        clean = re.sub(r"[（(][^）)]*[）)]", "", chinese_text).strip()
+        clean = strip_emoji(re.sub(r"[（(][^）)]*[）)]", "", chinese_text).strip())
         if not clean:
             return
         voice = getattr(self, "tts_deepseek_voice", DEEPSEEK_TTS_VOICE_DEFAULT) or DEEPSEEK_TTS_VOICE_DEFAULT
@@ -7330,22 +7577,24 @@ class DesktopPet:
                 break
             try:
                 if time.time() - self.sleep_start_time > MAX_AUTO_SLEEP_DURATION:
-                    self._ui(self.stop_sleep_mode)
+                    self._ui(lambda: self.stop_sleep_mode(cause="limit"))
                     break
                 cur = self._get_cursor_pos()
                 if cur is not None:
                     if last_pos is not None and \
                             abs(cur[0] - last_pos[0]) + abs(cur[1] - last_pos[1]) > 50:
-                        self._ui(self.stop_sleep_mode)
+                        self._ui(lambda: self.stop_sleep_mode(cause="mouse"))
                         break
                     last_pos = cur
                 # cur 为 None 时保留旧锚点，避免失去鼠标唤醒能力
             except Exception as e:
                 log.warning("睡眠监测异常（继续监测）: %s", e)
 
-    def stop_sleep_mode(self, restore_voice=True):
+    def stop_sleep_mode(self, restore_voice=True, cause="user"):
         if not self.sleep_mode:
             return
+        _was_manual = self.manual_sleep
+        _slept_from = self.sleep_start_time or time.time()
         self.sleep_mode = False
         self.manual_sleep = False
         self.bubble_window.fade_out()
@@ -7370,6 +7619,9 @@ class DesktopPet:
                     sleepy_text = f"我睡了 {hours} 个小时，现在精力充沛！"
                 else:
                     sleepy_text = f"我睡了 {hours} 小时 {mins} 分钟，感觉像新的一样~"
+            self._last_sleep = {"start": _slept_from, "end": time.time(),
+                                "minutes": slept_minutes, "cause": cause,
+                                "manual": _was_manual}
             self.sleep_start_time = None
         else:
             sleepy_text = "我睡了一觉，现在感觉好多了！"
@@ -7386,6 +7638,40 @@ class DesktopPet:
         if restore_voice:
             # 睡着时自动关掉的麦，醒来接着开（quiet：别用气泡盖掉她刚说的"我眯了一会儿"）
             self._restore_voice_if_wanted(quiet=True)
+
+    def _sleep_context_line(self):
+        """把"刚睡过一觉"变成一条上下文事实（11/18 用户要求，不进锚点也不进箱子）。
+
+        原先醒来那句只走气泡 + TTS，模型侧完全不知道睡过；这里给它一个带时间、
+        时长、醒来原因的事实，30 分钟后降级成一句，跨天就不提了。
+        """
+        d = getattr(self, "_last_sleep", None)
+        if not d:
+            return ""
+        try:
+            end = float(d.get("end") or 0)
+            start = float(d.get("start") or end)
+            if datetime.fromtimestamp(end).date() != datetime.now().date():
+                return ""
+            minutes = int(d.get("minutes") or 0)
+            hhmm = lambda ts: datetime.fromtimestamp(ts).strftime("%H:%M")
+            dur = ("%d 小时 %d 分" % (minutes // 60, minutes % 60)) if minutes >= 60                 else ("%d 分钟" % minutes)
+            if time.time() - end > 30 * 60:
+                return "【今天】你在 %s 到 %s 之间睡过一觉（%s），现在早就醒了。" % (
+                    hhmm(start), hhmm(end), dur)
+            if minutes < 1:
+                return "【刚才】你刚打了个盹，不到一分钟就醒了。"
+            why = {
+                "mouse": "是他动鼠标把你弄醒的，不是你睡够了",
+                "click": "是他把你戳醒的",
+                "voice": "是他喊你把你叫醒的",
+                "limit": "是你自己睡够了醒的",
+            }.get(str(d.get("cause") or ""), "是他把你弄醒的")
+            return "【刚才】你在 %s 睡着了，%s 醒的，睡了 %s。%s。" % (
+                hhmm(start), hhmm(end), dur, why)
+        except Exception as e:
+            log.debug("生成睡眠上下文失败: %s", e)
+            return ""
 
     # ---------- 精力值系统 ----------
     def start_energy_tick(self):
@@ -9954,6 +10240,9 @@ class DesktopPet:
                       f"周{'一二三四五六日'[_now.weekday()]}）。“昨天”“前天”这类说法只在跟"
                       "记忆或聊天记录里的时间对得上时才用；对不上或者没写清楚，就说记不清了，别猜。")
         system_content = f"{system_prompt}\n\n{_date_line}{anti_sleep}\n{energy_mood}"
+        _sleep_line = self._sleep_context_line()
+        if _sleep_line:
+            system_content += "\n" + _sleep_line
 
         profile_text = self._format_profile_for_context()
         if profile_text:
@@ -10509,7 +10798,7 @@ class DesktopPet:
             log.info("陪玩模式已关闭")
         else:
             if self.sleep_mode:
-                self.stop_sleep_mode()
+                self.stop_sleep_mode(cause="watch")
             if not mss:
                 messagebox.showwarning("缺少依赖", "请先安装 mss：\npip install mss")
                 return
@@ -12404,7 +12693,7 @@ OCR文字：
     # ---------- 读书伴侣 ----------
     def toggle_reading(self):
         if not self.reading_companion.enabled and self.sleep_mode:
-            self.stop_sleep_mode()
+            self.stop_sleep_mode(cause="reading")
         self.reading_companion.toggle()
         if self.reading_companion.enabled:
             if self.spine_enabled and self.spine:
@@ -12512,6 +12801,36 @@ OCR文字：
         if not self._shutdown:
             self.root.after(60, self._ptt_tick)
 
+    def relaunch_as_admin(self):
+        """以管理员身份重启自己：先起提权实例，1.5 秒后再退当前这个。
+
+        游戏（暗区突围这类）以管理员运行时，普通权限进程读不到任何键盘输入；
+        提权后 GetAsyncKeyState / Raw Input 都能恢复正常（11/18 实测 WeGame 前台）。
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                exe, params = sys.executable, ""
+                workdir = os.path.dirname(sys.executable)
+            else:
+                script = os.path.abspath(__file__)
+                exe = sys.executable
+                params = " ".join(['"%s"' % script] + ['"%s"' % a for a in sys.argv[1:]])
+                workdir = os.path.dirname(script)
+            se = ctypes.windll.shell32.ShellExecuteW
+            se.restype = ctypes.c_void_p          # HINSTANCE：不设 restype 会被截成 32 位
+            rc = int(se(None, "runas", exe, params or None, workdir, 1) or 0)
+            if rc <= 32:
+                # 1223 = 用户点了"否"，其余为 ShellExecute 错误码
+                messagebox.showinfo("没有取得管理员权限",
+                                    "UAC 被取消或启动失败（返回 %s）。\n"
+                                    "游戏里要用按键说话的话，需要以管理员身份运行。" % rc)
+                return
+            log.info("已请求以管理员身份重启（ShellExecute 返回 %d），1.5 秒后退出当前实例", rc)
+            self.root.after(1500, self.on_close)
+        except Exception as e:
+            log.warning("以管理员身份重启失败: %s", e)
+            messagebox.showinfo("重启失败", str(e))
+
     def toggle_tts_speak(self):
         """🔊 语音朗读开关（TTS）：菜单在「🎮 模式」里，音色与语言在设置窗里选"""
         if not self.tts_enabled and self.tts_mode == "deepseek" and not getattr(self, "tts_deepseek_key", ""):
@@ -12561,7 +12880,7 @@ OCR文字：
             log.info("语音识别已关闭")
         else:
             if self.sleep_mode:
-                self.stop_sleep_mode(restore_voice=False)   # 开麦这条路上别再触发一次"睡醒恢复"
+                self.stop_sleep_mode(restore_voice=False, cause="voice")   # 开麦这条路上别再触发一次"睡醒恢复"
             self.stt.start()
             self.voice_on = True
             self._update_voice_menu_label()
@@ -13503,6 +13822,11 @@ OCR文字：
         txt = rt.text
         btns = tk.Frame(input_box, bg=CARD_BG)
         btns.pack(side=tk.LEFT, padx=(int(8 * s), 0), anchor="s")
+        RoundedButton(btns, text="😊", variant="subtle",
+                      command=lambda: self.open_emoji_picker(
+                          lambda ch: self._insert_emoji_into(txt, ch), parent=txt),
+                      width=int(34 * s), height=int(26 * s), radius=int(6 * s),
+                      font=(self.font_family, 10)).pack(side=tk.TOP, pady=(0, int(4 * s)))
         RoundedButton(btns, text="发送", command=self._cc_send, variant="primary",
                       width=int(76 * s), height=int(34 * s), radius=int(8 * s),
                       font=(self.font_family, 10, "bold")).pack(side=tk.TOP)
@@ -14063,6 +14387,20 @@ OCR文字：
         RoundedButton(ptt_row, text="改键", command=start_capture, variant="subtle",
                       width=int(70 * s), height=int(30 * s), radius=int(8 * s),
                       font=(self.font_family, 10)).pack(side=tk.LEFT)
+
+        # 11/18：游戏以管理员运行时（UIPI），普通权限进程连 Raw Input 都收不到 —— 直接给状态和入口
+        if is_elevated():
+            tk.Label(frame, text="当前是管理员身份：游戏里的按键说话可以读到",
+                     font=(self.font_family, 9), fg=TEXT_SUB, bg=DIALOG_BG,
+                     justify='left').pack(anchor='w', pady=(8, 0))
+        else:
+            tk.Label(frame, text="现在不是管理员身份：游戏以管理员运行时读不到这个键。\n"
+                                 "（点下面那个按钮重启一次就好，UAC 里点「是」）",
+                     font=(self.font_family, 9), fg=DANGER_RED, bg=DIALOG_BG,
+                     justify='left').pack(anchor='w', pady=(8, 2))
+            RoundedButton(frame, text="以管理员身份重启桌宠", command=self.relaunch_as_admin,
+                          variant="subtle", width=int(180 * s), height=int(32 * s),
+                          radius=int(8 * s), font=(self.font_family, 10)).pack(anchor='w', pady=(2, 0))
 
     def on_speech_recognized(self, text, mode="content"):
         # 睡着时听到什么都只提示一句：不唤醒、不进模型、不出声（连 last_interaction_time 都不动，
