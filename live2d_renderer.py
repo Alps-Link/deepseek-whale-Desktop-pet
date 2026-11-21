@@ -38,7 +38,7 @@ MODEL_DIR = os.path.join(MODEL_ROOT, 'model')      # 鲸鱼娘（形态 whale）
 #   has_costumes 有没有装扮配件（按形态：鲸鱼娘 8 槽；小肥鱼 1 槽＝钢盆）
 FORMS = {
     'whale': {
-        'label': 'Q肥鱼',
+        'label': 'Q版肥鱼',
         'dir': 'model', 'json': 'c_0120.model3.json',
         'fit_scale': 1.277, 'fit_offset_y': -0.053, 'fit_offset_x': 0.0,
         'normal_face': {'ParamEyeLOpen': 1.0, 'ParamEyeROpen': 1.0, 'ParamMouthForm': -0.5},
@@ -48,7 +48,7 @@ FORMS = {
         'emotion_pools': None, 'eye_owning': None, 'sleep_expr': 'drool',
     },
     'medium': {
-        'label': '中肥鱼',
+        'label': '小女孩肥鱼',
         'dir': os.path.join('forms', 'medium'), 'json': 'medium.model3.json',
         # 构图在真实角色区（char_size × char_size*0.8）上重新标定：内容占区高 93%、上下居中、四边留 9px
         'fit_scale': 1.0145, 'fit_offset_y': -0.0379, 'fit_offset_x': 0.0,
@@ -78,7 +78,7 @@ FORMS = {
         'sleep_expr': 'drool',
     },
     'adult': {
-        'label': '成年肥鱼',
+        'label': '成熟女性肥鱼',
         'dir': os.path.join('forms', 'adult'), 'json': 'adult.model3.json',
         'fit_scale': 1.1581, 'fit_offset_y': -0.1439,
         # 水平构图：这套模型的人体在画布里偏左（上半身质心比区域中心左 17px），右移对齐
@@ -93,7 +93,8 @@ FORMS = {
         'has_motions': False, 'click_react': True,
         # 点击反应：随机挑一个表情播（用户拍板：三个都随机；"大小变"暂时不用）+ 一次小幅甩头保底
         'click_exprs': ['cry', 'angry', 'blush'],
-        'always_on': {}, 'has_costumes': False,
+        'always_on': {},
+        'has_costumes': True,          # 只有一个「大小变」槽（size_change 表情写 Size=1） 'has_costumes': False,
         # 这套只有 4 个表情（哭哭/生气/脸红/大小变），能对上的就对上，对不上的情绪不挂表情
         'emotion_pools': {
             'happy':     ['blush'],
@@ -109,7 +110,7 @@ FORMS = {
         'sleep_expr': None,
     },
     'small': {
-        'label': '小肥鱼',
+        'label': '幼稚小肥鱼',
         'dir': os.path.join('forms', 'small'), 'json': 'small.model3.json',
         # 构图在真实角色区（char_size × char_size*0.8）上标定：内容占区高 93%、上下居中
         # （实测 bbox=(94,9,258,254)：上留 9 / 下留 9、上半身质心 165.1 = 区中心）
@@ -140,8 +141,47 @@ FORMS = {
         # 只列单独播就看得见的：吃饭 / 吃token（转token 单播空转，已从 Action 组拿掉）
         'action_pool': [(0, '吃饭'), (1, '吃token')],
     },
+    # 11/18 新增：B站@神宫凉子 原画、霓虹猫_NeonNeko 建模的「免费公皮」。
+    # 注意：作者禁止二次发布 ⇒ 只能本地自用，不随发布包分发。
+    # fit 实测标定（330×264 角色区，内容高 92.4%，上下各留 10/11 px）；
+    # 参数名：模型里 AngleX 与 ParamAngleX 同时存在，但实测动的只有 AngleX。
+    'big': {
+        'label': '青春肥鱼',
+        'dir': os.path.join('forms', 'big'), 'json': 'big.model3.json',
+        'fit_scale': 1.0841, 'fit_offset_x': -0.0021, 'fit_offset_y': 0.0559,
+        'normal_face': None,
+        'aliases': {'ParamAngleX': 'AngleX', 'ParamAngleY': 'AngleY', 'ParamAngleZ': 'AngleZ'},
+        # 这套公皮的『头』是 AngleX/Y/Z、『身体跟随』是 PositionX/Y/Z（见作者 vtube.json），
+        # 引擎自带的 Drag 只写 ParamAngle*/ParamBodyAngle*，在这套上是空操作 ⇒ 自己补一份。
+        'follow_drag': True,
+        'has_motions': True,
+        'click_action': False,        # 点击不播 Action（脱捕 13 秒太长），只甩头 + 点击表情
+        # 自己找事做：随机一个〔词〕动作 + 点击那套随机表情（不再播 13 秒的脱捕）
+        'auto_actions': ['竖起食指', '抚胸', '狗尾草', '贴贴', '靠近他', '脱捕'],
+        'click_react': True,          # 没有 Touch 组：点击靠程序化甩头 + 点击表情
+        'click_exprs': ['圈圈眼', '屑屑眼', '＞＜'],
+        'entrance_sec': 1.02,         # 入场播 举手切默认手（1.02 秒）
+        'always_on': {},
+        'has_costumes': True,
+        # 表情强度实测（330×264）：黑脸 4.3% / 屑屑眼 0.52% / 圈圈眼 0.48% / ＞＜ 0.44% /
+        # 爱心眼 0.17% / 流泪 0.15%；流冷汗、竖食指关、默认体型 ≈0（不用）；体型/裙子/尾巴/钢盆
+        # 是换装或换体型，不进情绪池。
+        'emotion_pools': {
+            'happy':     ['＞＜', '爱心眼'],
+            'relaxed':   ['屑屑眼'],
+            'shy':       ['脸红'],
+            'surprised': ['圈圈眼'],
+            'worried':   ['流泪'],
+            'hurried':   ['＞＜'],
+            'angry':     ['黑脸'],
+            'sleep':     [],
+        },
+        'eye_owning': [],             # 23 个表情都不写 ParamEye*Open，眨眼照常
+        'sleep_expr': None,           # 没有睡眠表情：睡着靠每帧强制闭眼
+        'action_pool': [(0, '脱捕')],
+    },
 }
-FORM_ORDER = ['adult', 'medium', 'small', 'whale']
+FORM_ORDER = ['adult', 'medium', 'small', 'whale', 'big']
 # 默认形态（10/11 用户拍板："把成年肥鱼设置成默认形象吧，首次开机就是成年肥鱼"）：
 # 配置里没写过 form、或存了个认不出的名字时用它 —— 也就是新装/清空配置后的第一眼形象，
 # 同时它就是「🐟 形象」菜单里的第一条。
@@ -215,6 +255,12 @@ COSTUME_FIT = {
     'bunny_sticker': (1.213, -0.100),   # 兔耳
     'whale':         (1.258, -0.075),   # 头顶鲸
     'side_ponytail': (1.265, -0.067),   # 单边马尾
+    # 11/18 big 的体型切换：模型是在自己画布里缩，画布不变 ⇒ 人变小后离输入框越来越远。
+    # 下面两个值按实测内容高反推（默认 244px、体型1 157px、体型2 66px，基准 93% 高、底边对齐 253）
+    '体型1':         (1.684, -0.420),   # 小（bbox 实测 top8/bottom251，与默认构图一致）
+    '体型2':         (4.008, -2.150),   # 超小（bbox 实测 top6/bottom250，与默认一致；注视偏移由 cur_fit_from_costume 那条修）
+    # 成年肥鱼的 size_change：实测内容高 243→120px、底边都在 253 ⇒ 按 93% 高反推
+    'size_change':   (2.345, -1.223),
 }
 
 
@@ -602,12 +648,16 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
     MOUTH_PARAM = next((p for p in ('ParamMouthOpenY', 'ParamParmOpenY') if p in _param_ids), None)
 
     cmd_idx = 0; mouse_x, mouse_y = 0.0, 0.0
+    follow_now = {}      # follow_drag 形态的跟随量（逐帧平滑，键=参数名）
+    pose_hold = {}       # 台词里的〔词〕→ 参数（保持型，每帧写）
+    pose_defaults = {}   # 上面这些参数的原默认值，清掉时写回
     disp_w, disp_h = width, height   # 显示尺寸（主线程推送）
     act_w, act_h = width, height     # 活动渲染区域（FBO 分配尺寸为上限）
 
     # 当前生效的构图：**按形态取**（装扮会临时改小，见 COSTUME_FIT）
     cur_fit_scale = FORM['fit_scale']
     cur_fit_offset = FORM['fit_offset_y']
+    cur_fit_from_costume = False   # 这套构图是不是 COSTUME_FIT 给的（用于注视基准行的换算）
 
     def apply_area():
         """按 显示尺寸 × 聚焦缩放 设定渲染区域；上限是 FBO 分配尺寸。
@@ -625,7 +675,11 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
         _sc = min(act_w / 800.0, act_h / 640.0) * 0.78
         # 注视基准行要在"未被纠正"的坐标里算，再套同一套 SetScale/SetOffset 变换
         _row = act_h * 0.5 - _sc * 320 + EYE_ROW_IN_CANVAS * _sc
-        _row = (_row - act_h * 0.5) * cur_fit_scale + act_h * 0.5 + cur_fit_offset * act_h * 0.5
+        # 装扮纠正（COSTUME_FIT）的目标就是把内容重新填满画面、底边对齐，
+        # 所以那一档的眼睛仍落在"未纠正"的位置；再乘 fit_scale 会把基准行推到画面外
+        # （big 超小 4 倍缩放时实测：鼠标在上面才平视）。只在形态自身的构图下才换算。
+        if not cur_fit_from_costume:
+            _row = (_row - act_h * 0.5) * cur_fit_scale + act_h * 0.5 + cur_fit_offset * act_h * 0.5
         bridge.face_row = int(_row)
     active_scene = None
     expression_active = None   # 表情（场景）是否还挂着
@@ -897,12 +951,17 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                                  for _p in _ps}
                     # 装扮会改内容高度（兔耳最明显）→ 重算构图，否则头顶多出来的会被上边界裁掉。
                     # 多件同时挂时取"缩得最狠的那件"的一套（它自带对应的偏移）。
+                    # 只认"这个形态里真有这个表情文件"的装扮：换形态后存档里的旧选项
+                    # （比如成年肥鱼的 body=体型2）不能套用它的 COSTUME_FIT，否则只是放大不改形
                     _fits = [COSTUME_FIT[_n] for _sl in costume_names.values()
-                             for _n in _sl if _n in COSTUME_FIT]
+                             for _n in _sl if _n in COSTUME_FIT
+                             and os.path.isfile(os.path.join(model_dir, 'expressions', _n + '.exp3.json'))]
                     if _fits:
                         cur_fit_scale, cur_fit_offset = min(_fits, key=lambda _f: _f[0])
+                        cur_fit_from_costume = True
                     else:
                         cur_fit_scale, cur_fit_offset = FORM['fit_scale'], FORM['fit_offset_y']
+                        cur_fit_from_costume = False
                     model.SetScale(cur_fit_scale)
                     model.SetOffset(FORM.get('fit_offset_x', 0.0), cur_fit_offset)
                     apply_area()      # 注视基准行要跟着新构图一起重算
@@ -976,6 +1035,27 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                     mouth_level = float(cmd[1])  # 只记录，由每帧写入（见渲染循环）
                 elif cmd[0] == 'mouse':
                     mouse_x, mouse_y = cmd[1], cmd[2]
+                elif cmd[0] == 'pose':
+                    # 保持型词（穿戴/姿态）：值直接来自模型 exp3，不换算；合并进表
+                    for _pk, _pv in (cmd[1] or {}).items():
+                        if _pk not in pose_defaults:
+                            try:
+                                pose_defaults[_pk] = model.GetParameterValue(_param_ids.index(_pk))
+                            except Exception:
+                                pose_defaults[_pk] = 0.0
+                        pose_hold[_pk] = float(_pv)
+                elif cmd[0] == 'pose_release':
+                    # 只放掉指定的几个参数（定时动作/姿态到期时用），其它保持不动
+                    for _pk in (cmd[1] or []):
+                        if _pk in pose_defaults:
+                            model.SetParameterValue(_pk, pose_defaults[_pk])
+                            pose_defaults.pop(_pk, None)
+                        pose_hold.pop(_pk, None)
+                elif cmd[0] == 'pose_clear':
+                    for _pk, _pd in pose_defaults.items():
+                        model.SetParameterValue(_pk, _pd)
+                    pose_hold.clear()
+                    pose_defaults.clear()
                 elif cmd[0] == 'size':
                     disp_w = max(1, min(int(cmd[1]), width))
                     disp_h = max(1, min(int(cmd[2]), height))
@@ -1114,10 +1194,28 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                 model.SetParameterValue('ParamEyeLOpen', 0.0)
                 model.SetParameterValue('ParamEyeROpen', 0.0)
 
+            # 〔词〕保持的参数：每帧写，压住动作残留（穿戴/姿态不需要动画，值就是模型里的原值）
+            for _pk, _pv in pose_hold.items():
+                model.SetParameterValue(_pk, _pv)
             model.SetParameterValue('ParamEyeBallX', mouse_x)
             model.SetParameterValue('ParamEyeBallY', mouse_y)
             if active_scene is None:
                 model.Drag(mouse_x * DRAG_SCALE_X, mouse_y * DRAG_SCALE_Y)
+            if FORM.get('follow_drag'):
+                # 这几套模型的头部/身体参数不叫 ParamAngle*（公皮：AngleX* 是头、PositionX* 是身体），
+                # 引擎的 Drag 写不到 ⇒ 按作者 vtube.json 的映射自己写一份，带 0.2 的逐帧平滑（≈VTS 的 Smoothing 20）。
+                _dx = mouse_x * DRAG_SCALE_X
+                _dy = mouse_y * DRAG_SCALE_Y
+                for _k, _v in (('ParamAngleX', _dx * 30.0),
+                               ('ParamAngleY', _dy * 30.0),
+                               ('ParamAngleZ', -_dx * _dy * 30.0),
+                               ('PositionX', _dx * 30.0),
+                               ('PositionY', _dy * 30.0),
+                               ('PositionZ', -_dx * _dy * 30.0)):
+                    _cur = follow_now.get(_k, _v)
+                    _new = _cur + (_v - _cur) * 0.2
+                    follow_now[_k] = _new
+                    model.SetParameterValue(_k, _new)
             if click_expr_until and time.time() >= click_expr_until:
                 click_expr_until = 0.0
                 bridge._cmd_q.append(('emotion', 'normal'))   # 点击反应到期：表情收回常态

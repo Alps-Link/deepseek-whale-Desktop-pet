@@ -1253,6 +1253,127 @@ def render_emoji_image(ch, size):
         return None
 
 
+CUE_RE = re.compile("〔([^〔〕" + chr(10) + "]{1,12})〕")
+
+# 自然说法 → 模型里的资产名（动作=播那一段动画；表情=写它 exp3 里的原值）
+CUE_MOTION_ALIAS = {
+    "竖起食指": "竖手指切出来动画", "收回食指": "竖手指切回默认",
+    "抚胸": "默认手切举手", "举手": "默认手切举手", "举起手": "默认手切举手",
+    "放下手": "举手切默认手", "收手": "举手切默认手",
+    "狗尾草": "狗尾草切换出来", "收回狗尾草": "狗尾草切回默认手",
+}
+# 这些姿态是"做一下"的，不是一直挂着：到点自己回常态
+CUE_TIMED_POSE = {"前倾": 3.0}
+
+CUE_POSE_ALIAS = {
+    "身体前倾": "前倾", "前倾": "前倾", "贴贴": "前倾", "靠近他": "前倾",
+    "把脸凑过去": "前倾", "凑近": "前倾", "凑过去": "前倾",
+}
+
+
+ECHO_PREFIX_RE = re.compile("^\s*(?:[\[【]\s*(?:今天|昨天|前天|\d{1,2}\s*月\d{1,2}\s*日|\d{4}-\d{1,2}-\d{1,2}|时间|此刻|现在)[^\]】\n]{0,20}[\]】]|\[\d{1,2}:\d{2}\])\s*")
+
+
+def strip_echoed_prefix(text):
+    """她自己回复开头模仿出来的 [今天 12:27] / 【时间】 / 【此刻】 之类，剥掉。"""
+    if not text:
+        return text
+    return ECHO_PREFIX_RE.sub("", text, count=1).lstrip()
+
+
+def extract_cues(text):
+    """把台词里的〔词〕抠出来，返回 (干净文本, [词…])。气泡和 TTS 只用干净文本。"""
+    if not text:
+        return text, []
+    cues = [m.group(1).strip() for m in CUE_RE.finditer(text)]
+    clean = CUE_RE.sub("", text)
+    clean = re.sub(r"[ 	]{2,}", " ", clean).strip()
+    return clean, cues
+
+
+# 「此刻」那句里各装扮的说人话版本：按钮上的名字她不一定懂（"加载"是啥？），
+# 这里给她一句能想象的描述。键是 (槽位, 表情名)；槽位单独一条 = 没选这个槽时的样子。
+COSTUME_LOOK_ORDER = ["glasses", "head", "cloth", "skirt", "shoes", "tail", "body"]
+
+# 各形态"平常样子"的说法（体型这一项即使没勾也要写，配件类则不写）
+# 没勾选时要如实写出来的"平常状态"：按 (形态, 槽位) 区分
+# —— 槽位名在不同形态会重名（鲸鱼娘的 cloth 是桌布、青春肥鱼的 cloth 是胸口），
+#    所以不能只按槽位查，否则租衣服会串到鲸鱼娘身上。
+# 「此刻」里不写的槽位：桌布/桌面摆设/桌面显示 是环境物件，不属于她身上
+# （按 (形态, 槽位) 排除——"cloth" 在青春肥鱼那里是"胸口"，不能一起跳过）
+COSTUME_LOOK_SKIP = {("whale", "cloth"), ("whale", "desk"), ("whale", "display")}
+
+COSTUME_DEFAULT_TEXT = {
+    ("big", "skirt"): "穿着女仆超短裙",
+    ("big", "cloth"): "上衣是低胸款，领口开得比较大",
+    ("big", "shoes"): "穿着鞋",
+    ("big", "tail"): "尾巴露在外面",
+}
+
+BODY_DEFAULT_TEXT = {
+    "big": "少女体型",
+    "adult": "成年女性的体型",
+    "medium": "小女孩的体型",
+    "small": "幼童的体型",
+    "whale": "Q版体型",
+}
+
+COSTUME_LOOK_TEXT = {
+    # 服装/身体：没勾也要如实写（裙长、上衣、鞋、尾巴、体型）
+
+
+
+
+    ("glasses", "黑框眼镜"): "鼻梁上架着黑框眼镜",
+    ("glasses", "单片眼镜"): "右眼戴一片单片眼镜",
+    ("glasses", "加载"): "眼前挂着一个一直在转圈的加载符号（就是网卡住时那种）",
+    ("head", "钢盆"): "头上扣着一个钢盆",
+    ("skirt", "裙子切换"): "换成了女仆长裙",
+    ("cloth", "胸口衣服"): "上衣换成保守款，领口遮住了",
+    ("shoes", "脱鞋"): "光着脚",
+    ("tail", "尾巴开关"): "尾巴收起来了",
+    # —— Q版肥鱼（鲸鱼娘）那套 ——
+    ("glasses", "round_glasses"): "鼻梁上架着圆框眼镜",
+    ("glasses", "square_glasses"): "鼻梁上架着方框眼镜",
+    ("glasses", "oval_glasses"): "鼻梁上架着椭圆框眼镜",
+    ("glasses", "sunglasses"): "戴着墨镜",
+    ("sticker", "cat_sticker"): "脸上贴着猫猫贴纸",
+    ("sticker", "bunny_sticker"): "脸上贴着兔兔贴纸",
+    ("sticker", "ribbon_sticker"): "脸上贴着蝴蝶结贴纸",
+    ("hair", "headband"): "头上戴着发箍",
+    ("hair", "side_ponytail"): "头发扎成单边马尾",
+    ("hair", ("headband", "side_ponytail")): "扎着马尾，头上还有发箍",
+    ("cloth", "dark_cloth"): "桌上铺着深色桌布",
+    ("claw", "claw"): "手上戴着粉色魔爪",
+    ("claw", ("claw", "claw_color")): "手上戴着白色魔爪",
+    ("desk", "whale"): "头顶趴着一只小鲸鱼",
+    ("desk", "whale_on_desk"): "桌面上摆着一只小鲸鱼",
+    ("display", "brush"): "画笔",
+    ("display", "eraser"): "橡皮",
+    ("display", "undo"): "撤回图标",
+    ("display", "parfait"): "巴菲收起来了",
+    ("item", "omurice"): "手里端着一份蛋包饭",
+    ("item", "paw"): "手上戴着猫爪",
+    ("item", ("double_peace", "no_board")): "双手比耶",
+    ("item", ("order_press", "board")): "手里拿着点菜板",
+    ("body", "体型1"): "缩成了小女孩的个头",
+    ("body", "体型2"): "只有大头娃娃那么大",
+    ("body", "size_change"): "整个人缩成了小孩子的样子",
+}
+
+
+def available_forms():
+    """当前安装里真正有素材的形态：缺 model3.json 的跳过（公版发布包不含 big）。"""
+    out = []
+    for _k in LIVE2D_FORM_ORDER:
+        _info = LIVE2D_FORMS.get(_k) or {}
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live2d_viewer",
+                          _info.get("dir", ""), _info.get("json", ""))
+        if _info.get("dir") and _info.get("json") and os.path.isfile(_p):
+            out.append(_k)
+    return out or list(LIVE2D_FORM_ORDER[:1])
+
+
 def emotion_word_list():
     """提示词里公示的情绪词表：只列本只真正支持的，避免提示词写了她答不出来的情绪"""
     return ", ".join(w for w in EMOTION_ORDER if w in EMOTION_WORDS)
@@ -1814,6 +1935,8 @@ FORM_CREDITS = {
     'medium': 'Live2D 模型：中肥鱼 —— 模型制作 B站@Mao绒绒家园',
     'adult': 'Live2D 模型：成年肥鱼 —— 模型制作 B站@玹乐喵',
     'small': 'Live2D 模型：小肥鱼 —— 模型制作 狐宫静（公开免费皮套）',
+    'big': 'Live2D 模型：大大·肥鱼（免费公皮）—— 原画/拆分 B站@神宫凉子（BV1KmxY66EZ3）、建模 霓虹猫_NeonNeko'
+           '（作者禁止二次发布：仅供本地自用，不随发布包分发）',
 }
 
 COSTUME_SLOTS = [
@@ -1850,6 +1973,19 @@ FORM_COSTUMES = {
     # 小肥鱼只有一件：钢盆（写 Param89；实测画面差 12.46，扣上后内容高 242、上留 13/下留 9，
     # 不裁切 ⇒ 不需要 COSTUME_FIT）
     'small': ([("head", "头顶", "不戴", [("basin", "钢盆")])], set(), set(), {}),
+    # 11/18 big（大大·肥鱼）：选项全部走模型自带的 exp3，按槽位互斥、可摘；
+    # 裙子和尾巴是"减法"状态（exp3 写 -1），摘掉时由渲染器还原成装扮前的值。
+    # 成年肥鱼：四个表情里只有 size_change 能当"装扮"用（写 Size=1，摘掉时还原）
+    'adult': ([("body", "体型", "默认", [("size_change", "变小孩子")])], set(), set(), {}),
+    'big': ([
+        ("glasses", "眼镜", "无", [("黑框眼镜", "黑框眼镜"), ("单片眼镜", "单片眼镜"), ("加载", "卡顿加载符号")]),
+        ("skirt", "裙子", "女仆超短裙", [("裙子切换", "女仆长裙")]),
+        ("cloth", "胸口", "低胸上衣", [("胸口衣服", "保守上衣")]),
+        ("tail", "尾巴", "露出", [("尾巴开关", "收起")]),
+        ("body", "体型", "少女", [("体型1", "小女孩"), ("体型2", "大头娃娃")]),
+        ("head", "头顶", "不戴", [("钢盆", "钢盆")]),
+        ("shoes", "鞋", "穿鞋", [("脱鞋", "光脚")]),
+    ], set(), set(), {}),
 }
 
 
@@ -2365,7 +2501,7 @@ def mark_topic_materials_used(texts):
 
 
 
-def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=None):
+def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=None, has_cues=False, look_line=""):
     """由角色姓名 + 人设 + 回复规则拼系统提示词（"你是{名字}，"与情绪括号格式由代码内置）。
     max_chars / style_rules 来自 config.json 的 character 节；style_rules 传空串＝不注入说话方式段。"""
     parts = [f"你是{name}，{persona}\n\n【回复格式要求】\n{format_reply_rules(max_chars)}"]
@@ -2375,6 +2511,14 @@ def build_system_prompt(name, persona, max_chars=DEFAULT_MAX_CHARS, style_rules=
     # 11/15：表情符号许可（一句，不堆限制；也别让她把表情当句末装饰）
     parts.append("【表情】大概每五六句话里有那么一句，句尾可以带一个表情符号（😌 😳 😮‍💨），"
                  "别连着用；想表达情绪时也可以让它顶半句话，不用每次都用文字形容。")
+    # 11/18：身体动作许可。词会从台词里剥掉，不显示也不朗读；值来自模型本身（动作播一段/穿戴写原值）
+    if has_cues:
+        parts.append("【身体】想做个动作或者换身打扮，就在话里写〔词〕，气泡和朗读都不会念出来。"
+                     "能写：竖起食指、抚胸、狗尾草、贴贴、靠近他、把脸凑过去。"
+                     "一句最多一个，别每句都用，动作做完会自己回常态。"
+                     "他明确让你做某个动作（比如\"抚胸\"\"贴贴\"）时，一定要在话里写上对应的〔词〕，光说\"好呀\"不算做到了。")
+    if look_line:
+        parts.append(look_line)
     return "\n\n".join(parts)
 
 def build_full_system_prompt(base_prompt, user_profile):
@@ -4086,10 +4230,12 @@ class DesktopPet:
         self.max_chars = self.character_config["max_chars"]
         self.style_rules = self.character_config["style_rules"]
         self.system_prompt = build_system_prompt(self.pet_name, self.character_config["persona"],
-                                                 self.max_chars, self.style_rules)
+                                                 self.max_chars, self.style_rules, has_cues=self._form_has_cues(None),
+                look_line=self._current_look_line())
         self.banned_words = load_banned_words()
         self.user_profile = load_user_profile()
         self.full_system = build_full_system_prompt(self.system_prompt, self.user_profile)
+        log.info("系统提示词 %d 字，【身体】=%s 【此刻】=%s", len(self.system_prompt), "【身体】" in self.system_prompt, "【此刻】" in self.system_prompt)
 
         # 加载统一 LLM 配置（文本模型 + 视觉模型，OpenAI 兼容接口）
         self.llm_config = load_llm_config()
@@ -4201,10 +4347,21 @@ class DesktopPet:
 
         # 形象转换与装扮
         self.action_timer_job = None   # 下一次自发做动作的定时器
-        self.costume_choice = load_costume_config()   # 装扮（持久化，见 load_costume_config）
+        _cc_raw = _get_section("costume") or {}
+        if _cc_raw and any(isinstance(_v, dict) for _v in _cc_raw.values()):
+            self._costume_by_form = {_k: dict(_v) for _k, _v in _cc_raw.items() if isinstance(_v, dict)}
+            self.costume_choice = {}
+        else:
+            self._costume_by_form = {}
+            self.costume_choice = dict(_cc_raw)
         self._costume_applied = False  # 渲染器就绪后把存档的装扮穿回去（只做一次）
         self._form_pending = None      # 换形象待确认：(目标, 上一个, 起算时刻, 显示名)；见 _check_form_swap
         self.form = load_form_config()  # 形象（多形态）：换一整套 Live2D，见 set_form
+        if self.form not in available_forms():       # 公版包没有 big 之类：回落到有素材的那套
+            self.form = available_forms()[0]
+        if self._costume_by_form:       # 新格式存档：把当前形态自己的装扮取出来
+            self.costume_choice = self._load_costumes_for(self.form)
+        self._refresh_prompt_for_form(self.form)   # 形态+穿戴都就位了，重建一次（带「此刻」行）
         self._costume_buttons = {}     # {(槽位, 装扮名): 按钮}，用于刷新选中高亮
         topic_cfg = load_topic_config()
         self.topic_interval_minutes = topic_cfg["interval_minutes"]
@@ -5079,9 +5236,10 @@ class DesktopPet:
 
     def _add_chat_buffer_turn(self, user_msg, ai_reply, source="chat"):
         """向聊天缓冲追加一轮对话，支持 source 标记（chat/watch/reading）"""
+        _ts = time.time()
         turn = [
-            {"role": "user", "content": user_msg, "source": source},
-            {"role": "assistant", "content": ai_reply, "source": source}
+            {"role": "user", "content": user_msg, "source": source, "ts": _ts},
+            {"role": "assistant", "content": ai_reply, "source": source, "ts": _ts}
         ]
         if source == "chat":
             try:
@@ -5464,7 +5622,7 @@ class DesktopPet:
         # ── 形象（多形态）：一级菜单一行，点开选穿哪一套 Live2D ──
         self.form_menu = ModernMenu(self.root, pet=self)
         self.form_menu_indices = {}
-        for _fk in LIVE2D_FORM_ORDER:
+        for _fk in available_forms():
             self.form_menu.add_command(label=self._form_menu_label(_fk),
                                        command=lambda k=_fk: self.set_form(k))
             self.form_menu_indices[_fk] = self.form_menu.index("end")
@@ -5691,6 +5849,8 @@ class DesktopPet:
         log.error("换形象没成功（%s）：目标=%s 回滚=%s%s", "渲染线程崩了" if dead else "超时",
                   key, prev, ("；原因=" + str(why)) if why else "")
         self.form = prev                           # 账回滚：菜单能再点、重启也不会进坏状态
+        self.costume_choice = self._load_costumes_for(prev)
+        self._refresh_prompt_for_form(prev)        # 提示词也要跟着退回旧形态
         try:
             save_form_config(prev)
         except Exception:
@@ -5865,6 +6025,99 @@ class DesktopPet:
             except Exception:
                 pass
 
+    def _refresh_prompt_for_form(self, form):
+        """换形态后重建系统提示词：有 Cue 动作才带【身体】段。"""
+        try:
+            self.system_prompt = build_system_prompt(
+                self.pet_name, self.character_config["persona"], self.max_chars,
+                self.style_rules, has_cues=self._form_has_cues(form),
+                look_line=self._current_look_line())
+            self.full_system = build_full_system_prompt(self.system_prompt, self.user_profile)
+            log.info("提示词已重建：【身体】=%s 【此刻】=%s", "【身体】" in self.system_prompt,
+                     "【此刻】" in self.system_prompt)
+            log.info("此刻行：%s", self._current_look_line())
+        except Exception as e:
+            log.warning("重建提示词失败: %s", e)
+
+    def _current_look_line(self):
+        """「此刻」一行：把当前形象和她身上的东西写成她能想象的样子。"""
+        try:
+            label = (LIVE2D_FORMS.get(getattr(self, "form", "")) or {}).get("label", "")
+            if not label:
+                return ""
+            sl = costume_cfg(getattr(self, "form", ""))[0] or []
+            _order = {_s: _i for _i, _s in enumerate(COSTUME_LOOK_ORDER)}
+            sl = sorted(sl, key=lambda _x: _order.get(_x[0], 99))
+            bits = []
+            for slot, _slot_label, _clear, items in sl:
+                if (getattr(self, "form", ""), slot) in COSTUME_LOOK_SKIP:
+                    continue
+                val = (self.costume_choice or {}).get(slot)
+                vals = list(val) if isinstance(val, (list, tuple)) else ([val] if val else [])
+                if not vals:
+                    # 配件类（眼镜/头顶）没有就不写；服装与身体要如实写平常状态
+                    if slot == "body":
+                        d = BODY_DEFAULT_TEXT.get(getattr(self, "form", ""), "")
+                        if d:
+                            bits.append(d)
+                    else:
+                        d = COSTUME_DEFAULT_TEXT.get((getattr(self, "form", ""), slot))
+                        if d:
+                            bits.append(d)
+                    continue
+                _combo = COSTUME_LOOK_TEXT.get((slot, tuple(str(v) for v in vals)))
+                if _combo:
+                    bits.append(_combo)
+                    continue
+                descs = [COSTUME_LOOK_TEXT.get((slot, str(v))) for v in vals]
+                descs = [d for d in descs if d]
+                if descs:
+                    if slot == "display":
+                        # 「桌面显示」可多选：把物件合成一句，别重复"桌面上放着"
+                        _obj = [d for d in descs if d != "巴菲收起来了"]
+                        if _obj:
+                            bits.append("桌面上放着" + "、".join(_obj))
+                        if "巴菲收起来了" in descs:
+                            bits.append("巴菲收起来了")
+                    else:
+                        bits.append("、".join(descs))
+            line = "【此刻】你现在是「%s」这套形象" % label
+            if bits:
+                line += "：%s" % "；".join(bits)
+            line += "。除非他问起或提到，不要主动说自己穿什么、长什么样。"
+            return line
+        except Exception as e:
+            log.debug("拼当前形象失败: %s", e)
+            return ""
+
+    def _form_has_cues(self, form):
+        """这个形态有没有〔词〕动作（model3.json 里的 Cue 组）——没有就不往提示词里写【身体】。"""
+        try:
+            if not form:
+                form = load_form_config()
+            info = LIVE2D_FORMS.get(form) or {}
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "live2d_viewer", info.get("dir", ""))
+            with open(os.path.join(base, info.get("json", "")), encoding="utf-8") as f:
+                md = json.load(f)
+            return bool(((md.get("FileReferences", {}).get("Motions", {}) or {}).get("Cue")))
+        except Exception:
+            return False
+
+    def _stash_costumes(self, form):
+        """把当前形态的装扮选择存进按形态分组的表里。"""
+        if not form:
+            return
+        if getattr(self, "_costume_by_form", None) is None:
+            self._costume_by_form = {}
+        self._costume_by_form[form] = dict(getattr(self, "costume_choice", {}) or {})
+
+    def _load_costumes_for(self, form):
+        """取某个形态自己的装扮选择（没有就空表）。"""
+        if getattr(self, "_costume_by_form", None) is None:
+            self._costume_by_form = {}
+        return dict(self._costume_by_form.get(form) or {})
+
     def set_form(self, key):
         """切换形象。
 
@@ -5881,7 +6134,10 @@ class DesktopPet:
 
         # 正常路径：渲染器活着 → 线程内换模型（主线程不碰窗口、不碰上下文）
         if self.spine is not None and self.spine_enabled and self.spine.is_ready():
+            self._stash_costumes(prev)
             self.form = key
+            self.costume_choice = self._load_costumes_for(key)
+            self._refresh_prompt_for_form(key)
             self._costume_applied = False   # 新形态的装扮要重新穿一遍（_on_renderer_frame 里做）
             self._pushed_size = None        # 让 _spine_render_loop 重新推一次显示尺寸
             try:
@@ -5889,6 +6145,8 @@ class DesktopPet:
             except Exception as e:
                 log.error("切换形象失败: %s", e)
                 self.form = prev
+                self.costume_choice = self._load_costumes_for(prev)
+                self._refresh_prompt_for_form(prev)
                 return
             # 换模型是异步的：先记下"在等确认"，等渲染线程报回装载成功才落盘、才报成功（10/12）
             self._form_pending = (key, prev, time.time(), label)
@@ -5896,11 +6154,16 @@ class DesktopPet:
             return
 
         # 回退路径：渲染器还没起（或已经挂了）→ 老办法，重建；等不到旧线程退出就停住别硬撑
+        self._stash_costumes(prev)
         self.form = key                           # _start_spine 按 self.form 建，这里必须先改过来
+        self.costume_choice = self._load_costumes_for(key)
+        self._refresh_prompt_for_form(key)
         try:
             if not self._stop_spine(wait=8.0):
                 log.error("切换形象失败：旧渲染线程 8 秒内没退出（多半卡在显卡驱动里），未创建新上下文")
                 self.form = prev
+                self.costume_choice = self._load_costumes_for(prev)
+                self._refresh_prompt_for_form(prev)
                 try:
                     save_form_config(prev)        # 没换成就不写配置，免得下次开机还是坏的
                 except Exception:
@@ -6215,10 +6478,14 @@ class DesktopPet:
                 continue
 
         lines = []
+        _my_lines = []
         _seen = set()
         for t in _raw_turns:
             if str(t.get("src") or "chat") not in ("chat", "topic_open"):
                 continue
+            _a = str(t.get("a") or "").strip()
+            if 6 <= len(_a) <= 60 and _a not in _my_lines:
+                _my_lines.append(_a)
             u = str(t.get("u") or "").strip()
             a = str(t.get("a") or "").strip()
             key = (u, a)
@@ -6246,13 +6513,18 @@ class DesktopPet:
         _rel = str(((self.memory_data.get("profile") or {}).get("relation") or {}).get("content") or "").strip()
         prompt = chr(10).join([
             "你在帮一个桌宠角色写「我现在是什么样」这一页，她叫%s。" % self.pet_name,
-            "材料有四样：她这段时间对你的看法、你俩的关系认知、她这一页的旧版和更早一版、以及最近的对话。",
-            "据此重写这一页：",
+            "材料有五样：她最近说过的原话、她对他的看法、你俩的关系、这一页的旧版和更早一版、最近对话。",
+            "据此重写这一页——写的是「她自己是什么样」，不是这段时间发生了什么：",
             "- ≤%d 字，第一人称「我」" % SELFCARD_MAX_CHARS,
-            "- 写「我是什么样、我怎么待他」，不写「我该怎么做」，不写口号",
+            "- 主体是她的性子：在意什么、烦什么、说话什么口吻（爱用的词/爱开的玩笑）、怎么待他、什么时候会顶他",
+            "- 不写事件流水账：禁止「他做了X，我就Y」这种反应记录；要写「我就是会……的那种」",
+            "- 不写「我是一个……」这种自我贴标签的人设句，也不写「我该……」的自我要求",
+            "- 语气照着她自己的原话来，别改写成书面语",
             "- 允许保留原来写得对的部分；没什么变化就把 new_text 留空",
-            "- 不要写「我是一个……」这种自我贴标签的人设句",
-            "- 旧版和更早一版的差别，如果体现的是" + "她自己的变化" + "，可以用" + "「以前…现在…」" + "的口气写进去",
+            "- 旧版和更早一版的差别如果体现的是她自己的变化，可以用「以前…现在…」写进去",
+            "",
+            "【我最近说过的原话】（照这个口吻写，别写成书面语）",
+            (chr(10).join("- " + s for s in _my_lines[-12:]) if _my_lines else "（还没有）"),
             "",
             "【我对他的看法】",
             (chr(10).join("- " + s for s in _imps) if _imps else "（还没有）"),
@@ -6467,16 +6739,102 @@ class DesktopPet:
         else:
             return "深夜"
 
+    def _cue_catalog(self):
+        """当前形态的〔词〕表：动作类→播 Cue 组里的那一段；穿戴类→写 exp3 里的原值。
+
+        值全部来自模型文件（exp3 的 Value / 动作文件），代码里不写数值。
+        只在第一次（或换形态后）扫一次。
+        """
+        form = getattr(self, "form", "")
+        cached = getattr(self, "_cue_cache", None)
+        if cached and cached[0] == form:
+            return cached[1]
+        info = LIVE2D_FORMS.get(form) or {}
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "live2d_viewer", info.get("dir", ""))
+        cat = {}
+        try:
+            with open(os.path.join(base, info.get("json", "")), encoding="utf-8") as f:
+                md = json.load(f)
+            cues = ((md.get("FileReferences", {}).get("Motions", {}) or {}).get("Cue") or [])
+            for i, it in enumerate(cues):
+                rel = it.get("File", "")
+                name = os.path.basename(rel)[: -len(".motion3.json")]
+                if not name:
+                    continue
+                cat[name] = ("motion", i)
+        except Exception as e:
+            log.debug("读取 Cue 动作组失败: %s", e)
+        try:
+            edir = os.path.join(base, "expressions")
+            for fn in sorted(os.listdir(edir)):
+                if not fn.endswith(".exp3.json"):
+                    continue
+                try:
+                    with open(os.path.join(edir, fn), encoding="utf-8") as f:
+                        d = json.load(f)
+                    params = {p["Id"]: float(p.get("Value", 0.0))
+                              for p in (d.get("Parameters") or []) if p.get("Id")}
+                except Exception:
+                    continue
+                _nm = fn[: -len(".exp3.json")]
+                if params and _nm in CUE_TIMED_POSE:      # 只留"贴贴"这类动作型姿态，穿戴一律手动
+                    cat[_nm] = ("pose", params, CUE_TIMED_POSE[_nm])
+        except Exception as e:
+            log.debug("读取表情目录失败: %s", e)
+        for alias, target in CUE_MOTION_ALIAS.items():
+            if target in cat:
+                cat[alias] = cat[target]
+        for alias, target in CUE_POSE_ALIAS.items():
+            if isinstance(target, tuple):
+                cat[alias] = ("pose", {target[0]: target[1]}, None)
+            elif target in cat:
+                cat[alias] = cat[target]
+        self._cue_cache = (form, cat)
+        log.info("〔词〕表已建：%d 项（形态 %s）", len(cat), form)
+        return cat
+
+    def _apply_cues(self, cues):
+        """把台词里的〔词〕变成动作/姿态。一句最多两个。"""
+        if not cues or not (self.spine and self.spine_enabled):
+            return
+        cat = self._cue_catalog()
+        for name in cues[:2]:
+            item = cat.get(name)
+            if not item:
+                log.info("没见过的〔%s〕（词表里没有）", name)
+                continue
+            try:
+                if item[0] == "motion":
+                    # 就播这一段，播完让引擎自然淡出回默认——不按住终值、不播回程动作。
+                    # （按住 + 播切回会在动作交界处反折抽搐，用户实测否掉了这个方案）
+                    self.spine.enqueue(("test_motion", "Cue", item[1]))
+                    log.info("台词动作：%s（Cue#%d，自然结束）", name, item[1])
+                else:
+                    _params, _hold = item[1], item[2]
+                    self.spine.enqueue(("pose", _params))
+                    log.info("台词姿态：%s → %s（%s）", name, _params,
+                             ("%.1f 秒后收回" % _hold) if _hold else "保持")
+                    if _hold:
+                        self.root.after(int(_hold * 1000),
+                                        lambda ps=list(_params): self.spine.enqueue(("pose_release", ps)))
+            except Exception as e:
+                log.debug("套用〔%s〕失败: %s", name, e)
+
     def handle_ai_reply(self, reply, user_msg):
         # 本轮已弹选歌卡片：宠物保持沉默（卡片即回复），语音通道畅通让用户直接说编号
         if getattr(self, "_picker_reply_pending", False):
             self._picker_reply_pending = False
             return
         emotion, text = self.parse_emotion_from_reply(reply)
+        text = strip_echoed_prefix(text)         # 剥掉她模仿出来的时间戳前缀
+        text, cues = extract_cues(text)          # 〔词〕：气泡/TTS/记忆都只用干净文本
         self._add_chat_buffer_turn(user_msg, text, source="chat")
         # 对用户输入的回应：输出完毕刷新免唤醒词窗口
         self.show_bubble_text(text, emotion, refresh_voice=True)
         threading.Thread(target=self._tts_play, args=(text, True), daemon=True).start()
+        if cues:
+            self._apply_cues(cues)
 
     def parse_emotion_from_reply(self, text):
         text = (text or "").strip()
@@ -7401,7 +7759,7 @@ class DesktopPet:
             self.max_chars = new_max
             self.style_rules = new_style
             self.banned_words = new_bans
-            self.system_prompt = build_system_prompt(new_name, new_persona, new_max, new_style)
+            self.system_prompt = build_system_prompt(new_name, new_persona, new_max, new_style, has_cues=self._form_has_cues(self.form))
             self.full_system = build_full_system_prompt(self.system_prompt, self.user_profile)
             messagebox.showinfo("成功", "角色设定已保存并立即生效")
             win.destroy()
@@ -7865,8 +8223,8 @@ class DesktopPet:
     def show_about(self):
         """关于框：署名按形态列（FORM_CREDITS 里为空的那几套先不显示）"""
         parts = ["严禁用于商业用途和收费。", ""]
-        _filled = [k for k in LIVE2D_FORM_ORDER if (FORM_CREDITS.get(k) or "").strip()]
-        for _key in LIVE2D_FORM_ORDER:
+        _filled = [k for k in available_forms() if (FORM_CREDITS.get(k) or "").strip()]
+        for _key in available_forms():
             _credit = (FORM_CREDITS.get(_key) or "").strip()
             if not _credit:
                 continue
@@ -10224,6 +10582,22 @@ class DesktopPet:
                 lines.append(f"- [经历] {_dated(e)}{e['content']}")
             return "【你记得的事情】（括号里是当时记下的日期）\n" + "\n".join(lines)
 
+    def _history_time_label(self, ts):
+        """历史消息的时间前缀：今天/昨天/M月D日 + 时:分（让她自己从记录里看出间隔）。"""
+        try:
+            d = datetime.fromtimestamp(ts)
+        except Exception:
+            return ""
+        hhmm = d.strftime("%H:%M")
+        days = (datetime.now().date() - d.date()).days
+        if days == 0:
+            return "今天 " + hhmm
+        if days == 1:
+            return "昨天 " + hhmm
+        if days < 365:
+            return "%d月%d日 %s" % (d.month, d.day, hhmm)
+        return d.strftime("%Y-%m-%d %H:%M")
+
     def build_context_messages(self, system_prompt, user_msg="", context_type="chat",
                                image_b64=None, extra_context="", memory_query=None,
                                skip_sources=None, image_b64_prev=None, image_b64_earlier=None):
@@ -10262,14 +10636,24 @@ class DesktopPet:
 
         with self._memory_lock:
             turns = list(self.chat_buffer)
+        _topic_kept = 0
         for turn in turns:
             # 陪玩/读书这类"自说自话"的历史可整轮跳过：否则模型会照着自己上一条的句式接着写
             if skip_sources and turn[0].get("source") in skip_sources:
                 continue
             if turn[0].get("display_only"):
+                # 她主动开的话题：像 QQ 里她先发了一条——只把"她那句"放进上下文。
+                # （user 那条是空的，空 content 不能进 API；不带情绪括号，历史里本来就是正文）
+                _pick = str(turn[1].get("content") or "").strip()
+                if _pick and _topic_kept < 3:      # 最多带 3 条，免得她反复捡旧话题
+                    messages.append({"role": "assistant", "content": _pick})
+                    _topic_kept += 1
                 continue
             # 只传 role/content，剔除本地 source 标记
-            messages.append({"role": turn[0]["role"], "content": turn[0]["content"]})
+            _ts = turn[0].get("ts")
+            _pre = ("[%s] " % self._history_time_label(_ts)) if _ts else ""
+            messages.append({"role": turn[0]["role"], "content": _pre + turn[0]["content"]})
+            # 她的历史回复不加前缀：模型会模仿它、在自己的回复开头也写一个时间
             messages.append({"role": turn[1]["role"], "content": turn[1]["content"]})
 
         if image_b64:
@@ -10558,12 +10942,32 @@ class DesktopPet:
             # 点了不做"做事情"那套，也不弹"她做了个动作：X"的气泡；点击反应交给渲染端的随机表情
             if not LIVE2D_FORMS.get(self.form, {}).get('has_motions'):
                 return
+            # 点击触发时不播"做事情"动作（脱捕 13 秒太长）——只走渲染端的甩头 + 点击表情
+            if from_click and not LIVE2D_FORMS.get(self.form, {}).get('click_action', True):
+                self._schedule_action()
+                return
             if self.action_timer_job:
                 try:
                     self.root.after_cancel(self.action_timer_job)
                 except Exception:
                     pass
                 self.action_timer_job = None
+            # 形态配了 auto_actions：自己找事做 = 随机一个〔词〕动作 + 点击那套随机表情
+            _auto = LIVE2D_FORMS.get(self.form, {}).get('auto_actions') or []
+            if _auto:
+                try:
+                    self.spine.enqueue(("click",))
+                except Exception:
+                    pass
+                _pick = random.choice(_auto)
+                if _pick == "脱捕":
+                    # 这一段走原来 Action 组的完整收尾逻辑（道具/时长），落到下面去播
+                    log.info("自己找事做：脱捕（配一次点击表情）")
+                else:
+                    self._apply_cues([_pick])
+                    log.info("自己找事做：%s（配一次点击表情）", _pick)
+                    self._schedule_action()
+                    return
             # 动作池按形态取（小肥鱼有她自己的三段动作）；形态没配就用鲸鱼娘那套
             _pool = LIVE2D_FORMS.get(self.form, {}).get('action_pool') or ACTION_POOL
             idx, label = random.choice(_pool)
@@ -10572,6 +10976,28 @@ class DesktopPet:
         except Exception:
             pass
         self._schedule_action()
+
+    def _open_form_window(self):
+        """「形象」卡片：列四/五套形态，点一下就换（面板快捷入口用）。"""
+        win, frame = self._make_card_window("形象", 380, 360)
+        cur = getattr(self, "form", None)
+        for key in available_forms():
+            label = LIVE2D_FORMS.get(key, {}) .get("label", key)
+            text = ("✓ " if key == cur else "   ") + label
+
+            def _pick(k=key, w=win):
+                try:
+                    self.set_form(k)
+                except Exception as e:
+                    log.debug("换形象失败: %s", e)
+                try:
+                    w.destroy()          # 独立窗就关掉；嵌在面板里时是无害的空操作
+                except Exception:
+                    pass
+
+            tk.Button(frame, text=text, anchor="w", relief="flat", bg="#ffffff",
+                      activebackground="#f2f4f7", font=(self.font_family, 11),
+                      command=_pick).pack(fill=tk.X, pady=2, padx=6)
 
     def _open_costume_window(self):
         """🎩 装扮：悬浮卡片窗（同 API 设置那种），每个槽位一行、多选一用按钮高亮。**按当前形态显示**"""
@@ -10594,14 +11020,22 @@ class DesktopPet:
             # 一排最多 6 个按钮，超了自动换行（"手持道具"有 12 个按钮，一行放不下会被窗口右边界裁掉）
             # 必须有的槽位不给"无"按钮（手持道具：她总得有件拿的东西）
             _opts = ([] if slot in _required else [(None, clear_label)]) + items
-            for _i, (name, item_label) in enumerate(_opts):
-                if _i % 6 == 0:
+            _pad = int(6 * s)
+            _budget = int(470 * s)          # 卡片可用宽度（窗口 520 减两侧边距）
+            row = tk.Frame(frame, bg=DIALOG_BG)
+            row.pack(anchor='w')
+            _x = 0
+            for name, item_label in _opts:
+                _w = int(min(160, max(74, 16 * len(str(item_label)) + 26)) * s)
+                if _x and _x + _w > _budget:
                     row = tk.Frame(frame, bg=DIALOG_BG)
                     row.pack(anchor='w')
-                btn = RoundedButton(row, text=item_label, width=int(74 * s), height=int(30 * s),
+                    _x = 0
+                btn = RoundedButton(row, text=item_label, width=_w, height=int(30 * s),
                                     radius=int(8 * s), font=(self.font_family, 10), variant="subtle",
                                     command=lambda sl=slot, n=name: self.set_costume(sl, n))
-                btn.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
+                btn.pack(side=tk.LEFT, padx=(0, _pad), pady=(0, 4))
+                _x += _w + _pad
                 self._costume_buttons[(slot, str(name))] = btn
         tip = tk.Label(frame, text=("每个槽位只能选一个（「桌面显示」可以多选并存），选新的会自动摘掉旧的"
                                     if _multi else "每个槽位只能选一个，选新的会自动摘掉旧的"),
@@ -10615,18 +11049,40 @@ class DesktopPet:
     def _apply_saved_costumes(self):
         """渲染器就绪后把上次的装扮穿回去（只调一次；渲染线程里执行，set_costume 只是入队）"""
         self._costume_applied = True
+        log.info("恢复装扮：形态=%s 存档=%s", self.form, self.costume_choice)
         _slots, _multi, _required, _default = costume_cfg(self.form)
         if not _slots or not LIVE2D_FORMS.get(self.form, {}).get('has_costumes'):
             return      # 中肥鱼/成年肥鱼没有装扮配件
+        _dropped = False
         for slot, _label, _clear, _items in _slots:
             val = self.costume_choice.get(slot)
             if not val:
+                continue
+            # 存档里的选项必须在这个形态里真实存在（形态间槽位同名，比如都有 body）
+            _ok = True
+            for _nm in (val if isinstance(val, (list, tuple)) else [val]):
+                _info = LIVE2D_FORMS.get(self.form) or {}
+                _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live2d_viewer",
+                                  _info.get("dir", ""), "expressions", str(_nm) + ".exp3.json")
+                if not os.path.isfile(_p):
+                    _ok = False
+                    break
+            if not _ok:
+                log.info("装扮：%s → %s 在当前形态不存在，跳过", slot, val)
+                self.costume_choice.pop(slot, None)
+                _dropped = True
                 continue
             try:
                 self.spine.set_costume(slot, val)
                 log.info("装扮：%s → %s（启动恢复）", slot, val)
             except Exception as e:
                 log.warning("恢复装扮失败 %s: %s", slot, e)
+        if _dropped:
+            # 摘掉了当前形态不存在的选项 ⇒ 提示词里的「此刻」要重算，别还写着她没穿的东西
+            try:
+                self._refresh_prompt_for_form(self.form)
+            except Exception as e:
+                log.debug("恢复装扮后重建提示词失败: %s", e)
 
     def _refresh_costume_buttons(self):
         for (slot, key), btn in self._costume_buttons.items():
@@ -10655,8 +11111,14 @@ class DesktopPet:
         except Exception:
             pass
         log.info("装扮：%s → %s", slot, chosen if chosen else "无")
-        save_costume_config(self.costume_choice)
+        self._stash_costumes(getattr(self, "form", None))
+        _sec = {k: v for k, v in (getattr(self, "_costume_by_form", {}) or {}).items() if v}
+        _update_section("costume", _sec)
         self._refresh_costume_buttons()
+        try:
+            self._refresh_prompt_for_form(self.form)   # 「此刻」那行要跟着变
+        except Exception:
+            pass
 
     def start_topic_timer(self):
         """11/01：主动话题不再按"固定/随机间隔"，改成令牌桶 + 时段权重（频率内置，不可调）。"""
@@ -13620,6 +14082,8 @@ OCR文字：
 
         # ── 快捷 ──
         h = _group_header("快捷", "quick")
+        _item(h, "🐟 形象", lambda: self._cc_open_embed("set_form", "形象", self._open_form_window))
+        _item(h, "🎩 装扮", lambda: self._cc_open_embed("set_costume", "装扮", self._open_costume_window))
         _item(h, "💬 换个话题", self.generate_topic_manual)
         _item(h, "💤 睡觉", lambda: self.start_sleep_mode(manual=True))
         _item(h, "⚡ 精力值", self.show_energy_status)
@@ -13639,7 +14103,6 @@ OCR文字：
                 ("音乐库", self.open_music_library_settings, "set_music"),
                 ("语音识别", self.open_voice_settings, "set_voice"),
                 ("TTS 音色与语言", self.open_tts_settings, "set_tts"),
-                ("装扮", self._open_costume_window, "set_costume"),
                 ("DSH 协作", self.open_dsh_settings, "set_dsh"),
                 ("导出故障报告", self.export_fault_report, None),
                 ("关于", None, "about")):
