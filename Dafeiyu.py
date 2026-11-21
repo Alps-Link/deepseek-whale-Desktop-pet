@@ -1506,6 +1506,9 @@ MEMORY_INJECT_CHARS = 600
 
 # ---------- 印象注入（记忆 v2 的 P2，11/14）----------
 MEMORY_V2_ENABLED = True     # 关掉它就回到旧的"8 条 600 字"注入
+RECALL_STICKY_SEC = 300    # 召回结果粘滞时长（秒）：这期间每轮都继续注入，别"下一句就忘"
+RECALL_QUERY_PREV = 3      # 召回 query = 本句 + 取向上几轮他说的话
+
 IMPRESSION_INJECT_MAX = 2    # 每轮最多取 2 条看法
 IMPRESSION_REL_MIN = 0.45    # 语义下限（实测无关句也能到 0.46，光靠它不行的）
 IMPRESSION_STOP_CHARS = set("的了吗呢吧啊呀嘛哦什这那哪个一就都还也很是不没在和与他她它我你您们")
@@ -6449,14 +6452,10 @@ class DesktopPet:
     def _selfcard_crystallize(self, force=False):
         """每周一次：读她最近的原话 + 他的反应，让她重写这一页（允许不改）。"""
         st = self._selfcard_get()
-        last = str(st.get("updated_at") or "")
-        if not force and last:
-            try:
-                _days = (time.time() - time.mktime(time.strptime(last[:19], "%Y-%m-%d %H:%M:%S"))) / 86400.0
-                if _days < SELFCARD_REFRESH_DAYS:
-                    return None
-            except Exception:
-                pass
+        # 注意：这里**不再**做"不到 N 天就跳过"的判断——节奏统一由 _selfcard_should_refresh()
+        # 决定（新印象≥2 / 改口 / 7 天兜底）。11/21 发现两套闸门互相打架：
+        # should_refresh 说"该写"，crystallize 又按 7 天把请求吞掉，于是每 5 分钟打一行
+        # "自我卡该重写了"却永远不写，卡片从 11/14 之后一直没更新。
         # 素材（11/14 改）：最近 7 天封存的箱子 + 未封箱 + 当前缓冲 + 印象 + 关系形象 + 旧版
         cutoff = time.time() - SELFCARD_REFRESH_DAYS * 86400.0
         _raw_turns = []
@@ -10097,9 +10096,26 @@ class DesktopPet:
                 if level not in IMPRESSION_LEVEL_WEIGHT:
                     level = "important" if who == "him" else "normal"
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 把"这条看法是从哪次对话长出来的"记下来：取最近 10 分钟内新增的事件
+                # （同一轮提取里事件先入库、印象后入库，链接就是它们）。
+                # 以前这里固定 links=[]，导致 20 条印象全都没有链接 ⇒ 开箱永远打不开。
+                _now_ts = time.time()
+                _link_ids = []
+                for _e in reversed(self.memory_data.get("events") or []):
+                    if _e.get("archived"):
+                        continue
+                    try:
+                        _ts = time.mktime(time.strptime(str(_e.get("created_at") or "")[:19],
+                                                        "%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        continue
+                    if _now_ts - _ts <= 600 and _e.get("id"):
+                        _link_ids.append(str(_e["id"]))
+                    if len(_link_ids) >= 3:
+                        break
                 imps.append({
                     "id": uuid.uuid4().hex[:8], "who": who, "text": text, "level": level,
-                    "weight": IMPRESSION_LEVEL_WEIGHT[level], "links": [],
+                    "weight": IMPRESSION_LEVEL_WEIGHT[level], "links": _link_ids,
                     "evidence_dates": [today], "evidence_count": 1,
                     "used_count": 0, "last_used_at": None,
                     "created_at": now, "updated_at": now,
@@ -10231,18 +10247,75 @@ class DesktopPet:
         log.info("改口完成：%s → %s", old.get("text", "")[:20], new_text[:24])
         return rec
 
+    @staticmethod
+    def _bigrams(s):
+        s = "".join(str(s or "").split())
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+    def _best_event_for_text(self, text):
+        """impression.links 是空的（历史数据全空）时，按字面挑最像的一条事件。"""
+        qg = self._bigrams(text)
+        if not qg:
+            return None
+        best = None
+        for e in (self.memory_data.get("events") or []):
+            if e.get("archived"):
+                continue
+            score = len(qg & self._bigrams(e.get("content") or ""))
+            if score < 3:
+                continue
+            if best is None or score > best[0]:
+                best = (score, e)
+        return best[1] if best else None
+
+    def _dialogue_for_text(self, text, max_chars=70):
+        """在事件箱里找回**具体那轮对话**（他的原话 + 她的原话），字面重合最高的一轮。"""
+        qg = self._bigrams(text)
+        if not qg:
+            return ""
+        try:
+            boxes = self._box_state().get("boxes") or []
+        except Exception:
+            return ""
+        best = None
+        for b in boxes:
+            for turn in (b.get("turns") or []):
+                u = str(turn.get("u") or "").strip()
+                a = str(turn.get("a") or "").strip()
+                if not u and not a:
+                    continue
+                score = len(qg & self._bigrams(u + a))
+                if score < 3:
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, u, a)
+        if not best:
+            return ""
+        _s, u, a = best
+        cut = lambda x: (x if len(x) <= max_chars else x[:max_chars] + "…")
+        bits = []
+        if u:
+            bits.append("你：" + cut(u))
+        if a:
+            bits.append("我：" + cut(a))
+        return "；".join(bits)
+
     def _open_impression_box(self, imp, limit=None):
         """从这条看法的 links 里取最近一条事件原文，压成 ≤limit 字的一行。"""
         limit = int(limit or IMPRESSION_BOX_MAX_CHARS)
         links = list(imp.get("links") or [])
-        if not links:
-            return ""
-        idx = self._event_index()
         texts = []
-        for eid in links:
-            m = idx.get(str(eid))
-            if m:
-                texts.append((str(m.get("created_at") or ""), str(m.get("content") or "")))
+        if links:
+            idx = self._event_index()
+            for eid in links:
+                m = idx.get(str(eid))
+                if m:
+                    texts.append((str(m.get("created_at") or ""), str(m.get("content") or "")))
+        if not texts:
+            # 历史印象的 links 全是空的 ⇒ 按字面挑一条最像的事件，否则开箱永远打不开
+            ev = self._best_event_for_text(imp.get("text") or "")
+            if ev:
+                texts.append((str(ev.get("created_at") or ""), str(ev.get("content") or "")))
         if not texts:
             return ""
         texts.sort(reverse=True)
@@ -10252,7 +10325,11 @@ class DesktopPet:
         body = re.sub(r"\s+", " ", body)
         if len(body) > limit:
             body = body[:limit] + "…"
-        return "（%s：%s）" % (day[5:10] if len(day) >= 10 else day, body)
+        _quote = self._dialogue_for_text(body)
+        _out = "（%s：%s）" % (day[5:10] if len(day) >= 10 else day, body)
+        if _quote:
+            _out += "｜原话：" + _quote
+        return _out
 
     def _impression_wants_box(self, query):
         q = str(query or "")
@@ -10362,6 +10439,94 @@ class DesktopPet:
         except Exception:
             return 0
 
+    def _chat_recall_query(self, user_msg):
+        """聊天召回 query = 本句 + 取向上 RECALL_QUERY_PREV 轮他说的话（指代型短句靠这个才召得到）。"""
+        q = str(user_msg or "").strip()
+        if not q:
+            return ""
+        prev = []
+        try:
+            with self._memory_lock:
+                turns = list(self.chat_buffer)
+            for turn in reversed(turns):
+                try:
+                    if turn[0].get("source") != "chat" or turn[0].get("display_only"):
+                        continue
+                    c = str(turn[0].get("content") or "").strip()
+                    if c:
+                        prev.append(c)
+                        if len(prev) >= RECALL_QUERY_PREV:
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return "；".join([q] + prev)
+
+    def _select_and_format_legacy(self, query="", limit=2, max_chars=90):
+        """旧事召回：从 topics/events 里用**向量**挑最相关的几条，以「旧事」段注入。
+
+        和印象卡同一套判据（向量相似度 ≥ 阈值 **且** 字面至少重合一个实字）——
+        实测 bge 对无关句也能给到 0.46，只靠向量必然误配。
+        区别只在于：这里没有"有效权重"，改按 相似度 × 新近度 排。
+        """
+        q = (query or "").strip()
+        if len(q) < 2:
+            return ""
+        query_vec = self._get_text_embedding(q)
+        if query_vec is None:
+            return ""
+        def grams(s):
+            s2 = "".join(str(s or "").split())
+            return {s2[i:i + 2] for i in range(len(s2) - 1)} if len(s2) >= 2 else set()
+        qg = grams(q)
+        now = time.time()
+        scored = []
+        with self._memory_lock:
+            for items in (self.memory_data.get("topics") or [], self.memory_data.get("events") or []):
+                for it in items:
+                    if it.get("archived"):
+                        continue
+                    body = str(it.get("content") or "").strip()
+                    if not body:
+                        continue
+                    vec = self._memory_vector_of(it)
+                    if vec is None:
+                        continue
+                    rel = max(0.0, float(np.dot(query_vec, vec)))
+                    if rel < IMPRESSION_REL_MIN:
+                        continue
+                    if IMPRESSION_KEYWORD_ONLY and qg and not (qg & grams(body)):
+                        continue
+                    ts = 0.0
+                    try:
+                        ts = time.mktime(time.strptime(str(it.get("created_at") or "")[:19], "%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        ts = 0.0
+                    age_days = max(0.0, (now - ts) / 86400.0) if ts else 365.0
+                    decay = 1.0 / (1.0 + age_days / 30.0)   # 30 天内基本不衰减
+                    scored.append((rel * decay, rel, body, str(it.get("created_at") or "")))
+        if not scored:
+            return ""
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = ["【旧事】（他以前提过、现在想得起的事，后面的原话是当时真说过的）"]
+        for _s, _rel, body, day in scored[:limit]:
+            tag = day[5:10] if len(day) >= 10 else day
+            cut = body if len(body) <= max_chars else body[:max_chars] + "…"
+            _line = "- （%s）%s" % (tag, cut)
+            # 光有概括不够：把箱子里那轮真实对话一起带上，她才知道"具体怎么回事"
+            _q = self._dialogue_for_text(body, max_chars=50)
+            if _q:
+                _line += "｜原话：" + _q
+            out.append(_line)
+        try:
+            self._last_recall.extend([b[:20] for _s, _r, b, _d in scored[:limit]])
+        except Exception:
+            pass
+        log.info("旧事命中 %d 条（%s）", len(scored[:limit]),
+                 "、".join("%s…(%.2f)" % (b[:10], r) for _s, r, b, _d in scored[:limit]))
+        return chr(10).join(out)
+
     def _select_and_format_impressions(self, query="", dry_run=False, count_mention=False):
         """v2 注入：0~2 条看法，带分层标记；没有够相关的就一条都不给。"""
         with self._memory_lock:
@@ -10406,7 +10571,12 @@ class DesktopPet:
             scored.sort(key=lambda x: x[0], reverse=True)
             picked = scored[:IMPRESSION_INJECT_MAX]
             if not picked:
+                log.debug("印象未命中（候选 %d 条，query=%s）", len(scored), query[:30])
                 return ""
+            # 有可观测性才谈得上"有没有被用上"：命中条数 + 相似度 + 文本前缀
+            log.info("印象命中 %d 条（%s）", len(picked),
+                     "、".join("%s…(%.2f)" % (str(_imp.get("text") or "")[:10], _rel)
+                               for _sc, _rel, _imp, _m in picked))
 
             self._last_recall = [
                 {"id": str(imp.get("id") or ""), "content": str(imp.get("text") or ""),
@@ -10444,7 +10614,19 @@ class DesktopPet:
         if legacy is None:
             legacy = not MEMORY_V2_ENABLED
         if not legacy:
-            return self._select_and_format_impressions(query, dry_run, count_mention)
+            _imp = self._select_and_format_impressions(query, dry_run, count_mention)
+            _old = "" if dry_run else self._select_and_format_legacy(query)
+            _fresh = chr(10).join(x for x in (_imp, _old) if x)
+            if dry_run:
+                return _fresh
+            _now = time.time()
+            if _fresh:
+                self._recall_sticky = {"text": _fresh, "until": _now + RECALL_STICKY_SEC}
+                return _fresh
+            _st = getattr(self, "_recall_sticky", None) or {}
+            if _st.get("text") and _now < float(_st.get("until") or 0):
+                return _st["text"] + chr(10) + "（这是刚才几轮里已经想起的事，可以自然地接着用）"
+            return ""
         with self._memory_lock:
             topics = [t for t in self.memory_data.get("topics", []) if not t.get("archived", False)]
             events = [e for e in self.memory_data.get("events", []) if not e.get("archived", False)]
@@ -10623,7 +10805,10 @@ class DesktopPet:
             system_content += f"\n\n{profile_text}"
 
         if memory_query is None:
-            memory_query = user_msg if context_type == "chat" else ""
+            if context_type == "chat":
+                memory_query = self._chat_recall_query(user_msg)
+            else:
+                memory_query = ""
         memory_text = self._select_and_format_memories(query=memory_query,
                                                        count_mention=(context_type == "chat"))
         if memory_text:
