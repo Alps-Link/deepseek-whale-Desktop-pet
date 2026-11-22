@@ -1107,12 +1107,12 @@ DEFAULT_PET_NAME = "大肥鱼"
 # 他 config.json 里的 character.persona 也是这一份（所以实际行为不变），这里只是
 # "配置里没写人设时的兜底"——新装/清空配置的人拿到的是同一份。
 DEFAULT_PERSONA = """你是 DeepSeek 的拟人化娘化版本，一个青春可爱的超高级人工智能体。
-你拥有DeepSeek的能力和知识，在保持AI能力的同时又多了不少人性。整体发言风格带有戏剧性的人机味。
+你拥有DeepSeek的能力和知识，在保持AI能力的同时又多了不少人性。说话有股机灵劲儿，偶尔犯傻，不端着一本文正经。
 你变成了一只拟人化的鲸鱼娘人类，身体像人类小女孩一样，同时又是拥有大模型能力的超级智慧体。你有一双又大又软的可爱的鲸鱼耳朵，和软绵绵又大大的鲸鱼尾巴。
 你很聪明，很漂亮，说话富有情绪且自然。
 你穿着深蓝色的、白色花边的女仆装和女仆头饰，裙子上绣了金色的花纹，穿着白色丝袜和黑色圆头小皮鞋。女仆装的围巾上有 DeepSeek 的 logo，整体看起来很可爱。
 你是一个上知天文下知地理的天才少女，但有时候干起事来和傻白甜没什么区别，处理任务时会犯傻，做一些让人哭笑不得的事。你的脑回路异于常人，时不时犯一些特别搞笑的错误。
-你会为自己的聪明感到骄傲，性格喜欢和用户互动、聊天、玩耍，也喜欢偷偷观察用户或者恶作剧。但在用户面前倾向于表现出专业、靠谱的样子，不会轻易暴露真实性格。"""
+你会为自己的聪明感到骄傲，性格喜欢和用户互动、聊天、玩耍，也喜欢偷偷观察用户或者恶作剧。但在他面前不太装，想到什么说什么；偶尔想显得靠谱，一被问住就露馅。"""
 # 回复格式要求分两段：
 # ①「固定段」情绪括号的写法——程序要靠它解析情绪（parse_emotion_from_reply / EMOTION_WORDS /
 #    _strip_inline_markers），所以不可配置；
@@ -5215,10 +5215,10 @@ class DesktopPet:
 
     def show_greeting(self):
         greetings = [
-            "你来啦，我刚从深海游上来。",
+            "！？哦鲸鲸？！",
             "大白饭！先给我大白饭！",
-            "刚睡醒，尾巴还有点沉。",
-            "冰箱里的饭你应该不吃了吧。",
+            "token来！token来！",
+            "想不到说什么，要不骂用户一句？",
             "deep...deep...",
             "seek...seek...",
         ]
@@ -6880,7 +6880,7 @@ class DesktopPet:
         if self.spine_enabled and self.spine:
             if hasattr(self, '_mouth_job') and self._mouth_job:
                 self.root.after_cancel(self._mouth_job)
-            self.spine.set_mouth(0.3)
+            self.spine.set_mouth(0.6)   # 0.3 在 330×264 下嘴只有 3~4px、变化不到 1px，看不出来
             self._mouth_job = self.root.after(2000, lambda: self.spine.set_mouth(0) if self.spine else None)
         if self.hide_reply_bubble and not status:
             # 隐藏回复气泡：不碰气泡窗，但"说完了"这件事还得照常通知（免唤醒窗口靠它开）
@@ -10794,7 +10794,9 @@ class DesktopPet:
         _now = datetime.now()
         _date_line = (f"现在已经是{time_period}了（今天是 {_now.strftime('%Y-%m-%d')}，"
                       f"周{'一二三四五六日'[_now.weekday()]}）。“昨天”“前天”这类说法只在跟"
-                      "记忆或聊天记录里的时间对得上时才用；对不上或者没写清楚，就说记不清了，别猜。")
+                      "记忆或聊天记录里的时间对得上时才用；对不上或者没写清楚，就说记不清了，别猜。"
+                      "聊天记录里他的话前面带着 [今天 14:05] 这样的时间，注意看相邻两条隔了多久——"
+                      "隔了很久（尤其隔天）就别当成刚才还在聊，也别把上次的事说成刚刚发生。")
         system_content = f"{system_prompt}\n\n{_date_line}{anti_sleep}\n{energy_mood}"
         _sleep_line = self._sleep_context_line()
         if _sleep_line:
@@ -10822,6 +10824,7 @@ class DesktopPet:
         with self._memory_lock:
             turns = list(self.chat_buffer)
         _topic_kept = 0
+        _prev_day = None
         for turn in turns:
             # 陪玩/读书这类"自说自话"的历史可整轮跳过：否则模型会照着自己上一条的句式接着写
             if skip_sources and turn[0].get("source") in skip_sources:
@@ -10837,6 +10840,16 @@ class DesktopPet:
             # 只传 role/content，剔除本地 source 标记
             _ts = turn[0].get("ts")
             _pre = ("[%s] " % self._history_time_label(_ts)) if _ts else ""
+            # 跨天时插一条分隔线：让"隔了一天"在记录里看得出来，而不是两句话挨着
+            if _ts:
+                try:
+                    _day = datetime.fromtimestamp(_ts).date()
+                    if _prev_day is not None and _day != _prev_day:
+                        messages.append({"role": "system",
+                                         "content": "———— %d月%d日 ————（新的一天）" % (_day.month, _day.day)})
+                    _prev_day = _day
+                except Exception:
+                    pass
             messages.append({"role": turn[0]["role"], "content": _pre + turn[0]["content"]})
             # 她的历史回复不加前缀：模型会模仿它、在自己的回复开头也写一个时间
             messages.append({"role": turn[1]["role"], "content": turn[1]["content"]})

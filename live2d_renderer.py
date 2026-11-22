@@ -154,6 +154,8 @@ FORMS = {
         # 这套公皮的『头』是 AngleX/Y/Z、『身体跟随』是 PositionX/Y/Z（见作者 vtube.json），
         # 引擎自带的 Drag 只写 ParamAngle*/ParamBodyAngle*，在这套上是空操作 ⇒ 自己补一份。
         'follow_drag': True,
+        'manual_breath': True,        # 引擎自动呼吸幅度太小（4~23% 像素），改自己写正弦（7.6~45.8%）
+        'idle_sway': True,            # 生物理太阻尼、没有成年鱼那种左右轻摆，补一个（±2 位置 / ±1.2 角度，周期 6 秒）
         'has_motions': True,
         'click_action': False,        # 点击不播 Action（脱捕 13 秒太长），只甩头 + 点击表情
         # 自己找事做：随机一个〔词〕动作 + 点击那套随机表情（不再播 13 秒的脱捕）
@@ -613,7 +615,9 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
     model = live2d.LAppModel()
     model.LoadModelJson(os.path.join(model_dir, FORM['json']))
 
-    model.SetAutoBreathEnable(True)
+    # 有的形态用引擎自动呼吸幅度太小（big：0~0.5 幅度只带动 4~23% 像素，成年是 37~58%），
+    # 这类形态关掉自动呼吸，改由渲染循环自己按正弦写 ParamBreath（见 FORM['manual_breath']）。
+    model.SetAutoBreathEnable(not FORM.get('manual_breath'))
     model.SetAutoBlinkEnable(True)
 
     # 参数名：先取模型实际参数名，再按形态的别名表翻译成"我们的规范名"。
@@ -1190,6 +1194,14 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                         model.SetParameterValue(_ap, _av)
                     action_props = {}
                     action_until = 0.0
+                    # 动作刚结束：跟随的起点设成「动作停在哪」，下一帧从这里平滑接管
+                    for _fk in ('ParamAngleX', 'ParamAngleY', 'ParamAngleZ',
+                                'PositionX', 'PositionY', 'PositionZ'):
+                        if _fk in _param_ids:
+                            try:
+                                follow_now[_fk] = model.GetParameterValue(_param_ids.index(_fk))
+                            except Exception:
+                                pass
             if sleep_eyes:
                 model.SetParameterValue('ParamEyeLOpen', 0.0)
                 model.SetParameterValue('ParamEyeROpen', 0.0)
@@ -1199,9 +1211,16 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                 model.SetParameterValue(_pk, _pv)
             model.SetParameterValue('ParamEyeBallX', mouse_x)
             model.SetParameterValue('ParamEyeBallY', mouse_y)
+            # 手动呼吸：0.1~1.0、周期 4 秒（实测画面变化 7.6~45.8%，接近成年鱼的 37~58%）
+            if FORM.get('manual_breath'):
+                model.SetParameterValue('ParamBreath',
+                                        0.55 + 0.45 * math.sin(time.time() * 2 * math.pi / 4.0))
             if active_scene is None:
                 model.Drag(mouse_x * DRAG_SCALE_X, mouse_y * DRAG_SCALE_Y)
-            if FORM.get('follow_drag'):
+            # 动作（自带角度曲线的，如脱捕）播放期间让位：让动作独占 Angle/Position，
+            # 否则我们的跟随会在动作结束那一帧突然接管，出现整段 15° 的瞬跳（实测 17.1°/帧）。
+            _action_busy = bool(action_until) and time.time() < action_until
+            if FORM.get('follow_drag') and not _action_busy:
                 # 这几套模型的头部/身体参数不叫 ParamAngle*（公皮：AngleX* 是头、PositionX* 是身体），
                 # 引擎的 Drag 写不到 ⇒ 按作者 vtube.json 的映射自己写一份，带 0.2 的逐帧平滑（≈VTS 的 Smoothing 20）。
                 _dx = mouse_x * DRAG_SCALE_X
@@ -1216,20 +1235,34 @@ def _render_form(bridge, width, height, fbo, clock, form_key):
                     _new = _cur + (_v - _cur) * 0.2
                     follow_now[_k] = _new
                     model.SetParameterValue(_k, _new)
+                # 轻微左右摆（呼吸带动的那种"活着的晃"）：叠加在跟随值上，周期 6 秒。
+                # 成年鱼靠物理链自带这种摆动，big 的物理更阻尼、看不出来，所以这里补一个。
+                if FORM.get('idle_sway'):
+                    _st = time.time()
+                    model.SetParameterValue('PositionX',
+                                            follow_now.get('PositionX', 0.0)
+                                            + 5.5 * math.sin(_st * 2 * math.pi / 3.0))
+                    model.SetParameterValue('ParamAngleZ',
+                                            follow_now.get('ParamAngleZ', 0.0)
+                                            + 3.3 * math.sin(_st * 2 * math.pi / 3.0 + 0.6))
             if click_expr_until and time.time() >= click_expr_until:
                 click_expr_until = 0.0
                 bridge._cmd_q.append(('emotion', 'normal'))   # 点击反应到期：表情收回常态
             if click_react_until:
                 if time.time() < click_react_until:
-                    # 阻尼正弦：0 → 最大 → 0，写在 Drag 之后，这一帧以它为准
+                    # 阻尼正弦：0 → 最大 → 0；**叠加**在跟随值之上，不写绝对值——
+                    # 写绝对值会把头先顶到 0（看起来「目视前方」），结束时再跳回跟随（实测 5~9°/帧）。
                     _rp = 1.0 - (click_react_until - time.time()) / 0.7
                     _sw = math.sin(_rp * math.pi * 1.6) * 6.0 * (1.0 - _rp)
-                    model.SetParameterValue('ParamAngleZ', _sw)
-                    model.SetParameterValue('ParamAngleX', _sw * 0.4)
+                    if FORM.get('follow_drag'):
+                        model.SetParameterValue('ParamAngleZ', follow_now.get('ParamAngleZ', 0.0) + _sw)
+                        model.SetParameterValue('ParamAngleX', follow_now.get('ParamAngleX', 0.0) + _sw * 0.4)
+                    else:
+                        model.SetParameterValue('ParamAngleZ', _sw)
+                        model.SetParameterValue('ParamAngleX', _sw * 0.4)
                 else:
                     click_react_until = 0.0
             model.Update()
-
             glBindFramebuffer(GL_FRAMEBUFFER, fbo)
             glClearColor(0.0, 0.0, 0.0, 0.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)   # 模板也要清，遮罩才干净
